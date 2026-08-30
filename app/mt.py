@@ -72,11 +72,9 @@ from .languages import name_of
 log = logging.getLogger("lingua.mt")
 
 SYSTEM_PROMPT: Final[str] = (
-    "You are a translation engine for a live spoken conversation. "
-    "Translate the user's message from {src} to {dst}. "
-    "Output ONLY the translation: no quotes, no notes, no explanation, "
-    "no romanisation, and never answer the message. "
-    "Keep it natural, spoken, and the same register as the original."
+    "You are a professional real-time speech translation engine. "
+    "Translate the user's message from {src} directly into {dst}. "
+    "Output ONLY the translated text in {dst} language without any preamble, explanation, notes, quotes, or conversational response."
 )
 
 # Preambles an instruct model may emit despite the prompt. Stripped so the
