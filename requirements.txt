@@ -1,0 +1,40 @@
+# Lingua Buds translation server -- runtime dependencies.
+#
+# Split into three groups: what every deployment needs, what the GPU path
+# needs, and what only the tests need. Pin ranges rather than exact versions
+# so a CUDA image can resolve its own compatible wheels.
+
+# ---- core (always required) -----------------------------------------
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30
+pydantic>=2.8,<3.0
+numpy>=1.26
+websockets>=12.0
+
+# ---- ASR ------------------------------------------------------------
+# faster-whisper pulls in ctranslate2, tokenizers, onnxruntime (Silero VAD)
+# and av (audio container decoding), which the audio module also uses.
+faster-whisper>=1.1.0
+ctranslate2>=4.4.0
+av>=12.0
+soxr>=0.4          # high-quality resampling; audio.py falls back if absent
+sentencepiece>=0.2 # tokeniser for the CTranslate2 MT path
+
+# ---- MT: GPU path ---------------------------------------------------
+# vLLM is NOT installed by default: it is a large, CUDA-specific wheel and
+# installing it on a CPU box wastes ~2 GB and fails on some platforms.
+# On the RTX 3060 host, install it explicitly:
+#     pip install vllm>=0.6.0
+# Or use the CUDA Dockerfile target, which does this for you.
+#
+# transformers is only needed for MT_BACKEND=qwen_hf (the portable fallback).
+transformers>=4.44
+
+# ---- optional observability -----------------------------------------
+# pynvml gives VRAM + GPU utilisation in /metrics when torch is absent.
+# Without it, /metrics reports GPU as "unavailable" rather than as zero.
+pynvml>=11.5 ; platform_system != "Darwin"
+
+# ---- tests ----------------------------------------------------------
+httpx>=0.27         # REST test client
+soundfile>=0.12     # writing/reading test audio

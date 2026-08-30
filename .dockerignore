@@ -1,0 +1,36 @@
+# Keep the build context small and keep secrets out of the image.
+#
+# The .env exclusion is the important line here: .env.example is a template
+# and belongs in the repo, but a real .env holds tokens and must never be
+# baked into an image layer, where it would survive even if a later layer
+# deleted it. Pass it at runtime with --env-file instead.
+
+.env
+.env.*
+!.env.example
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Model weights are a runtime volume, never an image layer. Baking a 1.5 GB
+# model into the image makes it slow to push and impossible to update
+# without a rebuild.
+models/
+*.bin
+*.pt
+*.onnx
+*.gguf
+.cache/
+cache/
+
+# Local measurement output.
+*.log
+.venv/
+venv/
+
+.git/
+.gitignore
+README.md
