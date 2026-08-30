@@ -506,6 +506,7 @@ async def health() -> JSONResponse:
             round(time.time() - PIPELINE.started_at, 1) if PIPELINE.started_at else 0.0
         )
         body["engines"] = PIPELINE.engine_info()
+        body["engine_list"] = [PIPELINE.asr.info(), PIPELINE.mt.info()]
         body["warmup"] = PIPELINE.warmup_report
         # The honest headline: how often we actually met the budget.
         body["latency"] = PIPELINE.metrics.budget_report()

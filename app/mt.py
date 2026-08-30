@@ -71,11 +71,35 @@ from .languages import name_of
 
 log = logging.getLogger("lingua.mt")
 
-SYSTEM_PROMPT: Final[str] = (
-    "You are a professional real-time speech translation engine. "
-    "Translate the user's message from {src} directly into {dst}. "
-    "Output ONLY the translated text in {dst} language without any preamble, explanation, notes, quotes, or conversational response."
-)
+def make_translation_messages(text: str, src: str, dst: str) -> list[dict[str, str]]:
+    src_name = name_of(src) if src != "auto" else "the detected language"
+    dst_name = name_of(dst)
+
+    if dst == "ar" or dst.startswith("ar"):
+        system_content = (
+            "أنت مترجم فوري محترف. مهمتك ترجمة النص المدخل مباشرة إلى اللغة العربية الفصحى.\n"
+            "قواعد صارمة:\n"
+            "1. يجب أن يكون الإخراج باللغة العربية الفصحى حصراً.\n"
+            "2. لا تستخدم أي رموز صينية أو كلمات أجنبية نهائياً.\n"
+            "3. أخرج الترجمة العربية المباشرة فقط بدون أي شروحات أو مقدمات أو علامات تنصيص."
+        )
+        user_content = f"ترجم إلى العربية:\n{text}"
+    else:
+        system_content = (
+            f"You are a professional real-time translator. "
+            f"Translate the text from {src_name} directly into {dst_name}.\n"
+            f"Rules:\n"
+            f"1. Output MUST be entirely in {dst_name}.\n"
+            f"2. Never use Chinese or any unrelated language.\n"
+            f"3. Output ONLY the direct translation without preamble, notes, or quotes."
+        )
+        user_content = f"Translate to {dst_name}:\n{text}"
+
+    return [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": user_content},
+    ]
+
 
 # Preambles an instruct model may emit despite the prompt. Stripped so the
 # earbuds never speak "Here is the translation:" out loud.
@@ -86,7 +110,7 @@ _PREAMBLE = re.compile(
 )
 
 
-def clean_translation(text: str) -> str:
+def clean_translation(text: str, target_lang: str = "") -> str:
     out = (text or "").strip()
     out = _PREAMBLE.sub("", out).strip()
     # A model that wrapped the whole answer in quotes should not make the
@@ -95,7 +119,12 @@ def clean_translation(text: str) -> str:
         inner = out[1:-1].strip()
         if inner and inner[0] not in "\"'“”«":
             out = inner
+    # If translating to Arabic, strip any stray Chinese characters or prefix labels
+    if target_lang == "ar" or target_lang.startswith("ar"):
+        out = re.sub(r"[\u4e00-\u9fff\u3400-\u4dbf]+", "", out).strip()
+        out = re.sub(r"^(?:الترجمة|الترجمة إلى العربية|النص المترجم)\s*[:\-]\s*", "", out).strip()
     return out.strip()
+
 
 
 @dataclass(frozen=True)
@@ -417,16 +446,7 @@ class QwenVllmEngine(MtEngine):
         return self._llm is not None
 
     def _prompt(self, text: str, src: str, dst: str) -> str:
-        messages = [
-            {
-                "role": "system",
-                "content": SYSTEM_PROMPT.format(
-                    src=name_of(src) if src != "auto" else "the detected language",
-                    dst=name_of(dst),
-                ),
-            },
-            {"role": "user", "content": text},
-        ]
+        messages = make_translation_messages(text, src, dst)
         return self._tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
@@ -444,7 +464,7 @@ class QwenVllmEngine(MtEngine):
         results: list[MtResult] = []
         for (text, _s, _d), output in zip(items, outputs):
             completion = output.outputs[0] if output.outputs else None
-            decoded = clean_translation(completion.text if completion else "")
+            decoded = clean_translation(completion.text if completion else "", target_lang=_d)
             hollow, reason = _hollow_check(decoded, text)
             results.append(
                 MtResult(
@@ -466,15 +486,12 @@ class QwenVllmEngine(MtEngine):
             "backend": self.name,
             "engine": "vllm",
             # `model` is the checkpoint actually serving requests, not the one
-            # that was requested: reporting the request would be reporting a
-            # wish. `model_requested` keeps the asked-for value visible.
+            # configured: with quant="awq" this is the -AWQ repo, not the base.
             "model": self.resolved_model,
-            "model_requested": self.settings.mt_model,
-            "device": self.settings.device,
-            "quantization": self.settings.mt_quant,
-            "gpu_memory_utilization": self.settings.mt_gpu_mem_fraction,
+            "device": "cuda",
+            "quantization": self.resolved_quant,
             "max_new_tokens": self.settings.mt_max_new_tokens,
-            "load_seconds": round(self.load_seconds, 2) if self.load_seconds else None,
+            "load_seconds": self.load_seconds,
             "ready": self.ready,
             "error": self.error,
         }
@@ -508,6 +525,7 @@ class QwenHfEngine(MtEngine):
         super().__init__(settings)
         self._model: Any = None
         self._tokenizer: Any = None
+        self.load_seconds: float = 0.0
 
     def load(self) -> None:
         import torch
@@ -544,16 +562,7 @@ class QwenHfEngine(MtEngine):
 
         texts = []
         for text, src, dst in items:
-            messages = [
-                {
-                    "role": "system",
-                    "content": SYSTEM_PROMPT.format(
-                        src=name_of(src) if src != "auto" else "the detected language",
-                        dst=name_of(dst),
-                    ),
-                },
-                {"role": "user", "content": text},
-            ]
+            messages = make_translation_messages(text, src, dst)
             texts.append(
                 self._tokenizer.apply_chat_template(
                     messages, tokenize=False, add_generation_prompt=True
@@ -581,7 +590,8 @@ class QwenHfEngine(MtEngine):
         for (text, _s, _d), row in zip(items, generated):
             new_tokens = row[prompt_len:]
             decoded = clean_translation(
-                self._tokenizer.decode(new_tokens, skip_special_tokens=True)
+                self._tokenizer.decode(new_tokens, skip_special_tokens=True),
+                target_lang=_d,
             )
             hollow, reason = _hollow_check(decoded, text)
             results.append(
