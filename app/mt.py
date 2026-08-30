@@ -77,13 +77,38 @@ def make_translation_messages(text: str, src: str, dst: str) -> list[dict[str, s
 
     if dst == "ar" or dst.startswith("ar"):
         system_content = (
-            "أنت مترجم فوري محترف. مهمتك ترجمة النص المدخل مباشرة إلى اللغة العربية الفصحى.\n"
-            "قواعد صارمة:\n"
-            "1. يجب أن يكون الإخراج باللغة العربية الفصحى حصراً.\n"
-            "2. لا تستخدم أي رموز صينية أو كلمات أجنبية نهائياً.\n"
-            "3. أخرج الترجمة العربية المباشرة فقط بدون أي شروحات أو مقدمات أو علامات تنصيص."
+            "You are an expert real-time English-to-Arabic translator for live spoken conversation. "
+            "Translate the input faithfully and literally into Modern Standard Arabic.\n"
+            "Rules:\n"
+            "- Always translate question words accurately: 'Where is' -> 'أين', 'How is' -> 'كيف', 'When is' -> 'متى'.\n"
+            "- Translate 'weather' as 'الطقس' or 'الجو', 'train station' as 'محطة القطار', 'please' as 'من فضلك'.\n"
+            "- Translate EVERY word into Arabic. Never leave English words untranslated.\n"
+            "- Output ONLY the Arabic translation without quotes, notes, or explanations."
         )
-        user_content = f"ترجم إلى العربية:\n{text}"
+        return [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": "Where is the train station?"},
+            {"role": "assistant", "content": "أين محطة القطار؟"},
+            {"role": "user", "content": "The weather is nice today."},
+            {"role": "assistant", "content": "الطقس جميل اليوم."},
+            {"role": "user", "content": "I would like to order coffee please."},
+            {"role": "assistant", "content": "أود طلب قهوة من فضلك."},
+            {"role": "user", "content": text},
+        ]
+    elif src == "ar" or src.startswith("ar"):
+        system_content = (
+            f"You are an expert real-time Arabic-to-{dst_name} translator for live spoken conversation. "
+            f"Translate the spoken Arabic text accurately and naturally into {dst_name}.\n"
+            f"Output ONLY the direct {dst_name} translation with no notes, explanations, or quotes."
+        )
+        return [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": "أين محطة القطار؟"},
+            {"role": "assistant", "content": "Where is the train station?"},
+            {"role": "user", "content": "الطقس جميل اليوم."},
+            {"role": "assistant", "content": "The weather is nice today."},
+            {"role": "user", "content": text},
+        ]
     else:
         system_content = (
             f"You are a professional real-time translator. "
@@ -93,12 +118,11 @@ def make_translation_messages(text: str, src: str, dst: str) -> list[dict[str, s
             f"2. Never use Chinese or any unrelated language.\n"
             f"3. Output ONLY the direct translation without preamble, notes, or quotes."
         )
-        user_content = f"Translate to {dst_name}:\n{text}"
+        return [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": f"Translate to {dst_name}:\n{text}"},
+        ]
 
-    return [
-        {"role": "system", "content": system_content},
-        {"role": "user", "content": user_content},
-    ]
 
 
 # Preambles an instruct model may emit despite the prompt. Stripped so the
