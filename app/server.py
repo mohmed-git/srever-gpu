@@ -42,12 +42,11 @@ PIPELINE: Pipeline | None = None
 STARTUP_ERROR: str | None = None
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+async def _background_load() -> None:
     global PIPELINE, STARTUP_ERROR
     settings = SETTINGS
     log.info(
-        "starting: device=%s asr=%s/%s mt_backend=%s budget=%.0fms",
+        "starting background model load: device=%s asr=%s/%s mt_backend=%s budget=%.0fms",
         settings.device,
         settings.resolved_asr_model(),
         settings.resolved_asr_compute_type(),
@@ -58,13 +57,18 @@ async def lifespan(app: FastAPI):
         pipeline = Pipeline(settings)
         await pipeline.start()
         PIPELINE = pipeline
+        log.info("background model load complete: pipeline ready to serve!")
     except Exception as exc:
-        # A server that answers /health with "ok" while its engines failed to
-        # load is worse than one that refuses to serve. Record and keep the
-        # process up so /health can explain what went wrong.
         STARTUP_ERROR = f"{type(exc).__name__}: {exc}"
         log.error("startup failed: %s", STARTUP_ERROR)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    load_task = asyncio.create_task(_background_load())
     yield
+    if not load_task.done():
+        load_task.cancel()
     if PIPELINE is not None:
         await PIPELINE.stop()
 

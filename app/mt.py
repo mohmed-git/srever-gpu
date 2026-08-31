@@ -134,6 +134,11 @@ _PREAMBLE = re.compile(
 )
 
 
+_CJK_TARGETS: Final[frozenset[str]] = frozenset(
+    {"zh", "zh-cn", "zh-tw", "zh-hans", "zh-hant", "yue", "wuu", "ja", "japanese", "chinese", "cantonese"}
+)
+
+
 def clean_translation(text: str, target_lang: str = "") -> str:
     out = (text or "").strip()
     out = _PREAMBLE.sub("", out).strip()
@@ -143,10 +148,17 @@ def clean_translation(text: str, target_lang: str = "") -> str:
         inner = out[1:-1].strip()
         if inner and inner[0] not in "\"'“”«":
             out = inner
-    # If translating to Arabic, strip any stray Chinese characters or prefix labels
-    if target_lang == "ar" or target_lang.startswith("ar"):
-        out = re.sub(r"[\u4e00-\u9fff\u3400-\u4dbf]+", "", out).strip()
-        out = re.sub(r"^(?:الترجمة|الترجمة إلى العربية|النص المترجم)\s*[:\-]\s*", "", out).strip()
+
+    norm_target = (target_lang or "").strip().lower()
+    base_target = norm_target.split("-")[0]
+
+    # Never sanitize CJK scripts when target is a CJK language!
+    if norm_target not in _CJK_TARGETS and base_target not in _CJK_TARGETS:
+        # If translating to Arabic, strip any stray Chinese characters or prefix labels
+        if norm_target == "ar" or base_target == "ar":
+            out = re.sub(r"[\u4e00-\u9fff\u3400-\u4dbf]+", "", out).strip()
+            out = re.sub(r"^(?:الترجمة|الترجمة إلى العربية|النص المترجم)\s*[:\-]\s*", "", out).strip()
+
     return out.strip()
 
 
