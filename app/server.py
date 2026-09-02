@@ -322,6 +322,9 @@ async def translate_stream(websocket: WebSocket) -> None:
                     state.buffer.clear()
                     await websocket.send_json({"event": "reset", "buffered_bytes": 0})
                     continue
+                if action == "ping":
+                    await websocket.send_json({"event": "pong", "time": time.time()})
+                    continue
                 if action == "close":
                     break
 
