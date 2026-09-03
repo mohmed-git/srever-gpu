@@ -582,6 +582,7 @@ class Pipeline:
                 enabled=self.settings.sentence_streaming,
             )
             sentences = list(split.sentences) or [asr_result.text]
+            passthrough = detected == dst
             translated: list[str] = []
             mt_total_ms = 0.0
             first_sentence_ms: float | None = None
