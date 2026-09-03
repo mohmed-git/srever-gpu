@@ -583,6 +583,14 @@ class Pipeline:
             )
             sentences = list(split.sentences) or [asr_result.text]
             passthrough = detected == dst
+            mt_tasks = (
+                None
+                if passthrough
+                else [
+                    asyncio.create_task(self._mt_sched.submit((s, detected, dst)))
+                    for s in sentences
+                ]
+            )
 
             translated: list[str] = []
             mt_total_ms = 0.0
@@ -597,9 +605,8 @@ class Pipeline:
                     piece_hollow, piece_reason = False, None
                     mt_backend, out_tokens = None, None
                 else:
-                    mt_result, mt_timing = await self._mt_sched.submit(
-                        (sentence, detected, dst)
-                    )
+                    assert mt_tasks is not None
+                    mt_result, mt_timing = await mt_tasks[index]
                     piece, piece_ms = mt_result.text, mt_result.mt_ms
                     piece_hollow, piece_reason = mt_result.hollow, mt_result.hollow_reason
                     mt_backend, out_tokens = mt_result.backend, mt_result.output_tokens

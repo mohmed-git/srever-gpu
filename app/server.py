@@ -291,7 +291,15 @@ async def translate_stream(websocket: WebSocket) -> None:
 
     try:
         while True:
-            message = await websocket.receive()
+            try:
+                message = await asyncio.wait_for(websocket.receive(), timeout=120.0)
+            except asyncio.TimeoutError:
+                log.info("closing idle websocket after 120s timeout")
+                try:
+                    await websocket.close(code=1000)
+                except Exception:
+                    pass
+                break
             if message.get("type") == "websocket.disconnect":
                 break
 

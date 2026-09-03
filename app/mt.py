@@ -77,12 +77,12 @@ def make_translation_messages(text: str, src: str, dst: str) -> list[dict[str, s
 
     if dst == "ar" or dst.startswith("ar"):
         system_content = (
-            "You are an expert real-time English-to-Arabic translator for live spoken conversation. "
+            f"You are an expert real-time {src_name}-to-Arabic translator for live spoken conversation. "
             "Translate the input faithfully and literally into Modern Standard Arabic.\n"
             "Rules:\n"
             "- Always translate question words accurately: 'Where is' -> 'أين', 'How is' -> 'كيف', 'When is' -> 'متى'.\n"
             "- Translate 'weather' as 'الطقس' or 'الجو', 'train station' as 'محطة القطار', 'please' as 'من فضلك'.\n"
-            "- Translate EVERY word into Arabic. Never leave English words untranslated.\n"
+            "- Translate EVERY word into Arabic. Never leave source words untranslated.\n"
             "- Output ONLY the Arabic translation without quotes, notes, or explanations."
         )
         return [
@@ -449,6 +449,7 @@ class QwenVllmEngine(MtEngine):
             "max_model_len": 1024,  # a conversation turn, not a document
             "enforce_eager": False,
             "disable_log_stats": True,
+            "enable_prefix_caching": True,
         }
         # vLLM names in-flight weight quantisation differently from CT2.
         if quant in {"int8", "fp8", "w8a8"}:
@@ -464,7 +465,7 @@ class QwenVllmEngine(MtEngine):
                 temperature=0.0,  # translation is not a creative task
                 top_p=1.0,
                 max_tokens=self.settings.mt_max_new_tokens,
-                repetition_penalty=1.05,
+                repetition_penalty=1.0,
             )
         except Exception as exc:
             self.error = f"{type(exc).__name__}: {exc}"
@@ -612,10 +613,15 @@ class QwenHfEngine(MtEngine):
             self._model.device
         )
         started = time.perf_counter()
+        # Cap generation length dynamically to prevent runaway decode latency
+        dyn_tokens = min(
+            self.settings.mt_max_new_tokens,
+            max(16, max((len(t[0].split()) * 3 + 8 for t in items), default=32)),
+        )
         with torch.inference_mode():
             generated = self._model.generate(
                 **encoded,
-                max_new_tokens=self.settings.mt_max_new_tokens,
+                max_new_tokens=dyn_tokens,
                 do_sample=False,
                 pad_token_id=self._tokenizer.pad_token_id,
             )

@@ -133,7 +133,7 @@ class AsrEngine:
         }
 
         started = time.perf_counter()
-        if self._batched is not None and effective_batch > 1:
+        if self._batched is not None and effective_batch > 1 and duration_s >= 30.0:
             segments, info = self._batched.transcribe(
                 samples, batch_size=effective_batch, **options
             )
@@ -154,6 +154,13 @@ class AsrEngine:
             )
         elif not text:
             hollow_reason = "whisper returned segments but empty text"
+        else:
+            # Hallucination guard: filter out confident nonsense (e.g. "Thank you for watching")
+            seg_no_speech = max((getattr(s, "no_speech_prob", 0.0) for s in seg_list), default=0.0)
+            seg_avg_logprob = min((getattr(s, "avg_logprob", 0.0) for s in seg_list), default=0.0)
+            if seg_no_speech > 0.6 or seg_avg_logprob < -1.0:
+                hollow_reason = f"hallucination guard: no_speech_prob={seg_no_speech:.2f} > 0.6 or avg_logprob={seg_avg_logprob:.2f} < -1.0"
+                text = ""
 
         return AsrResult(
             text=text,
