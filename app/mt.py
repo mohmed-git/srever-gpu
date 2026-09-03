@@ -163,6 +163,14 @@ def clean_translation(text: str, target_lang: str = "") -> str:
 
 
 
+def _estimate_dynamic_tokens(items: list[tuple[str, str, str]], max_allowed: int) -> int:
+    """Safely bound max output tokens for spaced and unspaced scripts (CJK, Thai, etc.)."""
+    max_words = max((len(t[0].split()) for t in items), default=4)
+    max_chars = max((len(t[0]) for t in items), default=16)
+    est = max(int(max_words * 2.5) + 12, int(max_chars * 1.2) + 8)
+    return min(max_allowed, max(16, est))
+
+
 @dataclass(frozen=True)
 class MtResult:
     text: str
@@ -430,6 +438,7 @@ class QwenVllmEngine(MtEngine):
         # The checkpoint actually loaded, which may differ from MT_MODEL when a
         # quantised sibling was substituted. Reported in info().
         self.resolved_model: str = settings.mt_model
+        self.resolved_quant: str = settings.mt_quant
         self.model_substitution_note: str | None = None
 
     def load(self) -> None:
@@ -437,6 +446,7 @@ class QwenVllmEngine(MtEngine):
 
         started = time.perf_counter()
         quant = self.settings.mt_quant.strip().lower()
+        self.resolved_quant = quant
         self.resolved_model, self.model_substitution_note = _resolve_awq_model(
             self.settings.mt_model, quant
         )
@@ -466,6 +476,7 @@ class QwenVllmEngine(MtEngine):
                 top_p=1.0,
                 max_tokens=self.settings.mt_max_new_tokens,
                 repetition_penalty=1.0,
+                stop=["\n"],
             )
         except Exception as exc:
             self.error = f"{type(exc).__name__}: {exc}"
@@ -493,9 +504,19 @@ class QwenVllmEngine(MtEngine):
             raise RuntimeError("MT model not loaded")
         if not items:
             return []
+        from vllm import SamplingParams
+
         prompts = [self._prompt(t, s, d) for t, s, d in items]
+        dyn_tokens = _estimate_dynamic_tokens(items, self.settings.mt_max_new_tokens)
+        sampling = SamplingParams(
+            temperature=0.0,
+            top_p=1.0,
+            max_tokens=dyn_tokens,
+            repetition_penalty=1.0,
+            stop=["\n"],
+        )
         started = time.perf_counter()
-        outputs = self._llm.generate(prompts, self._sampling, use_tqdm=False)
+        outputs = self._llm.generate(prompts, sampling, use_tqdm=False)
         elapsed_ms = round((time.perf_counter() - started) * 1000.0, 2)
 
         results: list[MtResult] = []
@@ -614,10 +635,7 @@ class QwenHfEngine(MtEngine):
         )
         started = time.perf_counter()
         # Cap generation length dynamically to prevent runaway decode latency
-        dyn_tokens = min(
-            self.settings.mt_max_new_tokens,
-            max(16, max((len(t[0].split()) * 3 + 8 for t in items), default=32)),
-        )
+        dyn_tokens = _estimate_dynamic_tokens(items, self.settings.mt_max_new_tokens)
         with torch.inference_mode():
             generated = self._model.generate(
                 **encoded,

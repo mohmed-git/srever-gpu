@@ -582,66 +582,82 @@ class Pipeline:
                 enabled=self.settings.sentence_streaming,
             )
             sentences = list(split.sentences) or [asr_result.text]
-            passthrough = detected == dst
-            mt_tasks = (
-                None
-                if passthrough
-                else [
-                    asyncio.create_task(self._mt_sched.submit((s, detected, dst)))
-                    for s in sentences
-                ]
-            )
-
             translated: list[str] = []
             mt_total_ms = 0.0
             first_sentence_ms: float | None = None
             hollow_reasons: list[str] = []
 
-            for index, sentence in enumerate(sentences):
-                if passthrough:
-                    # Same language in and out: no MT call, but still streamed
-                    # per sentence so the client's playback path is identical.
-                    piece, piece_ms = sentence, 0.0
-                    piece_hollow, piece_reason = False, None
-                    mt_backend, out_tokens = None, None
-                else:
-                    assert mt_tasks is not None
-                    mt_result, mt_timing = await mt_tasks[index]
-                    piece, piece_ms = mt_result.text, mt_result.mt_ms
-                    piece_hollow, piece_reason = mt_result.hollow, mt_result.hollow_reason
-                    mt_backend, out_tokens = mt_result.backend, mt_result.output_tokens
-                    mt_total_ms += mt_result.mt_ms
-                    self.metrics.observe("mt_ms", mt_result.mt_ms)
-                    self.metrics.observe("mt_queue_ms", mt_timing["queue_wait_ms"])
+            mt_tasks: list[asyncio.Task] = []
+            try:
+                for index, sentence in enumerate(sentences):
+                    if passthrough:
+                        # Same language in and out: no MT call, but still streamed
+                        # per sentence so the client's playback path is identical.
+                        piece, piece_ms = sentence, 0.0
+                        piece_hollow, piece_reason = False, None
+                        mt_backend, out_tokens = None, None
+                    elif index == 0:
+                        # Sentence 0 is submitted and awaited immediately so Early Dispatch
+                        # delivers the first speakable word without waiting for sentences 1..n!
+                        mt_result, mt_timing = await self._mt_sched.submit(
+                            (sentence, detected, dst)
+                        )
+                        piece, piece_ms = mt_result.text, mt_result.mt_ms
+                        piece_hollow, piece_reason = mt_result.hollow, mt_result.hollow_reason
+                        mt_backend, out_tokens = mt_result.backend, mt_result.output_tokens
+                        mt_total_ms += mt_result.mt_ms
+                        self.metrics.observe("mt_ms", mt_result.mt_ms)
+                        self.metrics.observe("mt_queue_ms", mt_timing["queue_wait_ms"])
 
-                translated.append(piece)
-                if piece_hollow and piece_reason:
-                    hollow_reasons.append(f"sentence {index + 1}: {piece_reason}")
+                        # Launch remaining sentences (1..n) concurrently while sentence 0 is yielded
+                        if len(sentences) > 1:
+                            for s in sentences[1:]:
+                                mt_tasks.append(
+                                    asyncio.create_task(self._mt_sched.submit((s, detected, dst)))
+                                )
+                    else:
+                        task_idx = index - 1
+                        mt_result, mt_timing = await mt_tasks[task_idx]
+                        piece, piece_ms = mt_result.text, mt_result.mt_ms
+                        piece_hollow, piece_reason = mt_result.hollow, mt_result.hollow_reason
+                        mt_backend, out_tokens = mt_result.backend, mt_result.output_tokens
+                        mt_total_ms += mt_result.mt_ms
+                        self.metrics.observe("mt_ms", mt_result.mt_ms)
+                        self.metrics.observe("mt_queue_ms", mt_timing["queue_wait_ms"])
 
-                elapsed = (time.perf_counter() - wall_start) * 1000.0
-                if index == 0:
-                    first_sentence_ms = elapsed
-                    self.metrics.observe("first_sentence_ms", elapsed)
+                    translated.append(piece)
+                    if piece_hollow and piece_reason:
+                        hollow_reasons.append(f"sentence {index + 1}: {piece_reason}")
 
-                yield {
-                    "type": "sentence",
-                    "index": index,
-                    "sentence_count": len(sentences),
-                    "is_last": index == len(sentences) - 1,
-                    "original_text": sentence,
-                    "translated_text": piece,
-                    "source_lang": detected,
-                    "target_lang": dst,
-                    # Cumulative wall clock at the moment this sentence became
-                    # speakable. This -- not mt_ms -- is what the user perceives.
-                    "elapsed_ms": round(elapsed, 2),
-                    "mt_ms": round(piece_ms, 2),
-                    "mt_backend": mt_backend,
-                    "output_tokens": out_tokens,
-                    "hollow": piece_hollow,
-                    "hollow_reason": piece_reason,
-                    "rtl": lang_mod.is_rtl(dst),
-                }
+                    elapsed = (time.perf_counter() - wall_start) * 1000.0
+                    if index == 0:
+                        first_sentence_ms = elapsed
+                        self.metrics.observe("first_sentence_ms", elapsed)
+
+                    yield {
+                        "type": "sentence",
+                        "index": index,
+                        "sentence_count": len(sentences),
+                        "is_last": index == len(sentences) - 1,
+                        "original_text": sentence,
+                        "translated_text": piece,
+                        "source_lang": detected,
+                        "target_lang": dst,
+                        # Cumulative wall clock at the moment this sentence became
+                        # speakable. This -- not mt_ms -- is what the user perceives.
+                        "elapsed_ms": round(elapsed, 2),
+                        "mt_ms": round(piece_ms, 2),
+                        "mt_backend": mt_backend,
+                        "output_tokens": out_tokens,
+                        "hollow": piece_hollow,
+                        "hollow_reason": piece_reason,
+                        "rtl": lang_mod.is_rtl(dst),
+                    }
+            finally:
+                # Task leak guard: cancel any remaining MT tasks if an exception or disconnect occurs
+                for t in mt_tasks:
+                    if not t.done():
+                        t.cancel()
 
             total_ms = (time.perf_counter() - wall_start) * 1000.0
             self.metrics.observe_many(

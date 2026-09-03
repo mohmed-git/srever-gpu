@@ -26,6 +26,22 @@ from .config import Settings
 
 log = logging.getLogger("lingua.asr")
 
+_AR_HALLUCINATION_BLOCKLIST: set[str] = {
+    "اشتركوا في القناة",
+    "اشترك في القناة",
+    "اشتركوا بالقناة",
+    "اشترك بالقناة",
+    "ترجمة نانسي قنقر",
+    "شكرا للمشاهدة",
+    "شكراً للمشاهدة",
+    "شكرا على المشاهدة",
+    "شكراً على المشاهدة",
+    "Thank you for watching",
+    "Thank you for watching.",
+    "Please subscribe",
+    "Subscribe to the channel",
+}
+
 
 @dataclass(frozen=True)
 class AsrResult:
@@ -142,7 +158,6 @@ class AsrEngine:
         seg_list = list(segments)  # faster-whisper is lazy; this forces the work
         asr_ms = (time.perf_counter() - started) * 1000.0
 
-        text = " ".join(s.text.strip() for s in seg_list if s.text).strip()
         detected = getattr(info, "language", None) or lang_arg or "unknown"
         prob = getattr(info, "language_probability", None)
 
@@ -152,15 +167,19 @@ class AsrEngine:
                 "whisper returned 0 segments: the audio was rejected (silence/VAD/noise), "
                 "so this timing measures rejection, not transcription"
             )
-        elif not text:
-            hollow_reason = "whisper returned segments but empty text"
+            text = ""
         else:
-            # Hallucination guard: filter out confident nonsense (e.g. "Thank you for watching")
-            seg_no_speech = max((getattr(s, "no_speech_prob", 0.0) for s in seg_list), default=0.0)
-            seg_avg_logprob = min((getattr(s, "avg_logprob", 0.0) for s in seg_list), default=0.0)
-            if seg_no_speech > 0.6 or seg_avg_logprob < -1.0:
-                hollow_reason = f"hallucination guard: no_speech_prob={seg_no_speech:.2f} > 0.6 or avg_logprob={seg_avg_logprob:.2f} < -1.0"
-                text = ""
+            # Hallucination guard: filter per-segment using AND + compression_ratio + blocklist
+            kept = [
+                s for s in seg_list
+                if not (getattr(s, "no_speech_prob", 0.0) > 0.6 and getattr(s, "avg_logprob", 0.0) < -1.0)
+                and getattr(s, "compression_ratio", 0.0) <= 2.4
+                and s.text.strip() not in _AR_HALLUCINATION_BLOCKLIST
+            ]
+            text = " ".join(s.text.strip() for s in kept if s.text).strip()
+            if not text:
+                dropped_count = len(seg_list) - len(kept)
+                hollow_reason = f"hallucination guard dropped {dropped_count}/{len(seg_list)} segments"
 
         return AsrResult(
             text=text,

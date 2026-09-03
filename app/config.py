@@ -102,8 +102,8 @@ class Settings:
     asr_beam_size: int = field(default_factory=lambda: _env_int("ASR_BEAM_SIZE", 1))
     asr_vad_filter: bool = field(default_factory=lambda: _env_bool("ASR_VAD_FILTER", False))
     asr_cpu_threads: int = field(default_factory=lambda: _env_int("ASR_CPU_THREADS", 0))
-    asr_batch_size: int = field(default_factory=lambda: _env_int("ASR_BATCH_SIZE", 8))
-    asr_batch_wait_ms: float = field(default_factory=lambda: _env_float("ASR_BATCH_WAIT_MS", 8.0))
+    asr_batch_size: int = field(default_factory=lambda: _env_int("ASR_BATCH_SIZE", 1))
+    asr_batch_wait_ms: float = field(default_factory=lambda: _env_float("ASR_BATCH_WAIT_MS", 0.0))
 
     # ---- MT ------------------------------------------------------------
     # backend: auto | qwen_vllm | qwen_ct2 | qwen_hf | m2m100_ct2
@@ -125,7 +125,7 @@ class Settings:
     admission_enabled: bool = field(default_factory=lambda: _env_bool("ADMISSION_ENABLED", True))
     max_queue_depth: int = field(default_factory=lambda: _env_int("MAX_QUEUE_DEPTH", 256))
     max_inflight: int = field(default_factory=lambda: _env_int("MAX_INFLIGHT", 512))
-    reject_over_budget: bool = field(default_factory=lambda: _env_bool("REJECT_OVER_BUDGET", True))
+    reject_over_budget: bool = field(default_factory=lambda: _env_bool("REJECT_OVER_BUDGET", False))
     # How far past the budget we tolerate before shedding load. 1.0 == shed as
     # soon as the projected wait exceeds the budget itself.
     overload_factor: float = field(default_factory=lambda: _env_float("OVERLOAD_FACTOR", 1.0))
