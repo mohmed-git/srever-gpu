@@ -457,9 +457,10 @@ class QwenVllmEngine(MtEngine):
             "dtype": "float16",
             "gpu_memory_utilization": self.settings.mt_gpu_mem_fraction,
             "max_model_len": 1024,  # a conversation turn, not a document
-            "enforce_eager": False,
+            "enforce_eager": True,  # fast startup: saves 40-60s cudagraph capture on cold boot
             "disable_log_stats": True,
             "enable_prefix_caching": True,
+            "max_num_seqs": 16,
         }
         # vLLM names in-flight weight quantisation differently from CT2.
         if quant in {"int8", "fp8", "w8a8"}:

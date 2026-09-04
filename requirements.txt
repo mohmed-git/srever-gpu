@@ -21,11 +21,8 @@ soxr>=0.4          # high-quality resampling; audio.py falls back if absent
 sentencepiece>=0.2 # tokeniser for the CTranslate2 MT path
 
 # ---- MT: GPU path ---------------------------------------------------
-# vLLM is NOT installed by default: it is a large, CUDA-specific wheel and
-# installing it on a CPU box wastes ~2 GB and fails on some platforms.
-# On the RTX 3060 host, install it explicitly:
-#     pip install vllm>=0.6.0
-# Or use the CUDA Dockerfile target, which does this for you.
+# vLLM enables high-throughput continuous batching & prefix caching on CUDA.
+vllm>=0.6.3
 #
 # transformers is only needed for MT_BACKEND=qwen_hf (the portable fallback).
 transformers>=4.44
