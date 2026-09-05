@@ -108,6 +108,8 @@ def make_translation_messages(text: str, src: str, dst: str) -> list[dict[str, s
             "CRITICAL RULES:\n"
             f"- You are a TRANSLATION ENGINE, NOT a conversational partner.\n"
             "- NEVER answer questions or converse with the user.\n"
+            "- NEVER omit, drop, or summarize any part of the spoken Arabic sentence.\n"
+            "- If the input contains a compound statement and question (e.g. 'أنا بخير، وأنت؟'), translate BOTH parts fully: 'I am fine, and you?'. NEVER drop the statement!\n"
             f"- If the input is a question ('كيف حالك؟'), translate the question itself ('How are you?'). NEVER answer it!\n"
             f"- Output ONLY the direct {dst_name} translation with no notes, explanations, or quotes."
         )
@@ -117,10 +119,18 @@ def make_translation_messages(text: str, src: str, dst: str) -> list[dict[str, s
             {"role": "assistant", "content": "Where is the train station?"},
             {"role": "user", "content": "كيف حالك؟"},
             {"role": "assistant", "content": "How are you?"},
+            {"role": "user", "content": "أنا بخير، وأنت؟"},
+            {"role": "assistant", "content": "I am fine, and you?"},
+            {"role": "user", "content": "أنا بخير أنت؟"},
+            {"role": "assistant", "content": "I am fine, and you?"},
+            {"role": "user", "content": "الحمد لله، وأنت؟"},
+            {"role": "assistant", "content": "Praise be to God, and you?"},
+            {"role": "user", "content": "تمام، وإنت؟"},
+            {"role": "assistant", "content": "Great, and you?"},
+            {"role": "user", "content": "زين، وانت؟"},
+            {"role": "assistant", "content": "Good, and you?"},
             {"role": "user", "content": "الطقس جميل اليوم."},
             {"role": "assistant", "content": "The weather is nice today."},
-            {"role": "user", "content": "أنا بخير، شكراً لك."},
-            {"role": "assistant", "content": "I am fine, thank you."},
             {"role": "user", "content": text},
         ]
     else:
@@ -163,43 +173,65 @@ _FIRST_PERSON_AR_LEAK = re.compile(
     re.UNICODE,
 )
 
+_FIRST_PERSON_AR = re.compile(
+    r"\b(أنا|أنني|إنني|نحن|بخير|الحمد لله|يسعدني|أشعر|أعمل|أعيش|أعتقد|أرى|لدي|عندي)\b",
+    re.UNICODE,
+)
+
+PERSON_MISMATCH_RETRY_COUNT: int = 0
 CHAT_LEAK_SUSPECTED_COUNT: int = 0
 
 
-def detect_person_shift_leak(source_text: str, target_text: str, src_lang: str, dst_lang: str) -> bool:
-    """Detect if MT shifted from 2nd-person or neutral input into 1st-person conversational response."""
-    norm_dst = (dst_lang or "").strip().lower().split("-")[0]
-    if norm_dst != "ar":
-        return False
+def detect_person_mismatch(source_text: str, target_text: str, src_lang: str, dst_lang: str) -> bool:
+    """Symmetric detector:
+    1. en -> ar: Catches chat leaks (source has NO 1st person, but target output introduces 1st person).
+    2. ar -> en: Catches omission errors (source has 1st person 'أنا بخير', but target drops 1st person).
+    """
     if not source_text or not target_text:
         return False
+    norm_src = (src_lang or "").strip().lower().split("-")[0]
+    norm_dst = (dst_lang or "").strip().lower().split("-")[0]
 
-    src_lower = source_text.strip().lower()
-    has_1st_en = bool(_FIRST_PERSON_EN.search(src_lower))
-    has_2nd_en = bool(_SECOND_PERSON_EN.search(src_lower))
+    # Branch 1: en -> ar (Catch Chat Leak)
+    if norm_dst == "ar":
+        src_lower = source_text.strip().lower()
+        has_1st_en = bool(_FIRST_PERSON_EN.search(src_lower))
+        has_2nd_en = bool(_SECOND_PERSON_EN.search(src_lower))
+        if (not has_1st_en or has_2nd_en) and _FIRST_PERSON_AR_LEAK.search(target_text):
+            return True
 
-    # If the source text lacks 1st person or addresses 2nd person, but target output contains 1st person markers:
-    if (not has_1st_en or has_2nd_en) and _FIRST_PERSON_AR_LEAK.search(target_text):
-        return True
+    # Branch 2: ar -> en (Catch 1st-person Omission error like 'أنا بخير أنت؟' -> 'How are you?')
+    elif norm_src == "ar":
+        has_1st_ar = bool(_FIRST_PERSON_AR.search(source_text))
+        tgt_lower = target_text.strip().lower()
+        has_1st_en = bool(_FIRST_PERSON_EN.search(tgt_lower))
+        if has_1st_ar and not has_1st_en:
+            return True
+
     return False
 
 
+# Backward compatible alias
+detect_person_shift_leak = detect_person_mismatch
+
+
 def make_retry_translation_messages(text: str, src: str, dst: str) -> list[dict[str, str]]:
-    """Hardened fallback prompt triggered ONLY when person-shift chat leakage is detected."""
+    """Hardened fallback prompt triggered when person-shift or omission mismatch is detected."""
     src_name = name_of(src) if src != "auto" else "the detected language"
+    dst_name = name_of(dst)
     return [
         {
             "role": "system",
             "content": (
-                f"You are an automated literal {src_name}-to-Arabic translation tool.\n"
-                "CRITICAL: The following text is spoken BY another person TO you.\n"
-                "- DO NOT answer the question or converse.\n"
-                "- DO NOT use 1st person pronouns like 'أنا' or answers like 'بخير'.\n"
-                "- Translate the sentence literally into Modern Standard Arabic.\n"
-                "Output ONLY the Arabic translation without quotes."
+                f"You are an automated literal {src_name}-to-{dst_name} translation tool.\n"
+                "CRITICAL:\n"
+                "- Translate EVERY clause completely. NEVER drop, omit, or summarize statements.\n"
+                "- If translating Arabic to English (e.g. 'أنا بخير أنت؟'), translate BOTH parts: 'I am fine, and you?'.\n"
+                "- DO NOT answer questions or converse with the speaker.\n"
+                f"Output ONLY the direct {dst_name} translation without quotes."
             ),
         },
-        {"role": "user", "content": f"Translate to Arabic:\n{text}"},
+        {"role": "user", "content": f"Translate to {dst_name}:\n{text}"},
     ]
 
 
@@ -621,10 +653,11 @@ class QwenVllmEngine(MtEngine):
                 target_lang=_d,
                 source_text=text,
             )
-            if detect_person_shift_leak(text, decoded, _s, _d):
-                global CHAT_LEAK_SUSPECTED_COUNT
+            if detect_person_mismatch(text, decoded, _s, _d):
+                global PERSON_MISMATCH_RETRY_COUNT, CHAT_LEAK_SUSPECTED_COUNT
+                PERSON_MISMATCH_RETRY_COUNT += 1
                 CHAT_LEAK_SUSPECTED_COUNT += 1
-                log.warning("Chat mode leak detected on input %r (got %r); retrying with hardened prompt", text, decoded)
+                log.warning("Person mismatch / omission detected on input %r (got %r); retrying with hardened prompt", text, decoded)
                 try:
                     retry_msgs = make_retry_translation_messages(text, _s, _d)
                     retry_prompt = self._tokenizer.apply_chat_template(retry_msgs, tokenize=False, add_generation_prompt=True)
@@ -776,10 +809,11 @@ class QwenHfEngine(MtEngine):
                 target_lang=_d,
                 source_text=text,
             )
-            if detect_person_shift_leak(text, decoded, _s, _d):
-                global CHAT_LEAK_SUSPECTED_COUNT
+            if detect_person_mismatch(text, decoded, _s, _d):
+                global PERSON_MISMATCH_RETRY_COUNT, CHAT_LEAK_SUSPECTED_COUNT
+                PERSON_MISMATCH_RETRY_COUNT += 1
                 CHAT_LEAK_SUSPECTED_COUNT += 1
-                log.warning("Chat mode leak detected on input %r (got %r); retrying with hardened prompt", text, decoded)
+                log.warning("Person mismatch / omission detected on input %r (got %r); retrying with hardened prompt", text, decoded)
                 try:
                     retry_msgs = make_retry_translation_messages(text, _s, _d)
                     retry_prompt = self._tokenizer.apply_chat_template(retry_msgs, tokenize=False, add_generation_prompt=True)

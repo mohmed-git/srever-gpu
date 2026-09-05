@@ -663,7 +663,7 @@ async def metrics() -> JSONResponse:
             status_code=503,
             content={"error": "not_ready", "detail": STARTUP_ERROR or "loading"},
         )
-    from .mt import CHAT_LEAK_SUSPECTED_COUNT
+    from .mt import CHAT_LEAK_SUSPECTED_COUNT, PERSON_MISMATCH_RETRY_COUNT
 
     return JSONResponse(
         content={
@@ -671,6 +671,7 @@ async def metrics() -> JSONResponse:
             "device": SETTINGS.device,
             **PIPELINE.metrics.snapshot(),
             "chat_leak_suspected": CHAT_LEAK_SUSPECTED_COUNT,
+            "person_mismatch_retry": PERSON_MISMATCH_RETRY_COUNT,
             "queues": PIPELINE.scheduler_stats(),
             "engines": PIPELINE.engine_info(),
             "resources": resource_report(),
