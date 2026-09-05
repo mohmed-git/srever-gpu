@@ -5,6 +5,7 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     DEBIAN_FRONTEND=noninteractive \
     HF_HOME=/cache/huggingface \
+    VLLM_USE_V1=0 \
     DEVICE=cuda
 
 WORKDIR /app

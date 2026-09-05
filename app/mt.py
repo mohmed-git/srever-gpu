@@ -435,6 +435,7 @@ class QwenVllmEngine(MtEngine):
         self._llm: Any = None
         self._tokenizer: Any = None
         self._sampling: Any = None
+        self._fallback: QwenHfEngine | None = None
         # The checkpoint actually loaded, which may differ from MT_MODEL when a
         # quantised sibling was substituted. Reported in info().
         self.resolved_model: str = settings.mt_model
@@ -442,6 +443,10 @@ class QwenVllmEngine(MtEngine):
         self.model_substitution_note: str | None = None
 
     def load(self) -> None:
+        import os
+        os.environ["VLLM_USE_V1"] = "0"
+        os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
         from vllm import LLM, SamplingParams
 
         started = time.perf_counter()
@@ -472,26 +477,34 @@ class QwenVllmEngine(MtEngine):
         try:
             self._llm = LLM(**kwargs)
             self._tokenizer = self._llm.get_tokenizer()
-            self._sampling = SamplingParams(
-                temperature=0.0,  # translation is not a creative task
-                top_p=1.0,
-                max_tokens=self.settings.mt_max_new_tokens,
-                repetition_penalty=1.0,
-                stop=["\n"],
+            self.load_seconds = time.perf_counter() - started
+            log.info(
+                "MT ready: qwen_vllm model=%s quant=%s load=%.2fs",
+                self.resolved_model,
+                quant,
+                self.load_seconds,
             )
         except Exception as exc:
             self.error = f"{type(exc).__name__}: {exc}"
-            raise
-        self.load_seconds = time.perf_counter() - started
-        log.info(
-            "MT ready: qwen_vllm model=%s quant=%s load=%.2fs",
-            self.resolved_model,
-            quant,
-            self.load_seconds,
-        )
+            log.error(
+                "vLLM initialization failed (%s); falling back to QwenHfEngine on CUDA to keep service healthy",
+                exc,
+            )
+            self._fallback = QwenHfEngine(self.settings)
+            self._fallback.load()
+            self.resolved_model = self._fallback.settings.mt_model
+            self.resolved_quant = "fp16"
+            self.load_seconds = time.perf_counter() - started
+            log.info(
+                "MT fallback ready: qwen_hf model=%s load=%.2fs",
+                self.resolved_model,
+                self.load_seconds,
+            )
 
     @property
     def ready(self) -> bool:
+        if self._fallback is not None:
+            return self._fallback.ready
         return self._llm is not None
 
     def _prompt(self, text: str, src: str, dst: str) -> str:
@@ -505,6 +518,8 @@ class QwenVllmEngine(MtEngine):
             raise RuntimeError("MT model not loaded")
         if not items:
             return []
+        if self._fallback is not None:
+            return self._fallback.translate_batch(items)
         from vllm import SamplingParams
 
         prompts = [self._prompt(t, s, d) for t, s, d in items]
@@ -541,6 +556,10 @@ class QwenVllmEngine(MtEngine):
         return results
 
     def info(self) -> dict[str, Any]:
+        if self._fallback is not None:
+            inf = self._fallback.info()
+            inf["fallback_from_vllm_reason"] = self.error
+            return inf
         out: dict[str, Any] = {
             "backend": self.name,
             "engine": "vllm",
