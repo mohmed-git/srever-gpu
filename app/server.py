@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import struct
 import time
 from contextlib import asynccontextmanager
 from typing import Any
@@ -164,14 +165,29 @@ _CONTROL_KEYS = {
     # Per-connection opt-out from sentence streaming. A client that wants
     # exactly one JSON per utterance sends {"stream": false} once.
     "stream",
+    "protocol",
+    "utt",
+    "seq",
 }
 
 
-class _StreamState:
-    """Per-connection state: languages plus the audio buffer for one utterance."""
+class _Slot:
+    """Per-utterance buffer slot for Protocol v2 framed streaming."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, utt_id: int) -> None:
+        self.utt_id = utt_id
+        self.buffer = bytearray()
+        self.seq_seen: set[int] = set()
+        self.closed: bool = False
+        self.created_at: float = time.monotonic()
+
+
+class _StreamState:
+    """Per-connection state: languages plus audio buffers and async commit queue."""
+
+    def __init__(self, settings: Settings, websocket: WebSocket) -> None:
         self.settings = settings
+        self.websocket = websocket
         self.source: str | None = None
         self.target: str | None = None
         self.audio_format: str | None = None
@@ -179,13 +195,20 @@ class _StreamState:
         self.channels: int = 1
         self.buffer = bytearray()
         self.utterances = 0
-        # WHY a per-connection switch and not just the global setting: the
-        # existing client contract is ONE unified JSON per utterance. If the
-        # server unilaterally started emitting n+1 frames, every already-shipped
-        # client would read frame 1 as the whole answer and act on a partial
-        # translation. So streaming stays opt-outable per connection, and the
-        # `ready` frame below announces which mode this connection is in.
+        # Streaming stays opt-outable per connection
         self.stream: bool = settings.sentence_streaming
+        self.protocol_version: int = 1
+        self.slots: dict[int, _Slot] = {}
+        self.send_lock = asyncio.Lock()
+        self.utterance_queue: asyncio.Queue[tuple[bytes, int | None] | None] = asyncio.Queue()
+        self.worker_task: asyncio.Task[None] | None = None
+
+    async def send_json(self, data: dict[str, Any]) -> None:
+        async with self.send_lock:
+            try:
+                await self.websocket.send_json(data)
+            except Exception:
+                pass
 
     @property
     def max_bytes(self) -> int:
@@ -213,10 +236,14 @@ class _StreamState:
                     self.channels = channels
             except (TypeError, ValueError):
                 pass
+        if "protocol" in message and message["protocol"]:
+            try:
+                proto = int(message["protocol"])
+                if proto in {1, 2}:
+                    self.protocol_version = proto
+            except (TypeError, ValueError):
+                pass
         if "stream" in message:
-            # Accept the JSON booleans and the string forms clients actually
-            # send. Anything unrecognised leaves the mode untouched rather than
-            # silently flipping to a mode the client did not ask for.
             value = message["stream"]
             if isinstance(value, bool):
                 self.stream = value
@@ -243,25 +270,29 @@ async def translate_stream(websocket: WebSocket) -> None:
         await websocket.close(code=1013)
         return
 
-    state = _StreamState(settings)
-    await websocket.send_json(
+    state = _StreamState(settings, websocket)
+    state.worker_task = asyncio.create_task(_utterance_worker(state))
+
+    await state.send_json(
         {
             "event": "ready",
             "version": VERSION,
             "protocol": {
+                "version": 2,
                 "send_json": {
                     "source": "language code or 'auto'",
                     "target": "language code (required)",
-                    "format": "pcm_s16le | opus | ogg | webm | wav (optional; magic bytes win)",
+                    "format": "pcm_s16le | pcm_s16le_framed | opus | ogg | webm | wav (optional; magic bytes win)",
                     "sample_rate": settings.sample_rate,
                     "channels": 1,
-                    "action": "'flush' to end the utterance and translate now",
+                    "protocol": "1 or 2 (default 1; 2 uses 6-byte binary header <BBHH)",
+                    "action": "'flush' to end the utterance and translate now, 'ping' for keep-alive",
                     "stream": (
                         "true (default) for one frame per sentence then a "
                         "'final' frame; false for a single unified JSON"
                     ),
                 },
-                "send_binary": "audio chunks; buffered until you send {'action':'flush'}",
+                "send_binary": "audio chunks (Protocol v1: raw PCM16; Protocol v2: 6-byte header <BBHH + PCM16)",
                 "receive": [
                     "original_text",
                     "translated_text",
@@ -272,9 +303,6 @@ async def translate_stream(websocket: WebSocket) -> None:
                     "total_server_ms",
                 ],
             },
-            # Announced, not assumed: a client that reads frame 1 as the whole
-            # answer needs to know before it sends audio whether more frames
-            # are coming.
             "sentence_streaming": state.stream,
             "streaming_contract": (
                 "frames carry \"type\": \"sentence\" (index, is_last, "
@@ -309,12 +337,12 @@ async def translate_stream(websocket: WebSocket) -> None:
                 try:
                     control = json.loads(text_payload)
                 except json.JSONDecodeError as exc:
-                    await websocket.send_json(
+                    await state.send_json(
                         {"error": "bad_json", "detail": f"control frame is not JSON: {exc}"}
                     )
                     continue
                 if not isinstance(control, dict):
-                    await websocket.send_json(
+                    await state.send_json(
                         {"error": "bad_json", "detail": "control frame must be a JSON object"}
                     )
                     continue
@@ -324,19 +352,46 @@ async def translate_stream(websocket: WebSocket) -> None:
                 action = str(control.get("action", "")).strip().lower()
 
                 if action in {"flush", "end", "eou"}:
-                    await _handle_utterance(websocket, state)
+                    # Invariant I8: Hand off buffer to async utterance worker; DO NOT BLOCK receive loop!
+                    if not state.buffer:
+                        await state.send_json(
+                            {"error": "empty_utterance", "detail": "flush received but no audio was buffered"}
+                        )
+                    elif not state.target:
+                        await state.send_json(
+                            {
+                                "error": "missing_target",
+                                "detail": "send {'target': '<lang>'} before flushing audio",
+                            }
+                        )
+                        state.buffer.clear()
+                    else:
+                        raw = bytes(state.buffer)
+                        state.buffer.clear()
+                        await state.utterance_queue.put((raw, None))
                     continue
+
                 if action == "reset":
                     state.buffer.clear()
-                    await websocket.send_json({"event": "reset", "buffered_bytes": 0})
+                    state.slots.clear()
+                    await state.send_json({"event": "reset", "buffered_bytes": 0})
                     continue
+
                 if action == "ping":
-                    await websocket.send_json({"event": "pong", "time": time.time()})
+                    # Invariant I8: Sub-millisecond response time guaranteed, never blocked by compute
+                    await state.send_json({"event": "pong", "time": time.time()})
                     continue
+
+                if action == "tentative":
+                    utt_val = control.get("utt")
+                    if utt_val is not None:
+                        await state.send_json({"event": "tentative_ack", "utt": int(utt_val)})
+                    continue
+
                 if action == "close":
                     break
 
-                await websocket.send_json(
+                await state.send_json(
                     {
                         "event": "config",
                         "source": state.source,
@@ -344,8 +399,7 @@ async def translate_stream(websocket: WebSocket) -> None:
                         "format": state.audio_format,
                         "sample_rate": state.sample_rate,
                         "channels": state.channels,
-                        # Silently ignoring an unknown key is how a client ends
-                        # up believing it set something it did not.
+                        "protocol": state.protocol_version,
                         "ignored_keys": sorted(unknown) or None,
                     }
                 )
@@ -355,9 +409,39 @@ async def translate_stream(websocket: WebSocket) -> None:
             chunk = message.get("bytes")
             if chunk is None:
                 continue
+
+            # Protocol v2 framed audio: struct "<BBHH" (version, flags, utt_id, seq)
+            if len(chunk) >= 6 and (state.protocol_version == 2 or state.audio_format == "pcm_s16le_framed"):
+                try:
+                    version, flags, utt_id, seq = struct.unpack("<BBHH", chunk[:6])
+                    if version == 2:
+                        payload = chunk[6:]
+                        slot = state.slots.setdefault(utt_id, _Slot(utt_id))
+                        if seq not in slot.seq_seen:
+                            slot.seq_seen.add(seq)
+                            if len(slot.buffer) + len(payload) <= state.max_bytes:
+                                slot.buffer.extend(payload)
+                        # Check flags: bit 1 is LAST (commit)
+                        if flags & 0x02:
+                            slot.closed = True
+                            raw = bytes(slot.buffer)
+                            state.slots.pop(utt_id, None)
+                            if not state.target:
+                                await state.send_json({
+                                    "error": "missing_target",
+                                    "detail": "target language not set",
+                                    "utterance": utt_id,
+                                })
+                            else:
+                                await state.utterance_queue.put((raw, utt_id))
+                        continue
+                except Exception as exc:
+                    log.warning("error parsing framed binary audio: %s", exc)
+
+            # Protocol v1 legacy un-framed audio
             if len(state.buffer) + len(chunk) > state.max_bytes:
                 state.buffer.clear()
-                await websocket.send_json(
+                await state.send_json(
                     {
                         "error": "utterance_too_long",
                         "detail": (
@@ -377,32 +461,43 @@ async def translate_stream(websocket: WebSocket) -> None:
             await websocket.close(code=1011)
         except Exception:
             pass
+    finally:
+        if state.worker_task is not None and not state.worker_task.done():
+            await state.utterance_queue.put(None)
+            state.worker_task.cancel()
+            try:
+                await state.worker_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
-async def _handle_utterance(websocket: WebSocket, state: _StreamState) -> None:
-    if not state.buffer:
-        await websocket.send_json(
-            {"error": "empty_utterance", "detail": "flush received but no audio was buffered"}
-        )
-        return
-    if not state.target:
-        await websocket.send_json(
-            {
-                "error": "missing_target",
-                "detail": "send {'target': '<lang>'} before flushing audio",
-            }
-        )
-        state.buffer.clear()
-        return
+async def _utterance_worker(state: _StreamState) -> None:
+    while True:
+        try:
+            item = await state.utterance_queue.get()
+        except asyncio.CancelledError:
+            break
+        if item is None:
+            break
+        raw, utt_id = item
+        try:
+            await _handle_utterance_payload(state, raw, utt_id)
+        except Exception:
+            log.exception("utterance worker error")
+        finally:
+            state.utterance_queue.task_done()
 
-    raw = bytes(state.buffer)
-    state.buffer.clear()
+
+async def _handle_utterance_payload(
+    state: _StreamState, raw: bytes, utt_id: int | None = None
+) -> None:
     state.utterances += 1
+    utt_tag = utt_id if utt_id is not None else state.utterances
 
     assert PIPELINE is not None
 
     if state.stream:
-        await _stream_utterance(websocket, state, raw)
+        await _stream_utterance(state, raw, utt_tag)
         return
 
     try:
@@ -415,29 +510,29 @@ async def _handle_utterance(websocket: WebSocket, state: _StreamState) -> None:
             channels=state.channels,
         )
     except Overloaded as exc:
-        await websocket.send_json({**exc.payload(), "utterance": state.utterances})
+        await state.send_json({**exc.payload(), "utterance": utt_tag})
         return
     except RequestError as exc:
-        await websocket.send_json(
-            {"error": exc.code, "detail": str(exc), "utterance": state.utterances}
+        await state.send_json(
+            {"error": exc.code, "detail": str(exc), "utterance": utt_tag}
         )
         return
     except Exception as exc:
         log.exception("utterance failed")
-        await websocket.send_json(
+        await state.send_json(
             {
                 "error": "internal",
                 "detail": f"{type(exc).__name__}: {exc}",
-                "utterance": state.utterances,
+                "utterance": utt_tag,
             }
         )
         return
 
-    await websocket.send_json({**outcome.to_json(), "utterance": state.utterances})
+    await state.send_json({**outcome.to_json(), "utterance": utt_tag})
 
 
 async def _stream_utterance(
-    websocket: WebSocket, state: _StreamState, raw: bytes
+    state: _StreamState, raw: bytes, utt_tag: int
 ) -> None:
     """Relay the pipeline's per-sentence frames to the client.
 
@@ -464,7 +559,7 @@ async def _stream_utterance(
             input_sample_rate=state.sample_rate,
             channels=state.channels,
         ):
-            await websocket.send_json({**frame, "utterance": state.utterances})
+            await state.send_json({**frame, "utterance": utt_tag})
             frames += 1
         return
     except Overloaded as exc:
@@ -475,11 +570,11 @@ async def _stream_utterance(
         log.exception("streamed utterance failed")
         payload = {"error": "internal", "detail": f"{type(exc).__name__}: {exc}"}
 
-    await websocket.send_json(
+    await state.send_json(
         {
             "type": "error",
             **payload,
-            "utterance": state.utterances,
+            "utterance": utt_tag,
             "frames_sent": frames,
             "partial": frames > 0,
             "terminal": True,

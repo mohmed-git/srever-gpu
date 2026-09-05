@@ -77,46 +77,61 @@ def make_translation_messages(text: str, src: str, dst: str) -> list[dict[str, s
 
     if dst == "ar" or dst.startswith("ar"):
         system_content = (
-            f"You are an expert real-time {src_name}-to-Arabic translator for live spoken conversation. "
-            "Translate the input faithfully and literally into Modern Standard Arabic.\n"
-            "Rules:\n"
-            "- Always translate question words accurately: 'Where is' -> 'أين', 'How is' -> 'كيف', 'When is' -> 'متى'.\n"
+            f"You are a strict, literal real-time {src_name}-to-Arabic translation engine for live spoken conversation.\n"
+            "CRITICAL RULES:\n"
+            "- You are a TRANSLATION ENGINE, NOT a conversational partner or AI assistant.\n"
+            "- NEVER reply to, answer, or converse with the input text.\n"
+            "- NEVER say pleasantries or answers like 'أنا بخير' unless the input literally said 'I am fine'.\n"
+            "- If the input is a question (e.g. 'How are you?'), translate the QUESTION ITSELF into Arabic ('كيف حالك؟'). NEVER answer it!\n"
+            "- Always translate question words accurately: 'Where is' -> 'أين', 'How is' -> 'كيف', 'When is' -> 'متى', 'What is' -> 'ما'.\n"
             "- Translate 'weather' as 'الطقس' or 'الجو', 'train station' as 'محطة القطار', 'please' as 'من فضلك'.\n"
             "- Translate EVERY word into Arabic. Never leave source words untranslated.\n"
-            "- Output ONLY the Arabic translation without quotes, notes, or explanations."
+            "- Output ONLY the Modern Standard Arabic translation without quotes, notes, or explanations."
         )
         return [
             {"role": "system", "content": system_content},
             {"role": "user", "content": "Where is the train station?"},
             {"role": "assistant", "content": "أين محطة القطار؟"},
+            {"role": "user", "content": "How are you?"},
+            {"role": "assistant", "content": "كيف حالك؟"},
             {"role": "user", "content": "The weather is nice today."},
             {"role": "assistant", "content": "الطقس جميل اليوم."},
             {"role": "user", "content": "I would like to order coffee please."},
             {"role": "assistant", "content": "أود طلب قهوة من فضلك."},
+            {"role": "user", "content": "I am fine, thank you."},
+            {"role": "assistant", "content": "أنا بخير، شكراً لك."},
             {"role": "user", "content": text},
         ]
     elif src == "ar" or src.startswith("ar"):
         system_content = (
-            f"You are an expert real-time Arabic-to-{dst_name} translator for live spoken conversation. "
-            f"Translate the spoken Arabic text accurately and naturally into {dst_name}.\n"
-            f"Output ONLY the direct {dst_name} translation with no notes, explanations, or quotes."
+            f"You are a strict, literal real-time Arabic-to-{dst_name} translation engine for live spoken conversation.\n"
+            "CRITICAL RULES:\n"
+            f"- You are a TRANSLATION ENGINE, NOT a conversational partner.\n"
+            "- NEVER answer questions or converse with the user.\n"
+            f"- If the input is a question ('كيف حالك؟'), translate the question itself ('How are you?'). NEVER answer it!\n"
+            f"- Output ONLY the direct {dst_name} translation with no notes, explanations, or quotes."
         )
         return [
             {"role": "system", "content": system_content},
             {"role": "user", "content": "أين محطة القطار؟"},
             {"role": "assistant", "content": "Where is the train station?"},
+            {"role": "user", "content": "كيف حالك؟"},
+            {"role": "assistant", "content": "How are you?"},
             {"role": "user", "content": "الطقس جميل اليوم."},
             {"role": "assistant", "content": "The weather is nice today."},
+            {"role": "user", "content": "أنا بخير، شكراً لك."},
+            {"role": "assistant", "content": "I am fine, thank you."},
             {"role": "user", "content": text},
         ]
     else:
         system_content = (
-            f"You are a professional real-time translator. "
+            f"You are a strict real-time translation engine. "
             f"Translate the text from {src_name} directly into {dst_name}.\n"
             f"Rules:\n"
-            f"1. Output MUST be entirely in {dst_name}.\n"
-            f"2. Never use Chinese or any unrelated language.\n"
-            f"3. Output ONLY the direct translation without preamble, notes, or quotes."
+            f"1. You are a TRANSLATION ENGINE, NOT a chatbot. Never answer questions.\n"
+            f"2. Output MUST be entirely in {dst_name}.\n"
+            f"3. Never use Chinese or any unrelated language.\n"
+            f"4. Output ONLY the direct translation without preamble, notes, or quotes."
         )
         return [
             {"role": "system", "content": system_content},
@@ -139,7 +154,7 @@ _CJK_TARGETS: Final[frozenset[str]] = frozenset(
 )
 
 
-def clean_translation(text: str, target_lang: str = "") -> str:
+def clean_translation(text: str, target_lang: str = "", source_text: str = "") -> str:
     out = (text or "").strip()
     out = _PREAMBLE.sub("", out).strip()
     # A model that wrapped the whole answer in quotes should not make the
@@ -158,6 +173,16 @@ def clean_translation(text: str, target_lang: str = "") -> str:
         if norm_target == "ar" or base_target == "ar":
             out = re.sub(r"[\u4e00-\u9fff\u3400-\u4dbf]+", "", out).strip()
             out = re.sub(r"^(?:الترجمة|الترجمة إلى العربية|النص المترجم)\s*[:\-]\s*", "", out).strip()
+
+            # Conversational safety net: If input was an inquiry, output must not answer it with pleasantries
+            if source_text:
+                norm_src = re.sub(r"[^\w\s]", "", source_text.strip().lower())
+                if norm_src in {"how are you", "how are you doing", "how do you do", "how r you", "how are u"}:
+                    if any(p in out for p in ["أنا بخير", "بخير والحمد", "بخير شكرا", "بخير وانت", "بخير، وانت", "بخير، وأنت"]):
+                        out = "كيف حالك؟"
+                elif norm_src in {"how is it going", "hows it going"}:
+                    if any(p in out for p in ["أنا بخير", "بخير والحمد", "بخير شكرا"]):
+                        out = "كيف تجري الأمور؟"
 
     return out.strip()
 
@@ -383,7 +408,11 @@ class M2M100Ct2Engine(MtEngine):
                 if not (t.startswith("__") and t.endswith("__"))
                 and t not in ("</s>", "<s>", "<pad>")
             ]
-            decoded = clean_translation("".join(hypothesis).replace("\u2581", " "))
+            decoded = clean_translation(
+                "".join(hypothesis).replace("\u2581", " "),
+                target_lang=_dst,
+                source_text=text,
+            )
             hollow, reason = _hollow_check(decoded, text)
             out.append(
                 MtResult(
@@ -529,7 +558,7 @@ class QwenVllmEngine(MtEngine):
             top_p=1.0,
             max_tokens=dyn_tokens,
             repetition_penalty=1.0,
-            stop=["\n"],
+            stop=["\n", "<|im_end|>", "<|endoftext|>"],
         )
         started = time.perf_counter()
         outputs = self._llm.generate(prompts, sampling, use_tqdm=False)
@@ -538,7 +567,11 @@ class QwenVllmEngine(MtEngine):
         results: list[MtResult] = []
         for (text, _s, _d), output in zip(items, outputs):
             completion = output.outputs[0] if output.outputs else None
-            decoded = clean_translation(completion.text if completion else "", target_lang=_d)
+            decoded = clean_translation(
+                completion.text if completion else "",
+                target_lang=_d,
+                source_text=text,
+            )
             hollow, reason = _hollow_check(decoded, text)
             results.append(
                 MtResult(
@@ -662,6 +695,7 @@ class QwenHfEngine(MtEngine):
                 max_new_tokens=dyn_tokens,
                 do_sample=False,
                 pad_token_id=self._tokenizer.pad_token_id,
+                eos_token_id=self._tokenizer.eos_token_id,
             )
         elapsed_ms = round((time.perf_counter() - started) * 1000.0, 2)
 
@@ -672,6 +706,7 @@ class QwenHfEngine(MtEngine):
             decoded = clean_translation(
                 self._tokenizer.decode(new_tokens, skip_special_tokens=True),
                 target_lang=_d,
+                source_text=text,
             )
             hollow, reason = _hollow_check(decoded, text)
             results.append(
