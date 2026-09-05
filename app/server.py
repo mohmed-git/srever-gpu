@@ -200,7 +200,7 @@ class _StreamState:
         self.protocol_version: int = 1
         self.slots: dict[int, _Slot] = {}
         self.send_lock = asyncio.Lock()
-        self.utterance_queue: asyncio.Queue[tuple[bytes, int | None] | None] = asyncio.Queue()
+        self.utterance_queue: asyncio.Queue[tuple[bytes, int | None] | None] = asyncio.Queue(maxsize=3)
         self.worker_task: asyncio.Task[None] | None = None
 
     async def send_json(self, data: dict[str, Any]) -> None:
@@ -277,6 +277,7 @@ async def translate_stream(websocket: WebSocket) -> None:
         {
             "event": "ready",
             "version": VERSION,
+            "protocols": [1, 2],
             "protocol": {
                 "version": 2,
                 "send_json": {
@@ -368,7 +369,13 @@ async def translate_stream(websocket: WebSocket) -> None:
                     else:
                         raw = bytes(state.buffer)
                         state.buffer.clear()
-                        await state.utterance_queue.put((raw, None))
+                        if state.utterance_queue.full():
+                            await state.send_json({
+                                "error": "overloaded",
+                                "detail": "utterance queue full (backpressure cap: 3)",
+                            })
+                        else:
+                            await state.utterance_queue.put((raw, None))
                     continue
 
                 if action == "reset":
@@ -414,22 +421,46 @@ async def translate_stream(websocket: WebSocket) -> None:
             if len(chunk) >= 6 and (state.protocol_version == 2 or state.audio_format == "pcm_s16le_framed"):
                 try:
                     version, flags, utt_id, seq = struct.unpack("<BBHH", chunk[:6])
-                    if version == 2:
-                        payload = chunk[6:]
-                        slot = state.slots.setdefault(utt_id, _Slot(utt_id))
-                        if seq not in slot.seq_seen:
-                            slot.seq_seen.add(seq)
-                            if len(slot.buffer) + len(payload) <= state.max_bytes:
-                                slot.buffer.extend(payload)
-                        # Check flags: bit 1 is LAST (commit)
-                        if flags & 0x02:
-                            slot.closed = True
-                            raw = bytes(slot.buffer)
-                            state.slots.pop(utt_id, None)
-                            if not state.target:
+                    if version != 2:
+                        await state.send_json({"error": "bad_frame", "detail": f"unsupported protocol version {version}"})
+                        await websocket.close(code=1003)
+                        break
+
+                    payload = memoryview(chunk)[6:]
+                    if len(payload) % 2 != 0:
+                        await state.send_json({
+                            "error": "bad_frame",
+                            "detail": f"odd payload length {len(payload)}: 16-bit PCM requires even bytes",
+                            "utterance": utt_id,
+                        })
+                        continue
+
+                    slot = state.slots.setdefault(utt_id, _Slot(utt_id))
+                    if seq not in slot.seq_seen:
+                        slot.seq_seen.add(seq)
+                        # Payload length <= max_bytes - len(slot.buf); overflow -> auto-commit
+                        if len(slot.buffer) + len(payload) > state.max_bytes:
+                            log.warning("slot %d buffer overflow: auto-committing %d bytes", utt_id, len(slot.buffer))
+                            flags |= 0x02  # Force commit
+                        else:
+                            slot.buffer.extend(payload)
+
+                    # Check flags: bit 1 is LAST (commit)
+                    if flags & 0x02:
+                        slot.closed = True
+                        raw = bytes(slot.buffer)
+                        state.slots.pop(utt_id, None)
+                        if not state.target:
+                            await state.send_json({
+                                "error": "missing_target",
+                                "detail": "target language not set",
+                                "utterance": utt_id,
+                            })
+                        else:
+                            if state.utterance_queue.full():
                                 await state.send_json({
-                                    "error": "missing_target",
-                                    "detail": "target language not set",
+                                    "error": "overloaded",
+                                    "detail": "utterance queue full (backpressure cap: 3)",
                                     "utterance": utt_id,
                                 })
                             else:
@@ -632,11 +663,14 @@ async def metrics() -> JSONResponse:
             status_code=503,
             content={"error": "not_ready", "detail": STARTUP_ERROR or "loading"},
         )
+    from .mt import CHAT_LEAK_SUSPECTED_COUNT
+
     return JSONResponse(
         content={
             "version": VERSION,
             "device": SETTINGS.device,
             **PIPELINE.metrics.snapshot(),
+            "chat_leak_suspected": CHAT_LEAK_SUSPECTED_COUNT,
             "queues": PIPELINE.scheduler_stats(),
             "engines": PIPELINE.engine_info(),
             "resources": resource_report(),

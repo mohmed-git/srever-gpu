@@ -154,6 +154,55 @@ _CJK_TARGETS: Final[frozenset[str]] = frozenset(
 )
 
 
+_FIRST_PERSON_EN = re.compile(r"\b(i|me|my|mine|myself|we|us|our|ours|ourselves)\b", re.IGNORECASE)
+_SECOND_PERSON_EN = re.compile(r"\b(you|your|yours|yourself|yourselves)\b", re.IGNORECASE)
+
+_FIRST_PERSON_AR_LEAK = re.compile(
+    r"\b(أنا|أنني|إنني|نحن|بخير|الحمد لله|يسعدني|أستطيع مساعدتك|كيف يمكنني مساعدتك)\b"
+    r"|(?:^|\s)(?:أشعر|أعمل|أعيش|أعتقد|أرى|لدي|عندي)\b",
+    re.UNICODE,
+)
+
+CHAT_LEAK_SUSPECTED_COUNT: int = 0
+
+
+def detect_person_shift_leak(source_text: str, target_text: str, src_lang: str, dst_lang: str) -> bool:
+    """Detect if MT shifted from 2nd-person or neutral input into 1st-person conversational response."""
+    norm_dst = (dst_lang or "").strip().lower().split("-")[0]
+    if norm_dst != "ar":
+        return False
+    if not source_text or not target_text:
+        return False
+
+    src_lower = source_text.strip().lower()
+    has_1st_en = bool(_FIRST_PERSON_EN.search(src_lower))
+    has_2nd_en = bool(_SECOND_PERSON_EN.search(src_lower))
+
+    # If the source text lacks 1st person or addresses 2nd person, but target output contains 1st person markers:
+    if (not has_1st_en or has_2nd_en) and _FIRST_PERSON_AR_LEAK.search(target_text):
+        return True
+    return False
+
+
+def make_retry_translation_messages(text: str, src: str, dst: str) -> list[dict[str, str]]:
+    """Hardened fallback prompt triggered ONLY when person-shift chat leakage is detected."""
+    src_name = name_of(src) if src != "auto" else "the detected language"
+    return [
+        {
+            "role": "system",
+            "content": (
+                f"You are an automated literal {src_name}-to-Arabic translation tool.\n"
+                "CRITICAL: The following text is spoken BY another person TO you.\n"
+                "- DO NOT answer the question or converse.\n"
+                "- DO NOT use 1st person pronouns like 'أنا' or answers like 'بخير'.\n"
+                "- Translate the sentence literally into Modern Standard Arabic.\n"
+                "Output ONLY the Arabic translation without quotes."
+            ),
+        },
+        {"role": "user", "content": f"Translate to Arabic:\n{text}"},
+    ]
+
+
 def clean_translation(text: str, target_lang: str = "", source_text: str = "") -> str:
     out = (text or "").strip()
     out = _PREAMBLE.sub("", out).strip()
@@ -572,6 +621,25 @@ class QwenVllmEngine(MtEngine):
                 target_lang=_d,
                 source_text=text,
             )
+            if detect_person_shift_leak(text, decoded, _s, _d):
+                global CHAT_LEAK_SUSPECTED_COUNT
+                CHAT_LEAK_SUSPECTED_COUNT += 1
+                log.warning("Chat mode leak detected on input %r (got %r); retrying with hardened prompt", text, decoded)
+                try:
+                    retry_msgs = make_retry_translation_messages(text, _s, _d)
+                    retry_prompt = self._tokenizer.apply_chat_template(retry_msgs, tokenize=False, add_generation_prompt=True)
+                    retry_outputs = self._llm.generate([retry_prompt], sampling, use_tqdm=False)
+                    if retry_outputs and retry_outputs[0].outputs:
+                        retried_decoded = clean_translation(
+                            retry_outputs[0].outputs[0].text,
+                            target_lang=_d,
+                            source_text=text,
+                        )
+                        if retried_decoded and not detect_person_shift_leak(text, retried_decoded, _s, _d):
+                            decoded = retried_decoded
+                except Exception as retry_exc:
+                    log.warning("vLLM MT retry failed: %s", retry_exc)
+
             hollow, reason = _hollow_check(decoded, text)
             results.append(
                 MtResult(
@@ -708,6 +776,33 @@ class QwenHfEngine(MtEngine):
                 target_lang=_d,
                 source_text=text,
             )
+            if detect_person_shift_leak(text, decoded, _s, _d):
+                global CHAT_LEAK_SUSPECTED_COUNT
+                CHAT_LEAK_SUSPECTED_COUNT += 1
+                log.warning("Chat mode leak detected on input %r (got %r); retrying with hardened prompt", text, decoded)
+                try:
+                    retry_msgs = make_retry_translation_messages(text, _s, _d)
+                    retry_prompt = self._tokenizer.apply_chat_template(retry_msgs, tokenize=False, add_generation_prompt=True)
+                    retry_enc = self._tokenizer([retry_prompt], return_tensors="pt").to(self._model.device)
+                    with torch.inference_mode():
+                        retry_gen = self._model.generate(
+                            **retry_enc,
+                            max_new_tokens=dyn_tokens,
+                            do_sample=False,
+                            pad_token_id=self._tokenizer.pad_token_id,
+                            eos_token_id=self._tokenizer.eos_token_id,
+                        )
+                    retry_new = retry_gen[0][retry_enc["input_ids"].shape[1]:]
+                    retried_decoded = clean_translation(
+                        self._tokenizer.decode(retry_new, skip_special_tokens=True),
+                        target_lang=_d,
+                        source_text=text,
+                    )
+                    if retried_decoded and not detect_person_shift_leak(text, retried_decoded, _s, _d):
+                        decoded = retried_decoded
+                except Exception as retry_exc:
+                    log.warning("HF MT retry failed: %s", retry_exc)
+
             hollow, reason = _hollow_check(decoded, text)
             results.append(
                 MtResult(
