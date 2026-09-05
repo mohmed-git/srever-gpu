@@ -17,6 +17,7 @@ import json
 import logging
 import struct
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -178,6 +179,8 @@ class _Slot:
         self.utt_id = utt_id
         self.buffer = bytearray()
         self.seq_seen: set[int] = set()
+        self.last_seq: int | None = None
+        self.saw_preroll: bool = False
         self.closed: bool = False
         self.created_at: float = time.monotonic()
 
@@ -197,18 +200,25 @@ class _StreamState:
         self.utterances = 0
         # Streaming stays opt-outable per connection
         self.stream: bool = settings.sentence_streaming
-        self.protocol_version: int = 1
+        self.protocol_version: int | None = None
         self.slots: dict[int, _Slot] = {}
+        self.committed_utts: deque[int] = deque(maxlen=64)
         self.send_lock = asyncio.Lock()
         self.utterance_queue: asyncio.Queue[tuple[bytes, int | None] | None] = asyncio.Queue(maxsize=3)
         self.worker_task: asyncio.Task[None] | None = None
+        self.closed: bool = False
+
+    def record_committed(self, utt_id: int) -> None:
+        self.committed_utts.append(utt_id)
 
     async def send_json(self, data: dict[str, Any]) -> None:
+        if self.closed:
+            return
         async with self.send_lock:
             try:
                 await self.websocket.send_json(data)
             except Exception:
-                pass
+                self.closed = True
 
     @property
     def max_bytes(self) -> int:
@@ -278,6 +288,8 @@ async def translate_stream(websocket: WebSocket) -> None:
             "event": "ready",
             "version": VERSION,
             "protocols": [1, 2],
+            "negotiated_protocol": state.protocol_version,
+            "tentative": "ack_only",
             "protocol": {
                 "version": 2,
                 "send_json": {
@@ -287,7 +299,7 @@ async def translate_stream(websocket: WebSocket) -> None:
                     "sample_rate": settings.sample_rate,
                     "channels": 1,
                     "protocol": "1 or 2 (default 1; 2 uses 6-byte binary header <BBHH)",
-                    "action": "'flush' to end the utterance and translate now, 'ping' for keep-alive",
+                    "action": "'flush' to end the utterance and translate now, 'ping' for keep-alive, 'abort' with 'utt'",
                     "stream": (
                         "true (default) for one frame per sentence then a "
                         "'final' frame; false for a single unified JSON"
@@ -367,32 +379,59 @@ async def translate_stream(websocket: WebSocket) -> None:
                         )
                         state.buffer.clear()
                     else:
-                        raw = bytes(state.buffer)
-                        state.buffer.clear()
+                        # I8-1: Check queue.full() BEFORE clearing buffer!
                         if state.utterance_queue.full():
                             await state.send_json({
                                 "error": "overloaded",
+                                "retry_after_ms": 250,
                                 "detail": "utterance queue full (backpressure cap: 3)",
                             })
                         else:
+                            raw = bytes(state.buffer)
+                            state.buffer.clear()
                             await state.utterance_queue.put((raw, None))
                     continue
 
                 if action == "reset":
                     state.buffer.clear()
                     state.slots.clear()
-                    await state.send_json({"event": "reset", "buffered_bytes": 0})
+                    drained = 0
+                    while not state.utterance_queue.empty():
+                        try:
+                            state.utterance_queue.get_nowait()
+                            state.utterance_queue.task_done()
+                            drained += 1
+                        except (asyncio.QueueEmpty, ValueError):
+                            break
+                    await state.send_json({"event": "reset", "buffered_bytes": 0, "drained_utterances": drained})
                     continue
 
                 if action == "ping":
-                    # Invariant I8: Sub-millisecond response time guaranteed, never blocked by compute
+                    # Invariant I8: Sub-5ms response time under normal conditions (GIL may cause ~20-60ms spikes during PyTorch MT generate)
                     await state.send_json({"event": "pong", "time": time.time()})
                     continue
 
                 if action == "tentative":
                     utt_val = control.get("utt")
-                    if utt_val is not None:
-                        await state.send_json({"event": "tentative_ack", "utt": int(utt_val)})
+                    try:
+                        utt_int = int(utt_val) if utt_val is not None else None
+                    except (TypeError, ValueError):
+                        await state.send_json({"error": "bad_request", "detail": "tentative utt must be an integer"})
+                        continue
+                    if utt_int is not None:
+                        await state.send_json({"event": "tentative_ack", "utt": utt_int})
+                    continue
+
+                if action == "abort":
+                    utt_val = control.get("utt")
+                    try:
+                        utt_int = int(utt_val) if utt_val is not None else None
+                    except (TypeError, ValueError):
+                        utt_int = None
+                    if utt_int is not None:
+                        slot = state.slots.pop(utt_int, None)
+                        freed_bytes = len(slot.buffer) if slot else 0
+                        await state.send_json({"event": "aborted", "utt": utt_int, "freed_bytes": freed_bytes})
                     continue
 
                 if action == "close":
@@ -417,57 +456,159 @@ async def translate_stream(websocket: WebSocket) -> None:
             if chunk is None:
                 continue
 
+            # Require protocol negotiation before binary frames
+            if state.protocol_version is None and state.audio_format != "pcm_s16le_framed":
+                if PIPELINE is not None:
+                    PIPELINE.metrics.incr("bad_frame")
+                await state.send_json({
+                    "error": "bad_frame",
+                    "detail": "binary frame received before protocol negotiation; send {'protocol': 1|2} first",
+                })
+                continue
+
             # Protocol v2 framed audio: struct "<BBHH" (version, flags, utt_id, seq)
-            if len(chunk) >= 6 and (state.protocol_version == 2 or state.audio_format == "pcm_s16le_framed"):
+            if state.protocol_version == 2 or state.audio_format == "pcm_s16le_framed":
+                if len(chunk) < 6:
+                    if PIPELINE is not None:
+                        PIPELINE.metrics.incr("bad_frame")
+                    await state.send_json({
+                        "error": "bad_frame",
+                        "detail": f"chunk length {len(chunk)} < 6 bytes header",
+                    })
+                    continue
+
                 try:
                     version, flags, utt_id, seq = struct.unpack("<BBHH", chunk[:6])
                     if version != 2:
+                        if PIPELINE is not None:
+                            PIPELINE.metrics.incr("bad_frame")
                         await state.send_json({"error": "bad_frame", "detail": f"unsupported protocol version {version}"})
                         await websocket.close(code=1003)
                         break
 
                     payload = memoryview(chunk)[6:]
                     if len(payload) % 2 != 0:
+                        if PIPELINE is not None:
+                            PIPELINE.metrics.incr("bad_frame")
                         await state.send_json({
                             "error": "bad_frame",
                             "detail": f"odd payload length {len(payload)}: 16-bit PCM requires even bytes",
                             "utterance": utt_id,
+                            "seq": seq,
                         })
                         continue
 
-                    slot = state.slots.setdefault(utt_id, _Slot(utt_id))
-                    if seq not in slot.seq_seen:
-                        slot.seq_seen.add(seq)
-                        # Payload length <= max_bytes - len(slot.buf); overflow -> auto-commit
-                        if len(slot.buffer) + len(payload) > state.max_bytes:
-                            log.warning("slot %d buffer overflow: auto-committing %d bytes", utt_id, len(slot.buffer))
-                            flags |= 0x02  # Force commit
-                        else:
-                            slot.buffer.extend(payload)
+                    # I2 & I7: Check if utterance was already committed
+                    if utt_id in state.committed_utts:
+                        if PIPELINE is not None:
+                            PIPELINE.metrics.incr("late_frame_dropped")
+                        if flags & 0x02:
+                            await state.send_json({"event": "already_committed", "utt": utt_id})
+                        continue
 
-                    # Check flags: bit 1 is LAST (commit)
-                    if flags & 0x02:
-                        slot.closed = True
+                    slot = state.slots.setdefault(utt_id, _Slot(utt_id))
+
+                    # PREROLL flag check (bit 0: 0x01)
+                    if flags & 0x01:
+                        if slot.saw_preroll and PIPELINE is not None:
+                            PIPELINE.metrics.incr("duplicate_preroll")
+                        slot.saw_preroll = True
+
+                    # Sequence check and modulo 2^16 wrap arithmetic (I1 / I10)
+                    if seq in slot.seq_seen:
+                        # Duplicate frame: drop
+                        continue
+
+                    if slot.last_seq is not None:
+                        diff = (seq - slot.last_seq) & 0xFFFF
+                        if diff != 1:
+                            if PIPELINE is not None:
+                                PIPELINE.metrics.incr("seq_gap")
+                            log.warning("slot %d seq gap: expected %d, got %d (diff=%d)", utt_id, (slot.last_seq + 1) & 0xFFFF, seq, diff)
+
+                    slot.last_seq = seq
+                    slot.seq_seen.add(seq)
+
+                    # Overflow handling: append what fits, auto-commit, roll remainder to utt+1
+                    if len(slot.buffer) + len(payload) > state.max_bytes:
+                        if PIPELINE is not None:
+                            PIPELINE.metrics.incr("auto_commit")
+                        space = max(0, state.max_bytes - len(slot.buffer))
+                        if space > 0:
+                            slot.buffer.extend(payload[:space])
+                        remainder = bytes(payload[space:])
+
                         raw = bytes(slot.buffer)
                         state.slots.pop(utt_id, None)
+                        state.record_committed(utt_id)
+
                         if not state.target:
                             await state.send_json({
                                 "error": "missing_target",
                                 "detail": "target language not set",
                                 "utterance": utt_id,
                             })
+                        elif state.utterance_queue.full():
+                            await state.send_json({
+                                "error": "overloaded",
+                                "retry_after_ms": 250,
+                                "detail": "utterance queue full (backpressure cap: 3)",
+                                "utterance": utt_id,
+                            })
                         else:
-                            if state.utterance_queue.full():
-                                await state.send_json({
-                                    "error": "overloaded",
-                                    "detail": "utterance queue full (backpressure cap: 3)",
-                                    "utterance": utt_id,
-                                })
-                            else:
-                                await state.utterance_queue.put((raw, utt_id))
+                            await state.utterance_queue.put((raw, utt_id))
+
+                        # Rollover remainder into next_utt = utt_id + 1
+                        next_utt = (utt_id + 1) & 0xFFFF
+                        next_slot = state.slots.setdefault(next_utt, _Slot(next_utt))
+                        if remainder:
+                            next_slot.buffer.extend(remainder)
+                        next_slot.last_seq = seq
+                        next_slot.seq_seen.add(seq)
+
+                        await state.send_json({
+                            "event": "auto_commit",
+                            "utt": utt_id,
+                            "rolled_to": next_utt,
+                        })
                         continue
+
+                    slot.buffer.extend(payload)
+
+                    # Check flags: bit 1 is LAST (commit)
+                    if flags & 0x02:
+                        if not state.target:
+                            await state.send_json({
+                                "error": "missing_target",
+                                "detail": "target language not set",
+                                "utterance": utt_id,
+                            })
+                            continue
+
+                        # I8-1: check full() BEFORE popping slot or clearing buffer!
+                        if state.utterance_queue.full():
+                            await state.send_json({
+                                "error": "overloaded",
+                                "retry_after_ms": 250,
+                                "detail": "utterance queue full (backpressure cap: 3)",
+                                "utterance": utt_id,
+                            })
+                            continue
+
+                        slot.closed = True
+                        raw = bytes(slot.buffer)
+                        state.slots.pop(utt_id, None)
+                        state.record_committed(utt_id)
+                        await state.utterance_queue.put((raw, utt_id))
+                        continue
+
                 except Exception as exc:
+                    if PIPELINE is not None:
+                        PIPELINE.metrics.incr("bad_frame")
                     log.warning("error parsing framed binary audio: %s", exc)
+                    continue
+
+                continue
 
             # Protocol v1 legacy un-framed audio
             if len(state.buffer) + len(chunk) > state.max_bytes:
@@ -494,7 +635,10 @@ async def translate_stream(websocket: WebSocket) -> None:
             pass
     finally:
         if state.worker_task is not None and not state.worker_task.done():
-            await state.utterance_queue.put(None)
+            try:
+                state.utterance_queue.put_nowait(None)
+            except asyncio.QueueFull:
+                pass
             state.worker_task.cancel()
             try:
                 await state.worker_task
@@ -512,6 +656,9 @@ async def _utterance_worker(state: _StreamState) -> None:
             break
         raw, utt_id = item
         try:
+            if state.closed:
+                log.debug("connection closed; draining queued utterance %s", utt_id)
+                continue
             await _handle_utterance_payload(state, raw, utt_id)
         except Exception:
             log.exception("utterance worker error")

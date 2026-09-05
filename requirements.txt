@@ -22,7 +22,7 @@ sentencepiece>=0.2 # tokeniser for the CTranslate2 MT path
 
 # ---- MT: GPU path ---------------------------------------------------
 # transformers is used for the fast, ultra-stable CUDA translation engine.
-transformers>=4.44
+transformers>=4.56
 
 # ---- optional observability -----------------------------------------
 # pynvml gives VRAM + GPU utilisation in /metrics when torch is absent.

@@ -135,13 +135,14 @@ class Pipeline:
         # each item is timed on its own.
         results: list[AsrResult] = []
         for item in items:
-            results.append(
-                self.asr.transcribe(
-                    item["samples"],
-                    language=item["language"],
-                    batch_size=self.settings.asr_batch_size,
-                )
+            res = self.asr.transcribe(
+                item["samples"],
+                language=item["language"],
+                batch_size=self.settings.asr_batch_size,
             )
+            if res.dropped_segments > 0:
+                self.metrics.incr("guard_dropped_segments", res.dropped_segments)
+            results.append(res)
         return results
 
     def _run_mt_batch(self, items: list[tuple[str, str, str]]) -> list[Any]:

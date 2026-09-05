@@ -164,22 +164,44 @@ _CJK_TARGETS: Final[frozenset[str]] = frozenset(
 )
 
 
+# Person markers ONLY — no content words.
+_AR_1P = re.compile(
+    r"(?:^|[\s،,])(?:و)?(?:أنا|إنني|أنني|إني|نحن|إننا)(?=$|[\s،,؟?.!])"
+    r"|(?:^|\s)(?:و|ف)?(?:سأ|سوف\s+أ|أ)[\u0621-\u064A]{2,}"
+    r"|(?:^|\s)(?:و|ف)?(?:سن|سوف\s+ن|ن)[\u0621-\u064A]{2,}(?=$|[\s،,؟?.!])"
+    r"|[\u0621-\u064A]{2,}(?:ني|نا|ي)(?=$|[\s،,؟?.!])",
+    re.UNICODE,
+)
+_AR_1P_STOP = {
+    "نعم", "نحو", "نهار", "أين", "أنت", "أنتم", "أنتِ", "أي", "أو", "أم",
+    "إلى", "أمام", "أكثر", "أول", "أمس", "أحد", "أيضا", "أيضاً",
+    "أنك", "إنك", "أنكم", "إنكم", "أنكن", "إنكن", "أنه", "إنه", "أنها", "إنها",
+    "أنهم", "إنهم", "أن", "إن", "إذا", "إذن", "ألا", "إلا",
+}
+
 _FIRST_PERSON_EN = re.compile(r"\b(i|me|my|mine|myself|we|us|our|ours|ourselves)\b", re.IGNORECASE)
-_SECOND_PERSON_EN = re.compile(r"\b(you|your|yours|yourself|yourselves)\b", re.IGNORECASE)
 
-_FIRST_PERSON_AR_LEAK = re.compile(
-    r"\b(أنا|أنني|إنني|نحن|بخير|الحمد لله|يسعدني|أستطيع مساعدتك|كيف يمكنني مساعدتك)\b"
-    r"|(?:^|\s)(?:أشعر|أعمل|أعيش|أعتقد|أرى|لدي|عندي)\b",
-    re.UNICODE,
-)
-
-_FIRST_PERSON_AR = re.compile(
-    r"\b(أنا|أنني|إنني|نحن|بخير|الحمد لله|يسعدني|أشعر|أعمل|أعيش|أعتقد|أرى|لدي|عندي)\b",
-    re.UNICODE,
-)
-
+PERSON_MISMATCH_OBSERVED_COUNT: int = 0
 PERSON_MISMATCH_RETRY_COUNT: int = 0
 CHAT_LEAK_SUSPECTED_COUNT: int = 0
+
+
+def has_1p_ar(text: str) -> bool:
+    if not text:
+        return False
+    for m in _AR_1P.finditer(text):
+        token = m.group(0).strip(" ،,؟?.!")
+        if token:
+            base = token.lstrip("وف")
+            if token not in _AR_1P_STOP and base not in _AR_1P_STOP:
+                return True
+    return False
+
+
+def has_1p_en(text: str) -> bool:
+    if not text:
+        return False
+    return bool(_FIRST_PERSON_EN.search(text))
 
 
 def detect_person_mismatch(source_text: str, target_text: str, src_lang: str, dst_lang: str) -> bool:
@@ -192,20 +214,15 @@ def detect_person_mismatch(source_text: str, target_text: str, src_lang: str, ds
     norm_src = (src_lang or "").strip().lower().split("-")[0]
     norm_dst = (dst_lang or "").strip().lower().split("-")[0]
 
-    # Branch 1: en -> ar (Catch Chat Leak)
     if norm_dst == "ar":
-        src_lower = source_text.strip().lower()
-        has_1st_en = bool(_FIRST_PERSON_EN.search(src_lower))
-        has_2nd_en = bool(_SECOND_PERSON_EN.search(src_lower))
-        if (not has_1st_en or has_2nd_en) and _FIRST_PERSON_AR_LEAK.search(target_text):
+        src_1p = has_1p_en(source_text)
+        tgt_1p = has_1p_ar(target_text)
+        if not src_1p and tgt_1p:
             return True
-
-    # Branch 2: ar -> en (Catch 1st-person Omission error like 'أنا بخير أنت؟' -> 'How are you?')
     elif norm_src == "ar":
-        has_1st_ar = bool(_FIRST_PERSON_AR.search(source_text))
-        tgt_lower = target_text.strip().lower()
-        has_1st_en = bool(_FIRST_PERSON_EN.search(tgt_lower))
-        if has_1st_ar and not has_1st_en:
+        src_1p = has_1p_ar(source_text)
+        tgt_1p = has_1p_en(target_text)
+        if src_1p and not tgt_1p:
             return True
 
     return False
@@ -255,22 +272,19 @@ def clean_translation(text: str, target_lang: str = "", source_text: str = "") -
             out = re.sub(r"[\u4e00-\u9fff\u3400-\u4dbf]+", "", out).strip()
             out = re.sub(r"^(?:الترجمة|الترجمة إلى العربية|النص المترجم)\s*[:\-]\s*", "", out).strip()
 
-            # Conversational safety net: If input was an inquiry, output must not answer it with pleasantries
-            if source_text:
-                norm_src = re.sub(r"[^\w\s]", "", source_text.strip().lower())
-                if norm_src in {"how are you", "how are you doing", "how do you do", "how r you", "how are u"}:
-                    if any(p in out for p in ["أنا بخير", "بخير والحمد", "بخير شكرا", "بخير وانت", "بخير، وانت", "بخير، وأنت"]):
-                        out = "كيف حالك؟"
-                elif norm_src in {"how is it going", "hows it going"}:
-                    if any(p in out for p in ["أنا بخير", "بخير والحمد", "بخير شكرا"]):
-                        out = "كيف تجري الأمور؟"
-
     return out.strip()
 
 
 
-def _estimate_dynamic_tokens(items: list[tuple[str, str, str]], max_allowed: int) -> int:
+def _estimate_dynamic_tokens(items: list[tuple[str, str, str]], max_allowed: int, tokenizer: Any = None) -> int:
     """Safely bound max output tokens for spaced and unspaced scripts (CJK, Thai, etc.)."""
+    if tokenizer is not None:
+        try:
+            max_in = max((len(tokenizer.encode(t[0], add_special_tokens=False)) for t in items), default=4)
+            est = int(2.5 * max_in) + 12
+            return min(max_allowed, max(16, est))
+        except Exception:
+            pass
     max_words = max((len(t[0].split()) for t in items), default=4)
     max_chars = max((len(t[0]) for t in items), default=16)
     est = max(int(max_words * 2.5) + 12, int(max_chars * 1.2) + 8)
@@ -633,7 +647,7 @@ class QwenVllmEngine(MtEngine):
         from vllm import SamplingParams
 
         prompts = [self._prompt(t, s, d) for t, s, d in items]
-        dyn_tokens = _estimate_dynamic_tokens(items, self.settings.mt_max_new_tokens)
+        dyn_tokens = _estimate_dynamic_tokens(items, self.settings.mt_max_new_tokens, tokenizer=self._tokenizer)
         sampling = SamplingParams(
             temperature=0.0,
             top_p=1.0,
@@ -654,24 +668,9 @@ class QwenVllmEngine(MtEngine):
                 source_text=text,
             )
             if detect_person_mismatch(text, decoded, _s, _d):
-                global PERSON_MISMATCH_RETRY_COUNT, CHAT_LEAK_SUSPECTED_COUNT
-                PERSON_MISMATCH_RETRY_COUNT += 1
-                CHAT_LEAK_SUSPECTED_COUNT += 1
-                log.warning("Person mismatch / omission detected on input %r (got %r); retrying with hardened prompt", text, decoded)
-                try:
-                    retry_msgs = make_retry_translation_messages(text, _s, _d)
-                    retry_prompt = self._tokenizer.apply_chat_template(retry_msgs, tokenize=False, add_generation_prompt=True)
-                    retry_outputs = self._llm.generate([retry_prompt], sampling, use_tqdm=False)
-                    if retry_outputs and retry_outputs[0].outputs:
-                        retried_decoded = clean_translation(
-                            retry_outputs[0].outputs[0].text,
-                            target_lang=_d,
-                            source_text=text,
-                        )
-                        if retried_decoded and not detect_person_shift_leak(text, retried_decoded, _s, _d):
-                            decoded = retried_decoded
-                except Exception as retry_exc:
-                    log.warning("vLLM MT retry failed: %s", retry_exc)
+                global PERSON_MISMATCH_OBSERVED_COUNT
+                PERSON_MISMATCH_OBSERVED_COUNT += 1
+                log.info("Person mismatch observed (observe-only): src=%r tgt=%r", text, decoded)
 
             hollow, reason = _hollow_check(decoded, text)
             results.append(
@@ -749,7 +748,7 @@ class QwenHfEngine(MtEngine):
             dtype = torch.float16 if self.settings.on_cuda else torch.float32
             self._model = AutoModelForCausalLM.from_pretrained(
                 self.settings.mt_model,
-                dtype=dtype,
+                torch_dtype=dtype,
                 device_map="cuda:0" if self.settings.on_cuda else "cpu",
                 low_cpu_mem_usage=True,
             )
@@ -789,7 +788,7 @@ class QwenHfEngine(MtEngine):
         )
         started = time.perf_counter()
         # Cap generation length dynamically to prevent runaway decode latency
-        dyn_tokens = _estimate_dynamic_tokens(items, self.settings.mt_max_new_tokens)
+        dyn_tokens = _estimate_dynamic_tokens(items, self.settings.mt_max_new_tokens, tokenizer=self._tokenizer)
         with torch.inference_mode():
             generated = self._model.generate(
                 **encoded,
@@ -810,32 +809,9 @@ class QwenHfEngine(MtEngine):
                 source_text=text,
             )
             if detect_person_mismatch(text, decoded, _s, _d):
-                global PERSON_MISMATCH_RETRY_COUNT, CHAT_LEAK_SUSPECTED_COUNT
-                PERSON_MISMATCH_RETRY_COUNT += 1
-                CHAT_LEAK_SUSPECTED_COUNT += 1
-                log.warning("Person mismatch / omission detected on input %r (got %r); retrying with hardened prompt", text, decoded)
-                try:
-                    retry_msgs = make_retry_translation_messages(text, _s, _d)
-                    retry_prompt = self._tokenizer.apply_chat_template(retry_msgs, tokenize=False, add_generation_prompt=True)
-                    retry_enc = self._tokenizer([retry_prompt], return_tensors="pt").to(self._model.device)
-                    with torch.inference_mode():
-                        retry_gen = self._model.generate(
-                            **retry_enc,
-                            max_new_tokens=dyn_tokens,
-                            do_sample=False,
-                            pad_token_id=self._tokenizer.pad_token_id,
-                            eos_token_id=self._tokenizer.eos_token_id,
-                        )
-                    retry_new = retry_gen[0][retry_enc["input_ids"].shape[1]:]
-                    retried_decoded = clean_translation(
-                        self._tokenizer.decode(retry_new, skip_special_tokens=True),
-                        target_lang=_d,
-                        source_text=text,
-                    )
-                    if retried_decoded and not detect_person_shift_leak(text, retried_decoded, _s, _d):
-                        decoded = retried_decoded
-                except Exception as retry_exc:
-                    log.warning("HF MT retry failed: %s", retry_exc)
+                global PERSON_MISMATCH_OBSERVED_COUNT
+                PERSON_MISMATCH_OBSERVED_COUNT += 1
+                log.info("Person mismatch observed (observe-only): src=%r tgt=%r", text, decoded)
 
             hollow, reason = _hollow_check(decoded, text)
             results.append(

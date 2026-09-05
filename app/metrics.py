@@ -104,7 +104,15 @@ class Metrics:
         self._window = window
         self._budget_ms = budget_ms
         self._series: dict[str, Series] = {}
-        self._counters: dict[str, int] = {}
+        self._counters: dict[str, int] = {
+            "seq_gap": 0,
+            "late_frame_dropped": 0,
+            "duplicate_preroll": 0,
+            "bad_frame": 0,
+            "auto_commit": 0,
+            "guard_dropped_segments": 0,
+            "person_mismatch_observed": 0,
+        }
         self._started_at = time.time()
         self._inflight = 0
         self._peak_inflight = 0

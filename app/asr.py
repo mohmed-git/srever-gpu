@@ -56,6 +56,7 @@ class AsrResult:
     model: str
     compute_type: str
     batch_size: int
+    dropped_segments: int = 0
 
 
 class AsrEngine:
@@ -162,6 +163,7 @@ class AsrEngine:
         prob = getattr(info, "language_probability", None)
 
         hollow_reason: str | None = None
+        dropped_count = 0
         if not seg_list:
             hollow_reason = (
                 "whisper returned 0 segments: the audio was rejected (silence/VAD/noise), "
@@ -174,11 +176,11 @@ class AsrEngine:
                 s for s in seg_list
                 if not (getattr(s, "no_speech_prob", 0.0) > 0.6 and getattr(s, "avg_logprob", 0.0) < -1.0)
                 and getattr(s, "compression_ratio", 0.0) <= 2.4
-                and s.text.strip() not in _AR_HALLUCINATION_BLOCKLIST
+                and s.text.strip().rstrip(".!؟،, ") not in _AR_HALLUCINATION_BLOCKLIST
             ]
+            dropped_count = len(seg_list) - len(kept)
             text = " ".join(s.text.strip() for s in kept if s.text).strip()
-            if not text:
-                dropped_count = len(seg_list) - len(kept)
+            if not text and dropped_count > 0:
                 hollow_reason = f"hallucination guard dropped {dropped_count}/{len(seg_list)} segments"
 
         return AsrResult(
@@ -188,6 +190,7 @@ class AsrEngine:
             duration_s=round(duration_s, 3),
             asr_ms=round(asr_ms, 2),
             segments=len(seg_list),
+            dropped_segments=dropped_count,
             hollow=hollow_reason is not None,
             hollow_reason=hollow_reason,
             model=self.model_name,

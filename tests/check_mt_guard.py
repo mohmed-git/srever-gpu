@@ -16,7 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.config import Settings  # noqa: E402
-from app.mt import build_mt_engine, is_translatable  # noqa: E402
+from app.mt import build_mt_engine, is_translatable, detect_person_mismatch  # noqa: E402
 
 
 def main() -> int:
@@ -39,6 +39,60 @@ def main() -> int:
         if got != expected:
             failures.append(f"is_translatable({text!r}) = {got}, expected {expected}")
         print(f"[{status}] is_translatable({text!r}) = {got}")
+
+    print("\n--- Evaluating detect_person_mismatch against benchmark cases ---")
+    detector_cases = [
+        # Branch 2: ar -> en (omission errors)
+        ("أنا بخير أنت؟", "How are you?", "ar", "en", True),
+        ("أنا بخير أنت؟", "I am fine, and you?", "ar", "en", False),
+        ("بخير", "Fine", "ar", "en", False),
+        ("الحمد لله", "Praise be to God", "ar", "en", False),
+        ("هو بخير", "He is fine", "ar", "en", False),
+        ("هي بخير", "She is fine", "ar", "en", False),
+        ("هم بخير", "They are fine", "ar", "en", False),
+        ("أريد غرفة لليلتين", "A room for two nights", "ar", "en", True),
+        ("أريد غرفة لليلتين", "I want a room for two nights", "ar", "en", False),
+        ("سأذهب غداً", "Going tomorrow", "ar", "en", True),
+        ("سأذهب غداً", "I will go tomorrow", "ar", "en", False),
+        ("أشعر بالتعب", "Feeling tired", "ar", "en", True),
+        ("أشعر بالتعب", "I feel tired", "ar", "en", False),
+        ("لدي سؤال", "A question", "ar", "en", True),
+        ("لدي سؤال", "I have a question", "ar", "en", False),
+        ("أعتقد أنه جيد", "Think it is good", "ar", "en", True),
+        ("أعتقد أنه جيد", "I think it is good", "ar", "en", False),
+        # Branch 1: en -> ar (chat leak errors)
+        ("How are you?", "أنا بخير، أنت؟", "en", "ar", True),
+        ("How are you?", "كيف حالك؟", "en", "ar", False),
+        ("I am fine, thank you.", "أنا بخير، شكراً لك.", "en", "ar", False),
+        ("Are you okay?", "هل أنت بخير؟", "en", "ar", False),
+        ("Do you feel well?", "هل تشعر أنك بخير؟", "en", "ar", False),
+        ("Thank God you are here.", "الحمد لله أنك هنا.", "en", "ar", False),
+        ("How can I help you?", "كيف يمكنني مساعدتك؟", "en", "ar", False),
+        ("Where is the station?", "أين المحطة؟", "en", "ar", False),
+        ("Can you help me?", "هل يمكنك مساعدتي؟", "en", "ar", False),
+        ("I want to order food.", "أريد طلب الطعام.", "en", "ar", False),
+        ("We need a taxi.", "نحتاج إلى سيارة أجرة.", "en", "ar", False),
+        ("What is the time?", "كم الوقت؟", "en", "ar", False),
+        ("Good morning.", "صباح الخير.", "en", "ar", False),
+        ("See you tomorrow.", "أراك غداً.", "en", "ar", False),
+    ]
+
+    detector_fps = 0
+    detector_fns = 0
+    for src, tgt, sl, tl, expected in detector_cases:
+        got = detect_person_mismatch(src, tgt, sl, tl)
+        ok = got == expected
+        if not ok:
+            if got and not expected:
+                detector_fps += 1
+                failures.append(f"FALSE POSITIVE: {src!r} -> {tgt!r} tripped detector")
+            else:
+                detector_fns += 1
+                failures.append(f"FALSE NEGATIVE: {src!r} -> {tgt!r} missed by detector")
+        status = "ok" if ok else "FAIL"
+        print(f"[{status}] mismatch({src[:25]!r} -> {tgt[:25]!r}) = {got} (expected {expected})")
+
+    print(f"Detector benchmark: {len(detector_cases)} cases, {detector_fps} false positives, {detector_fns} false negatives")
 
     engine = build_mt_engine(Settings())
     engine.load()
