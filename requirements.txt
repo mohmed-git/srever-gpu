@@ -21,10 +21,7 @@ soxr>=0.4          # high-quality resampling; audio.py falls back if absent
 sentencepiece>=0.2 # tokeniser for the CTranslate2 MT path
 
 # ---- MT: GPU path ---------------------------------------------------
-# vLLM enables high-throughput continuous batching & prefix caching on CUDA.
-vllm>=0.6.3
-#
-# transformers is only needed for MT_BACKEND=qwen_hf (the portable fallback).
+# transformers is used for the fast, ultra-stable CUDA translation engine.
 transformers>=4.44
 
 # ---- optional observability -----------------------------------------
