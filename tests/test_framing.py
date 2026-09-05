@@ -186,6 +186,25 @@ class TestFramingInvariants(unittest.IsolatedAsyncioTestCase):
         await _utterance_worker(self.state)
         self.assertEqual(self.state.utterance_queue.qsize(), 0)
 
+    def test_protocol_v1_isolation_and_backward_compatibility(self):
+        # Invariant: Protocol 1 is the default for legacy clients (e.g. mobile APK 1.27.0)
+        self.assertEqual(self.state.protocol_version, 1)
+
+        # Mobile app sends config without 'protocol' key
+        self.state.apply({'source': 'ar', 'target': 'en', 'format': 'pcm_s16le', 'sample_rate': 16000})
+        self.assertEqual(self.state.protocol_version, 1)
+        self.assertEqual(self.state.source, 'ar')
+        self.assertEqual(self.state.target, 'en')
+
+        # Raw PCM chunk arrives - must NOT be dropped or rejected with bad_frame
+        chunk = b'\x01\x00' * 320
+        self.state.buffer.extend(chunk)
+        self.assertEqual(len(self.state.buffer), 640)
+
+        # Opt-in to Protocol 2 upgrades protocol_version
+        self.state.apply({'protocol': 2})
+        self.assertEqual(self.state.protocol_version, 2)
+
 
 class FakeAsrEngine:
     def __init__(self):

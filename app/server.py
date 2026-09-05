@@ -200,7 +200,7 @@ class _StreamState:
         self.utterances = 0
         # Streaming stays opt-outable per connection
         self.stream: bool = settings.sentence_streaming
-        self.protocol_version: int | None = None
+        self.protocol_version: int = 1
         self.slots: dict[int, _Slot] = {}
         self.committed_utts: deque[int] = deque(maxlen=64)
         self.send_lock = asyncio.Lock()
@@ -455,17 +455,6 @@ async def translate_stream(websocket: WebSocket) -> None:
             chunk = message.get("bytes")
             if chunk is None:
                 continue
-
-            # Require protocol negotiation before binary frames
-            if state.protocol_version is None and state.audio_format != "pcm_s16le_framed":
-                if PIPELINE is not None:
-                    PIPELINE.metrics.incr("bad_frame")
-                await state.send_json({
-                    "error": "bad_frame",
-                    "detail": "binary frame received before protocol negotiation; send {'protocol': 1|2} first",
-                })
-                continue
-
             # Protocol v2 framed audio: struct "<BBHH" (version, flags, utt_id, seq)
             if state.protocol_version == 2 or state.audio_format == "pcm_s16le_framed":
                 if len(chunk) < 6:
