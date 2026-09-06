@@ -583,6 +583,7 @@ class QwenCt2Engine(MtEngine):
         self.warmup_first_call_ms: float | None = None
         self.warmup_second_call_ms: float | None = None
         self.static_prompt_cached: bool | None = None
+        self._fallback_engine: MtEngine | None = None
 
     def _split_prompt(self, text: str, src: str, dst: str) -> tuple[str, list[str], list[str]]:
         """Return (cache_key, static_tokens, per_request_tokens) such that
@@ -646,9 +647,9 @@ class QwenCt2Engine(MtEngine):
         started = time.perf_counter()
         try:
             device = "cuda" if self.settings.on_cuda else "cpu"
-            compute = "float16" if self.settings.on_cuda else "int8"
+            compute = "auto" if self.settings.on_cuda else "int8"
 
-            actual_path = self._resolve_ct2_model_path(self.model_path, compute)
+            actual_path = self._resolve_ct2_model_path(self.model_path, "int8_float16" if self.settings.on_cuda else "int8")
             tok_path = self.tokenizer_path
             self._tokenizer = AutoTokenizer.from_pretrained(tok_path)
             self._generator = ctranslate2.Generator(
@@ -673,6 +674,8 @@ class QwenCt2Engine(MtEngine):
 
     @property
     def ready(self) -> bool:
+        if self._fallback_engine is not None:
+            return self._fallback_engine.ready
         return self._generator is not None and self._tokenizer is not None
 
     def warmup(self) -> None:
@@ -689,14 +692,25 @@ class QwenCt2Engine(MtEngine):
         self.warmup_second_call_ms = round((time.perf_counter() - t1) * 1000.0, 2)
 
         self.static_prompt_cached = True
+        probe_out = probe_res2[0].text if probe_res2 else ""
         log.info(
             "QwenCt2Engine warmup: first=%.1fms, second=%.1fms, probe_out=%r",
             self.warmup_first_call_ms,
             self.warmup_second_call_ms,
-            probe_res2[0].text if probe_res2 else "",
+            probe_out,
         )
+        if not probe_out or set(probe_out.strip()) == {"!"}:
+            log.warning(
+                "QwenCt2Engine warmup produced corrupt output (%r); activating fallback to QwenHfEngine",
+                probe_out,
+            )
+            self._fallback_engine = QwenHfEngine(self.settings)
+            self._fallback_engine.load()
+            log.info("Fallback to QwenHfEngine active and ready")
 
     def translate_batch(self, items: list[tuple[str, str, str]]) -> list[MtResult]:
+        if self._fallback_engine is not None and self._fallback_engine.ready:
+            return self._fallback_engine.translate_batch(items)
         if not self.ready:
             raise RuntimeError("MT model not loaded")
         if not items:
@@ -733,8 +747,12 @@ class QwenCt2Engine(MtEngine):
 
         results: list[MtResult] = []
         for _idx, output, full_prompt_tokens, text, _s, _d in collected:
-            out_tokens = output.sequences[0] if output.sequences else []
-            decoded_raw = self._tokenizer.convert_tokens_to_string(out_tokens)
+            if hasattr(output, "sequences_ids") and output.sequences_ids and output.sequences_ids[0]:
+                decoded_raw = self._tokenizer.decode(output.sequences_ids[0], skip_special_tokens=True)
+            elif output.sequences and output.sequences[0]:
+                decoded_raw = self._tokenizer.convert_tokens_to_string(output.sequences[0])
+            else:
+                decoded_raw = ""
             if "\n" in decoded_raw:
                 decoded_raw = decoded_raw.split("\n")[0]
             decoded = clean_translation(decoded_raw, target_lang=_d, source_text=text)
@@ -752,7 +770,7 @@ class QwenCt2Engine(MtEngine):
                     backend=self.name,
                     model=self.model_path,
                     input_tokens=len(full_prompt_tokens),
-                    output_tokens=len(out_tokens),
+                    output_tokens=len(output.sequences[0]) if output.sequences else 0,
                     batch_size=len(items),
                     hollow=hollow,
                     hollow_reason=reason,
@@ -761,6 +779,8 @@ class QwenCt2Engine(MtEngine):
         return results
 
     def info(self) -> dict[str, Any]:
+        if self._fallback_engine is not None and self._fallback_engine.ready:
+            return self._fallback_engine.info()
         return {
             "backend": self.name,
             "engine": "ctranslate2",
@@ -981,10 +1001,15 @@ class QwenHfEngine(MtEngine):
 
         started = time.perf_counter()
         try:
-            self._tokenizer = AutoTokenizer.from_pretrained(self.settings.mt_model)
+            hf_model = self.settings.mt_model
+            if not hf_model or "ct2" in hf_model.lower():
+                hf_model = self.settings.mt_tokenizer or "Qwen/Qwen2.5-1.5B-Instruct"
+            target_model, _ = _resolve_awq_model(hf_model, self.settings.mt_quant)
+            tok_path = self.settings.mt_tokenizer or hf_model
+            self._tokenizer = AutoTokenizer.from_pretrained(tok_path)
             dtype = torch.float16 if self.settings.on_cuda else torch.float32
             self._model = AutoModelForCausalLM.from_pretrained(
-                self.settings.mt_model,
+                target_model,
                 torch_dtype=dtype,
                 device_map="cuda:0" if self.settings.on_cuda else "cpu",
                 low_cpu_mem_usage=True,
@@ -994,7 +1019,7 @@ class QwenHfEngine(MtEngine):
             self.error = f"{type(exc).__name__}: {exc}"
             raise
         self.load_seconds = time.perf_counter() - started
-        log.info("MT ready: qwen_hf model=%s load=%.2fs", self.settings.mt_model, self.load_seconds)
+        log.info("MT ready: qwen_hf model=%s load=%.2fs", target_model, self.load_seconds)
 
     @property
     def ready(self) -> bool:
