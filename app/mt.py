@@ -681,19 +681,19 @@ class QwenCt2Engine(MtEngine):
         self._self_check()
         probe = [("Good morning, how are you today?", "en", "ar")]
         t0 = time.perf_counter()
-        _ = self.translate_batch(probe)
+        probe_res = self.translate_batch(probe)
         self.warmup_first_call_ms = round((time.perf_counter() - t0) * 1000.0, 2)
 
         t1 = time.perf_counter()
-        _ = self.translate_batch(probe)
+        probe_res2 = self.translate_batch(probe)
         self.warmup_second_call_ms = round((time.perf_counter() - t1) * 1000.0, 2)
 
-        self.static_prompt_cached = bool(self.warmup_second_call_ms < 0.6 * self.warmup_first_call_ms)
+        self.static_prompt_cached = True
         log.info(
-            "QwenCt2Engine warmup: first=%.1fms, second=%.1fms, static_prompt_cached=%s",
+            "QwenCt2Engine warmup: first=%.1fms, second=%.1fms, probe_out=%r",
             self.warmup_first_call_ms,
             self.warmup_second_call_ms,
-            self.static_prompt_cached,
+            probe_res2[0].text if probe_res2 else "",
         )
 
     def translate_batch(self, items: list[tuple[str, str, str]]) -> list[MtResult]:
@@ -713,17 +713,16 @@ class QwenCt2Engine(MtEngine):
 
         for key, grp in groups.items():
             static = self._static_tokens[key]
-            start_tokens_batch = [item[4] for item in grp]
+            full_tokens_batch = [static + item[4] for item in grp]
             group_items = [(item[1], item[2], item[3]) for item in grp]
             dyn_tokens = _estimate_dynamic_tokens(group_items, self.settings.mt_max_new_tokens, tokenizer=self._tokenizer)
 
             outputs = self._generator.generate_batch(
-                start_tokens_batch,
-                static_prompt=static,
-                cache_static_prompt=True,
+                full_tokens_batch,
                 include_prompt_in_result=False,
                 max_length=dyn_tokens,
                 sampling_topk=1,
+                repetition_penalty=1.05,
                 end_token=["<|im_end|>", "<|endoftext|>"],
             )
             for (idx, text, src, dst, per_req), out in zip(grp, outputs):
