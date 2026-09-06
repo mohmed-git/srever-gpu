@@ -83,6 +83,7 @@ class _Job(Generic[T, R]):
     payload: T
     future: asyncio.Future
     enqueued_at: float = field(default_factory=time.perf_counter)
+    priority: int = 0
 
 
 class BatchScheduler(Generic[T, R]):
@@ -121,7 +122,8 @@ class BatchScheduler(Generic[T, R]):
         # service times of queue we tolerate before shedding.
         self.unreachable_budget_queue_multiple = max(1.0, unreachable_budget_queue_multiple)
 
-        self._queue: deque[_Job[T, R]] = deque()
+        # Priority queues: 0 (commit), 1 (tentative), 2 (pre-translate), 3 (partial)
+        self._queues: dict[int, deque[_Job[T, R]]] = {0: deque(), 1: deque(), 2: deque(), 3: deque()}
         self._wakeup: asyncio.Event | None = None
         self._worker: asyncio.Task | None = None
         self._closing = False
@@ -153,82 +155,93 @@ class BatchScheduler(Generic[T, R]):
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 self._worker.cancel()
         # Anything still queued must be failed explicitly, not left hanging.
-        while self._queue:
-            job = self._queue.popleft()
-            if not job.future.done():
-                job.future.set_exception(RuntimeError("server shutting down"))
+        for prio in (0, 1, 2, 3):
+            while self._queues[prio]:
+                job = self._queues[prio].popleft()
+                if not job.future.done():
+                    job.future.set_exception(RuntimeError("server shutting down"))
+
+    def _total_depth(self) -> int:
+        return sum(len(q) for q in self._queues.values())
+
+    @property
+    def _queue(self) -> list[_Job[T, R]]:
+        res = []
+        for prio in (0, 1, 2, 3):
+            res.extend(self._queues[prio])
+        return res
 
     # ---- admission -----------------------------------------------------
     def projected_wait_ms(self) -> float | None:
         """Estimated queue wait for a request arriving now. None = not yet measurable."""
         if self._per_item_ms is None:
             return None
-        depth = len(self._queue)
+        depth = self._total_depth()
         # Items ahead are served in batches of at most max_batch, and a batch
         # costs roughly per_item_ms * batch_size on a serial device.
         batches_ahead = (depth + self.max_batch - 1) // self.max_batch
         return batches_ahead * self._per_item_ms * min(self.max_batch, max(1, depth))
 
-    def _admit_or_raise(self) -> None:
-        depth = len(self._queue)
+    def _admit_or_raise(self, priority: int = 0) -> None:
+        depth = self._total_depth()
         if depth >= self.max_queue_depth:
-            self._rejected += 1
-            raise Overloaded(
-                f"queue for '{self.name}' is full ({depth}/{self.max_queue_depth})",
-                queue_depth=depth,
-                projected_wait_ms=self.projected_wait_ms() or 0.0,
-                budget_ms=self.budget_ms,
-                retry_after_s=1.0,
-            )
+            # Under Overloaded, shed 3 then 2; never shed 0 except by max_queue_depth
+            if priority < 2:
+                for shed_prio in (3, 2):
+                    if self._queues[shed_prio]:
+                        shed_job = self._queues[shed_prio].popleft()
+                        self._rejected += 1
+                        if not shed_job.future.done():
+                            shed_job.future.set_exception(
+                                Overloaded(
+                                    f"shed priority {shed_prio} to accommodate priority {priority}",
+                                    queue_depth=self._total_depth(),
+                                    projected_wait_ms=self.projected_wait_ms() or 0.0,
+                                    budget_ms=self.budget_ms,
+                                    retry_after_s=0.25,
+                                )
+                            )
+                        break
+            depth = self._total_depth()
+            if depth >= self.max_queue_depth:
+                self._rejected += 1
+                raise Overloaded(
+                    f"queue for '{self.name}' is full ({depth}/{self.max_queue_depth})",
+                    queue_depth=depth,
+                    projected_wait_ms=self.projected_wait_ms() or 0.0,
+                    budget_ms=self.budget_ms,
+                    retry_after_s=1.0,
+                )
+
+        if priority == 0:
+            # Commits never shed by projected wait
+            return
+
         if not (self.admission_enabled and self.reject_over_budget):
             return
         projected = self.projected_wait_ms()
         if projected is None:
             return  # no measurement yet: do not refuse on a guess
 
-        # MEASURED DEFECT this guard fixes: on CPU the measured service time is
-        # ~1450 ms against a 150 ms budget, so *any* queue at all projects over
-        # budget and the first version of this check rejected 46 of 48 requests
-        # at peak_queue_depth=1. That is not load shedding, that is a server
-        # that refuses to work.
-        #
-        # Admission control is only meaningful when the device can meet the
-        # budget when idle. When one item already costs more than the budget,
-        # the budget is unreachable by construction and rejecting traffic
-        # cannot fix it -- it only hides a hardware verdict behind 503s. So we
-        # fall back to protecting against unbounded queue *growth* (the real
-        # failure mode) using a multiple of the measured service time, and
-        # leave the "you missed the budget" reporting to /health and /metrics,
-        # which state it plainly.
         if self._per_item_ms is not None and self._per_item_ms > self.budget_ms:
             limit = self._per_item_ms * self.unreachable_budget_queue_multiple
-            if projected > limit:
-                self._rejected += 1
-                raise Overloaded(
-                    (
-                        f"projected queue wait {projected:.0f} ms exceeds {limit:.0f} ms "
-                        f"({self.unreachable_budget_queue_multiple:g}x the measured "
-                        f"{self._per_item_ms:.0f} ms service time). NOTE: this device "
-                        f"cannot meet the {self.budget_ms:.0f} ms budget even when idle, "
-                        f"so admission is protecting against unbounded queue growth, "
-                        f"not enforcing the budget"
-                    ),
-                    queue_depth=depth,
-                    projected_wait_ms=projected,
-                    budget_ms=self.budget_ms,
-                    retry_after_s=max(0.05, projected / 1000.0),
-                )
-            return
+        else:
+            limit = self.budget_ms * self.overload_factor
 
-        limit = self.budget_ms * self.overload_factor
-        if projected > limit:
+        # Priority-aware thresholds: shed 3 (partials) then 2 (pre-translate)
+        threshold = limit
+        if priority == 3:
+            threshold = 0.5 * limit
+        elif priority == 2:
+            threshold = 0.8 * limit
+
+        if projected > threshold:
             self._rejected += 1
             raise Overloaded(
                 (
                     f"projected queue wait {projected:.0f} ms exceeds the "
-                    f"{limit:.0f} ms admission limit; this server refuses work it "
-                    f"cannot finish inside the latency budget rather than letting "
-                    f"latency diverge silently"
+                    f"{threshold:.0f} ms admission limit for priority {priority}; "
+                    f"shedding speculative work to preserve latency budget"
                 ),
                 queue_depth=depth,
                 projected_wait_ms=projected,
@@ -237,16 +250,18 @@ class BatchScheduler(Generic[T, R]):
             )
 
     # ---- submission ----------------------------------------------------
-    async def submit(self, payload: T) -> tuple[R, dict[str, Any]]:
-        """Queue one item. Returns (result, timing). Raises Overloaded when shedding."""
+    async def submit(self, payload: T, priority: int = 0) -> tuple[R, dict[str, Any]]:
+        """Queue one item with priority (0 commit, 1 tentative, 2 pre-translate, 3 partial).
+        Returns (result, timing). Raises Overloaded when shedding."""
         if self._worker is None or self._wakeup is None:
             raise RuntimeError(f"scheduler '{self.name}' not started")
-        self._admit_or_raise()
+        prio = min(3, max(0, priority))
+        self._admit_or_raise(priority=prio)
 
         loop = asyncio.get_running_loop()
-        job: _Job[T, R] = _Job(payload=payload, future=loop.create_future())
-        self._queue.append(job)
-        self._peak_queue = max(self._peak_queue, len(self._queue))
+        job: _Job[T, R] = _Job(payload=payload, future=loop.create_future(), priority=prio)
+        self._queues[prio].append(job)
+        self._peak_queue = max(self._peak_queue, self._total_depth())
         self._wakeup.set()
 
         result = await job.future
@@ -260,7 +275,8 @@ class BatchScheduler(Generic[T, R]):
     async def _run(self) -> None:
         assert self._wakeup is not None
         while not self._closing:
-            if not self._queue:
+            depth = self._total_depth()
+            if depth == 0:
                 try:
                     await asyncio.wait_for(self._wakeup.wait(), timeout=0.5)
                 except asyncio.TimeoutError:
@@ -269,12 +285,16 @@ class BatchScheduler(Generic[T, R]):
                 continue
 
             # Coalescing window: give more requests a chance to join the batch.
-            if self.wait_s > 0 and len(self._queue) < self.max_batch:
+            if self.wait_s > 0 and depth < self.max_batch:
                 await asyncio.sleep(self.wait_s)
 
             batch: list[_Job[T, R]] = []
-            while self._queue and len(batch) < self.max_batch:
-                batch.append(self._queue.popleft())
+            for prio in (0, 1, 2, 3):
+                q = self._queues[prio]
+                while q and len(batch) < self.max_batch:
+                    batch.append(q.popleft())
+                if len(batch) >= self.max_batch:
+                    break
             if not batch:
                 continue
 

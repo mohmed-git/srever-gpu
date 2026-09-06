@@ -117,6 +117,14 @@ class Metrics:
             "tentative_await": 0,
             "tentative_miss": 0,
             "tentative_cancelled": 0,
+            "tentative_skipped_too_short": 0,
+            "tentative_skipped_rate_limited": 0,
+            "tentative_skipped_seq_mismatch": 0,
+            "partials_run": 0,
+            "partials_skipped": 0,
+            "presplit_hit": 0,
+            "presplit_miss": 0,
+            "aborted": 0,
         }
         self._started_at = time.time()
         self._inflight = 0

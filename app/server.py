@@ -13,11 +13,12 @@ GET  /capabilities             what this build can and cannot do, with numbers
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import struct
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -31,6 +32,7 @@ from .config import SETTINGS, Settings
 from .metrics import resource_report
 from .pipeline import Pipeline, RequestError
 from .scheduler import Overloaded
+from .sentences import _TERMINATORS, split_sentences
 
 VERSION = "1.0.0"
 
@@ -172,6 +174,12 @@ _CONTROL_KEYS = {
 }
 
 
+def norm_hash(text: str) -> str:
+    """Normalized hash for sentence caching in mt_cache."""
+    cleaned = " ".join(text.strip().lower().split())
+    return hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:16]
+
+
 class _Slot:
     """Per-utterance buffer slot for Protocol v2 framed streaming."""
 
@@ -182,11 +190,30 @@ class _Slot:
         self.last_seq: int | None = None
         self.saw_preroll: bool = False
         self.closed: bool = False
+        self.committed: bool = False
         self.created_at: float = time.monotonic()
+
+        # Tentative pass (Phase 2.4)
+        self.tentative_task: asyncio.Task[None] | None = None
+        self.tentative_seq: int = -1
+        self.tentative_result: tuple[list[dict[str, Any]], dict[str, Any], float] | None = None
+        self.tentative_started: float = 0.0
+        self.tentatives_issued: int = 0
+        self.last_tentative_audio_ms: int = 0
+
+        # UI Partials (Phase 2.4.4)
+        self.partial_task: asyncio.Task[None] | None = None
+        self.partial_rev: int = 0
+        self.partial_prev_words: list[str] = []
+        self.last_partial_started: float = 0.0
+
+    @property
+    def buf_ms(self) -> int:
+        return len(self.buffer) // 32
 
 
 class _StreamState:
-    """Per-connection state: languages plus audio buffers and async commit queue."""
+    """Per-connection state: languages plus audio buffers, mt_cache, and async commit queue."""
 
     def __init__(self, settings: Settings, websocket: WebSocket) -> None:
         self.settings = settings
@@ -202,11 +229,25 @@ class _StreamState:
         self.stream: bool = settings.sentence_streaming
         self.protocol_version: int = 1
         self.slots: dict[int, _Slot] = {}
+        self.mt_cache: OrderedDict[str, Any] = OrderedDict()  # LRU 32, key = norm_hash(sentence)
         self.committed_utts: deque[int] = deque(maxlen=64)
         self.send_lock = asyncio.Lock()
-        self.utterance_queue: asyncio.Queue[tuple[bytes, int | None] | None] = asyncio.Queue(maxsize=3)
+        self.utterance_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=3)
         self.worker_task: asyncio.Task[None] | None = None
         self.closed: bool = False
+
+    def cache_get(self, key: str) -> Any:
+        if key in self.mt_cache:
+            self.mt_cache.move_to_end(key)
+            return self.mt_cache[key]
+        return None
+
+    def cache_put(self, key: str, val: Any) -> None:
+        if key in self.mt_cache:
+            self.mt_cache.move_to_end(key)
+        self.mt_cache[key] = val
+        if len(self.mt_cache) > 32:
+            self.mt_cache.popitem(last=False)
 
     def record_committed(self, utt_id: int) -> None:
         self.committed_utts.append(utt_id)
@@ -263,6 +304,318 @@ class _StreamState:
                     self.stream = True
                 elif lowered in {"0", "false", "no", "off"}:
                     self.stream = False
+
+
+async def _run_tentative(state: _StreamState, slot: _Slot, seq: int) -> None:
+    slot_id = slot.utt_id
+    started = time.perf_counter()
+    raw = bytes(slot.buffer)
+    pipeline = PIPELINE
+    if pipeline is None or not pipeline.ready:
+        return
+
+    try:
+        decoded, decode_ms = await pipeline._decode_checked(
+            raw,
+            declared_format=state.audio_format,
+            input_sample_rate=state.sample_rate,
+            channels=state.channels,
+        )
+
+        src = state.source or "auto"
+        dst = state.target or ""
+        pinned_src = None if src == "auto" else src
+
+        asr_result, asr_timing = await pipeline._asr_sched.submit(
+            {"samples": decoded.samples, "language": pinned_src},
+            priority=1,
+        )
+        detected = pipeline._resolve_detected(src, asr_result)
+
+        if asr_result.hollow or not asr_result.text.strip():
+            await state.send_json({
+                "type": "tentative",
+                "utt": slot_id,
+                "seq": seq,
+                "terminal": False,
+                "hollow": True,
+            })
+            return
+
+        terminal = bool(asr_result.text.rstrip() and asr_result.text.rstrip()[-1] in _TERMINATORS)
+        await state.send_json({
+            "type": "tentative",
+            "utt": slot_id,
+            "seq": seq,
+            "terminal": terminal,
+            "original_text": asr_result.text,
+            "asr_ms": asr_result.asr_ms,
+        })
+
+        if not dst:
+            return
+
+        split = split_sentences(
+            asr_result.text,
+            min_chars=state.settings.sentence_min_chars,
+            max_sentences=state.settings.sentence_max_count,
+            enabled=state.settings.sentence_streaming,
+        )
+        sentences = list(split.sentences) or [asr_result.text]
+        passthrough = detected == dst
+
+        uncached: list[str] = []
+        presplit_hits = 0
+        for s in sentences:
+            h = norm_hash(s)
+            if state.cache_get(h) is not None:
+                presplit_hits += 1
+            else:
+                if s not in uncached and not passthrough:
+                    uncached.append(s)
+
+        if presplit_hits > 0 and pipeline is not None:
+            pipeline.metrics.incr("presplit_hit", presplit_hits)
+        misses = len(sentences) - presplit_hits
+        if misses > 0 and pipeline is not None:
+            pipeline.metrics.incr("presplit_miss", misses)
+
+        if uncached and not passthrough:
+            mt_jobs = [
+                pipeline._mt_sched.submit((s, detected, dst), priority=1)
+                for s in uncached
+            ]
+            mt_outcomes = await asyncio.gather(*mt_jobs)
+            for s, (res, _) in zip(uncached, mt_outcomes):
+                state.cache_put(norm_hash(s), res)
+
+        sentence_frames: list[dict[str, Any]] = []
+        translated_pieces: list[str] = []
+        mt_total_ms = 0.0
+        hollow_reasons: list[str] = []
+        first_sent_elapsed: float | None = None
+
+        for idx, s in enumerate(sentences):
+            if passthrough:
+                piece, piece_ms = s, 0.0
+                piece_hollow, piece_reason = False, None
+                mt_backend, out_tokens = None, None
+            else:
+                mt_res = state.cache_get(norm_hash(s))
+                if mt_res:
+                    piece = mt_res.text
+                    piece_ms = mt_res.mt_ms
+                    piece_hollow = mt_res.hollow
+                    piece_reason = mt_res.hollow_reason
+                    mt_backend = mt_res.backend
+                    out_tokens = mt_res.output_tokens
+                    mt_total_ms += piece_ms
+                else:
+                    piece = s
+                    piece_ms = 0.0
+                    piece_hollow, piece_reason = False, None
+                    mt_backend, out_tokens = None, None
+
+            translated_pieces.append(piece)
+            if piece_hollow and piece_reason:
+                hollow_reasons.append(f"sentence {idx + 1}: {piece_reason}")
+
+            elapsed = (time.perf_counter() - started) * 1000.0
+            if idx == 0:
+                first_sent_elapsed = elapsed
+
+            sentence_frames.append({
+                "type": "sentence",
+                "index": idx,
+                "sentence_count": len(sentences),
+                "is_last": idx == len(sentences) - 1,
+                "original_text": s,
+                "translated_text": piece,
+                "source_lang": detected,
+                "target_lang": dst,
+                "elapsed_ms": round(elapsed, 2),
+                "mt_ms": round(piece_ms, 2),
+                "mt_backend": mt_backend,
+                "output_tokens": out_tokens,
+                "hollow": piece_hollow,
+                "hollow_reason": piece_reason,
+                "rtl": lang_mod.is_rtl(dst),
+                "from_tentative": True,
+                "tentative_seq": seq,
+            })
+
+        tentative_pass_ms = (time.perf_counter() - started) * 1000.0
+        multi = len(sentences) > 1
+
+        final_frame = {
+            "type": "final",
+            "original_text": asr_result.text,
+            "translated_text": " ".join(t for t in translated_pieces if t).strip(),
+            "source_lang": detected,
+            "target_lang": dst,
+            "asr_ms": asr_result.asr_ms,
+            "mt_ms": round(mt_total_ms, 2),
+            "total_server_ms": round(tentative_pass_ms, 2),
+            "sentence_count": len(sentences),
+            "streamed": multi,
+            "split_reason": split.reason,
+            "first_sentence_ms": round(first_sent_elapsed, 2) if first_sent_elapsed is not None else None,
+            "time_saved_to_first_word_ms": round(tentative_pass_ms - first_sent_elapsed, 2) if (multi and first_sent_elapsed is not None) else 0.0,
+            "decode_ms": round(decode_ms, 2),
+            "audio_seconds": decoded.duration_s,
+            "audio_format": decoded.source_format,
+            "real_time_factor": round(tentative_pass_ms / (decoded.duration_s * 1000.0), 3) if decoded.duration_s > 0 else None,
+            "language_detected": src == "auto",
+            "passthrough": passthrough,
+            "hollow": bool(hollow_reasons),
+            "hollow_reason": "; ".join(hollow_reasons) or None,
+            "within_budget": tentative_pass_ms <= state.settings.latency_budget_ms,
+            "first_sentence_within_budget": (first_sent_elapsed is not None and first_sent_elapsed <= state.settings.latency_budget_ms),
+            "latency_budget_ms": state.settings.latency_budget_ms,
+            "rtl": lang_mod.is_rtl(dst),
+            "tentative_hit": None,
+            "time_saved_ms": None,
+            "presplit_hits": presplit_hits,
+        }
+
+        slot.tentative_result = (sentence_frames, final_frame, tentative_pass_ms)
+
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log.warning("Tentative run error for slot %d: %s", slot_id, exc)
+
+
+async def _run_partial(state: _StreamState, slot: _Slot, seq: int) -> None:
+    slot_id = slot.utt_id
+    pipeline = PIPELINE
+    if pipeline is None or not pipeline.ready:
+        return
+    started = time.perf_counter()
+    slot.last_partial_started = started
+    raw = bytes(slot.buffer)
+
+    try:
+        pipeline.metrics.incr("partials_run")
+        decoded, _ = await pipeline._decode_checked(
+            raw,
+            declared_format=state.audio_format,
+            input_sample_rate=state.sample_rate,
+            channels=state.channels,
+        )
+        src = state.source or "auto"
+        pinned_src = None if src == "auto" else src
+
+        asr_result, _ = await pipeline._asr_sched.submit(
+            {"samples": decoded.samples, "language": pinned_src},
+            priority=3,
+        )
+        if asr_result.hollow or not asr_result.text.strip():
+            return
+
+        words = asr_result.text.split()
+        prev = slot.partial_prev_words
+        match_len = 0
+        for w1, w2 in zip(words, prev):
+            if w1 == w2:
+                match_len += 1
+            else:
+                break
+
+        stable_words = words[:match_len]
+        unstable_words = words[match_len:]
+        slot.partial_prev_words = words
+
+        stable_str = " ".join(stable_words)
+        unstable_str = " ".join(unstable_words)
+        slot.partial_rev += 1
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+
+        detected = pipeline._resolve_detected(src, asr_result)
+        await state.send_json({
+            "type": "partial",
+            "utt": slot_id,
+            "seq": seq,
+            "rev": slot.partial_rev,
+            "stable": stable_str,
+            "unstable": unstable_str,
+            "lang": detected,
+            "elapsed_ms": round(elapsed_ms, 2),
+        })
+
+        # Closed-sentence pre-translation (priority 2)
+        if state.target and detected != state.target and len(stable_words) >= 2:
+            split = split_sentences(stable_str, min_chars=10, max_sentences=4, enabled=True)
+            candidate_sents = list(split.sentences)
+            if len(candidate_sents) > 1:
+                closed = candidate_sents[:-1]
+                for cs in closed:
+                    h = norm_hash(cs)
+                    if state.cache_get(h) is None:
+                        try:
+                            mt_res, _ = await pipeline._mt_sched.submit(
+                                (cs, detected, state.target),
+                                priority=2,
+                            )
+                            state.cache_put(h, mt_res)
+                        except Exception:
+                            pass
+
+    except asyncio.CancelledError:
+        raise
+    except Overloaded:
+        pipeline.metrics.incr("partials_skipped")
+    except Exception as exc:
+        log.debug("Partial error on slot %d: %s", slot_id, exc)
+
+
+async def _commit_slot(state: _StreamState, slot: _Slot, seq: int) -> None:
+    utt_id = slot.utt_id
+    pipeline = PIPELINE
+
+    if utt_id in state.committed_utts:
+        await state.send_json({"event": "already_committed", "utt": utt_id})
+        return
+
+    slot.closed = True
+    slot.committed = True
+    state.record_committed(utt_id)
+    state.slots.pop(utt_id, None)
+    commit_time = time.perf_counter()
+
+    if slot.partial_task and not slot.partial_task.done():
+        slot.partial_task.cancel()
+
+    # HIT: tentative_result present and tentative_seq == seq
+    if slot.tentative_result is not None and slot.tentative_seq == seq:
+        if pipeline is not None:
+            pipeline.metrics.incr("tentative_hit")
+        if not state.utterance_queue.full():
+            await state.utterance_queue.put(("serve_cached", slot, seq, slot.tentative_result, commit_time))
+        else:
+            await state.send_json({"error": "overloaded", "retry_after_ms": 250, "detail": "utterance queue full", "utterance": utt_id})
+        return
+
+    # AWAIT: tentative_task running and tentative_seq == seq
+    if slot.tentative_task is not None and not slot.tentative_task.done() and slot.tentative_seq == seq:
+        if pipeline is not None:
+            pipeline.metrics.incr("tentative_await")
+        if not state.utterance_queue.full():
+            await state.utterance_queue.put(("await_then_serve", slot, seq, slot.tentative_task, commit_time))
+        else:
+            await state.send_json({"error": "overloaded", "retry_after_ms": 250, "detail": "utterance queue full", "utterance": utt_id})
+        return
+
+    # MISS: cancel task, enqueue fresh
+    if pipeline is not None:
+        pipeline.metrics.incr("tentative_miss")
+    if slot.tentative_task and not slot.tentative_task.done():
+        slot.tentative_task.cancel()
+    raw = bytes(slot.buffer)
+    if not state.utterance_queue.full():
+        await state.utterance_queue.put(("fresh", raw, utt_id, commit_time))
+    else:
+        await state.send_json({"error": "overloaded", "retry_after_ms": 250, "detail": "utterance queue full", "utterance": utt_id})
 
 
 @app.websocket("/ws/v1/translate-stream")
@@ -345,22 +698,21 @@ async def translate_stream(websocket: WebSocket) -> None:
                         for s in list(state.slots.values()):
                             slot_id = s.utt_id
                             if len(s.buffer) >= 3200:
-                                raw = bytes(s.buffer)
-                                state.slots.pop(slot_id, None)
-                                state.record_committed(slot_id)
                                 if PIPELINE is not None:
                                     PIPELINE.metrics.incr("auto_commit")
                                     PIPELINE.metrics.incr("auto_commit_timeout")
-                                log.warning("Slot %d committed by 3.0s leak-guard (client_timeout, %d bytes)", slot_id, len(raw))
+                                log.warning("Slot %d committed by 3.0s leak-guard (client_timeout, %d bytes)", slot_id, len(s.buffer))
                                 await state.send_json({
                                     "event": "auto_commit",
                                     "reason": "client_timeout",
                                     "utt": slot_id,
                                 })
-                                if state.target and not state.utterance_queue.full():
-                                    await state.utterance_queue.put((raw, slot_id))
+                                await _commit_slot(state, s, s.last_seq)
                             else:
-                                # Drop tiny sub-100ms noise burst
+                                if s.tentative_task and not s.tentative_task.done():
+                                    s.tentative_task.cancel()
+                                if s.partial_task and not s.partial_task.done():
+                                    s.partial_task.cancel()
                                 state.slots.pop(slot_id, None)
                     elif state.buffer:
                         if len(state.buffer) >= 3200:
@@ -375,7 +727,7 @@ async def translate_stream(websocket: WebSocket) -> None:
                                 "reason": "client_timeout",
                             })
                             if state.target and not state.utterance_queue.full():
-                                await state.utterance_queue.put((raw, None))
+                                await state.utterance_queue.put(("fresh", raw, None, time.perf_counter()))
                         else:
                             state.buffer.clear()
                     continue
@@ -409,23 +761,23 @@ async def translate_stream(websocket: WebSocket) -> None:
                 state.apply(control)
                 action = str(control.get("action", "")).strip().lower()
 
-                if action in {"flush", "end", "eou"}:
-                    # Invariant I8: Hand off buffer to async utterance worker; DO NOT BLOCK receive loop!
-                    if state.protocol_version == 2 and any(len(s.buffer) > 0 for s in state.slots.values()):
-                        # Protocol v2 flush support: find targeted or latest active slot
+                if action in {"commit", "flush", "end", "eou"}:
+                    if state.protocol_version == 2:
                         utt_val = control.get("utt")
+                        seq_val = control.get("seq")
                         target_slot = None
                         if utt_val is not None:
                             try:
                                 target_slot = state.slots.get(int(utt_val))
                             except (TypeError, ValueError):
                                 pass
-                        if target_slot is None:
+                        if target_slot is None and state.slots:
                             for s in reversed(list(state.slots.values())):
                                 if s.buffer:
                                     target_slot = s
                                     break
-                        if target_slot and target_slot.buffer:
+
+                        if target_slot is not None:
                             slot_id = target_slot.utt_id
                             if not state.target:
                                 await state.send_json({
@@ -434,23 +786,20 @@ async def translate_stream(websocket: WebSocket) -> None:
                                     "utterance": slot_id,
                                 })
                                 continue
-                            if state.utterance_queue.full():
-                                await state.send_json({
-                                    "error": "overloaded",
-                                    "retry_after_ms": 250,
-                                    "detail": "utterance queue full (backpressure cap: 3)",
-                                    "utterance": slot_id,
-                                })
-                                continue
-                            raw = bytes(target_slot.buffer)
-                            state.slots.pop(slot_id, None)
-                            state.record_committed(slot_id)
-                            if PIPELINE is not None:
-                                PIPELINE.metrics.incr("flush_v2_committed")
-                            log.info("Committed slot %d via flush action (%d bytes)", slot_id, len(raw))
-                            await state.utterance_queue.put((raw, slot_id))
+                            c_seq = int(seq_val) if seq_val is not None else target_slot.last_seq
+                            await _commit_slot(state, target_slot, c_seq)
                             continue
 
+                        if utt_val is not None:
+                            try:
+                                u_id = int(utt_val)
+                                if u_id in state.committed_utts:
+                                    await state.send_json({"event": "already_committed", "utt": u_id})
+                                    continue
+                            except (TypeError, ValueError):
+                                pass
+
+                    # Legacy v1 buffer commit
                     if not state.buffer:
                         await state.send_json(
                             {"error": "empty_utterance", "detail": "flush received but no audio was buffered"}
@@ -464,22 +813,28 @@ async def translate_stream(websocket: WebSocket) -> None:
                         )
                         state.buffer.clear()
                     else:
-                        # I8-1: Check queue.full() BEFORE clearing buffer!
                         if state.utterance_queue.full():
                             await state.send_json({
                                 "error": "overloaded",
                                 "retry_after_ms": 250,
-                                "detail": "utterance queue full (backpressure cap: 3)",
+                                "detail": "utterance queue full (backpressure cap: 4)",
                             })
                         else:
                             raw = bytes(state.buffer)
                             state.buffer.clear()
-                            await state.utterance_queue.put((raw, None))
+                            await state.utterance_queue.put(("fresh", raw, None, time.perf_counter()))
                     continue
 
                 if action == "reset":
                     state.buffer.clear()
+                    for s in state.slots.values():
+                        if s.tentative_task and not s.tentative_task.done():
+                            s.tentative_task.cancel()
+                        if s.partial_task and not s.partial_task.done():
+                            s.partial_task.cancel()
                     state.slots.clear()
+                    state.mt_cache.clear()
+                    state.committed_utts.clear()
                     drained = 0
                     while not state.utterance_queue.empty():
                         try:
@@ -492,19 +847,59 @@ async def translate_stream(websocket: WebSocket) -> None:
                     continue
 
                 if action == "ping":
-                    # Invariant I8: Sub-5ms response time under normal conditions (GIL may cause ~20-60ms spikes during PyTorch MT generate)
                     await state.send_json({"event": "pong", "time": time.time()})
                     continue
 
                 if action == "tentative":
                     utt_val = control.get("utt")
+                    seq_val = control.get("seq")
                     try:
                         utt_int = int(utt_val) if utt_val is not None else None
+                        seq_int = int(seq_val) if seq_val is not None else None
                     except (TypeError, ValueError):
-                        await state.send_json({"error": "bad_request", "detail": "tentative utt must be an integer"})
+                        await state.send_json({"error": "bad_request", "detail": "tentative utt and seq must be integers"})
                         continue
-                    if utt_int is not None:
-                        await state.send_json({"event": "tentative_ack", "utt": utt_int})
+
+                    if utt_int is None or seq_int is None:
+                        await state.send_json({"error": "bad_request", "detail": "tentative requires utt and seq"})
+                        continue
+
+                    # 1. utt unknown or committed -> {"error":"unknown_utt"}
+                    if utt_int in state.committed_utts or utt_int not in state.slots:
+                        await state.send_json({"error": "unknown_utt", "utt": utt_int})
+                        continue
+
+                    slot = state.slots[utt_int]
+
+                    # 2. slot.buf_ms < 400 -> {"type":"tentative","utt","seq","skipped":"too_short"}; no work.
+                    if slot.buf_ms < 400:
+                        if PIPELINE is not None:
+                            PIPELINE.metrics.incr("tentative_skipped_too_short")
+                        await state.send_json({"type": "tentative", "utt": utt_int, "seq": seq_int, "skipped": "too_short"})
+                        continue
+
+                    # 3. Rate cap: if slot.buf_ms - last_tentative_audio_ms < 800 and a tentative already ran -> skipped:"rate_limited"
+                    if slot.tentatives_issued > 0 and (slot.buf_ms - slot.last_tentative_audio_ms) < 800:
+                        if PIPELINE is not None:
+                            PIPELINE.metrics.incr("tentative_skipped_rate_limited")
+                        await state.send_json({"type": "tentative", "utt": utt_int, "seq": seq_int, "skipped": "rate_limited"})
+                        continue
+
+                    # 4. seq != slot.last_seq -> skipped:"seq_mismatch" (client's view is stale; a frame is still in flight).
+                    if seq_int != slot.last_seq:
+                        if PIPELINE is not None:
+                            PIPELINE.metrics.incr("tentative_skipped_seq_mismatch")
+                        await state.send_json({"type": "tentative", "utt": utt_int, "seq": seq_int, "skipped": "seq_mismatch"})
+                        continue
+
+                    # 5. Cancel running tentative, update tracking, launch new run_tentative
+                    if slot.tentative_task is not None and not slot.tentative_task.done():
+                        slot.tentative_task.cancel()
+
+                    slot.tentative_seq = seq_int
+                    slot.last_tentative_audio_ms = slot.buf_ms
+                    slot.tentatives_issued += 1
+                    slot.tentative_task = asyncio.create_task(_run_tentative(state, slot, seq_int))
                     continue
 
                 if action == "abort":
@@ -515,7 +910,17 @@ async def translate_stream(websocket: WebSocket) -> None:
                         utt_int = None
                     if utt_int is not None:
                         slot = state.slots.pop(utt_int, None)
-                        freed_bytes = len(slot.buffer) if slot else 0
+                        if slot is not None:
+                            if slot.tentative_task and not slot.tentative_task.done():
+                                slot.tentative_task.cancel()
+                            if slot.partial_task and not slot.partial_task.done():
+                                slot.partial_task.cancel()
+                            slot.tentative_result = None
+                            freed_bytes = len(slot.buffer)
+                        else:
+                            freed_bytes = 0
+                        if PIPELINE is not None:
+                            PIPELINE.metrics.incr("aborted")
                         await state.send_json({"event": "aborted", "utt": utt_int, "freed_bytes": freed_bytes})
                     continue
 
@@ -584,8 +989,10 @@ async def translate_stream(websocket: WebSocket) -> None:
 
                     # PREROLL flag check (bit 0: 0x01)
                     if flags & 0x01:
-                        if slot.saw_preroll and PIPELINE is not None:
-                            PIPELINE.metrics.incr("duplicate_preroll")
+                        if slot.saw_preroll:
+                            if PIPELINE is not None:
+                                PIPELINE.metrics.incr("duplicate_preroll")
+                            continue
                         slot.saw_preroll = True
 
                     # Sequence check and modulo 2^16 wrap arithmetic (I1 / I10)
@@ -603,6 +1010,24 @@ async def translate_stream(websocket: WebSocket) -> None:
                     slot.last_seq = seq
                     slot.seq_seen.add(seq)
 
+                    # B.2 Discard: If tentative running or cached result present and seq > tentative_seq
+                    if (slot.tentative_task is not None and not slot.tentative_task.done()) or slot.tentative_result is not None:
+                        if slot.tentative_seq != -1 and seq != slot.tentative_seq and ((seq - slot.tentative_seq) & 0xFFFF) < 32768:
+                            if slot.tentative_task is not None and not slot.tentative_task.done():
+                                slot.tentative_task.cancel()
+                            slot.tentative_result = None
+                            disc_seq = slot.tentative_seq
+                            slot.tentative_seq = -1
+                            if PIPELINE is not None:
+                                PIPELINE.metrics.incr("tentative_cancelled")
+                            await state.send_json({
+                                "type": "discard",
+                                "utt": utt_id,
+                                "what": "tentative",
+                                "seq": disc_seq,
+                                "reason": "audio_after_tentative",
+                            })
+
                     # Overflow handling: append what fits, auto-commit, roll remainder to utt+1
                     if len(slot.buffer) + len(payload) > state.max_bytes:
                         if PIPELINE is not None:
@@ -612,68 +1037,39 @@ async def translate_stream(websocket: WebSocket) -> None:
                             slot.buffer.extend(payload[:space])
                         remainder = bytes(payload[space:])
 
-                        raw = bytes(slot.buffer)
-                        state.slots.pop(utt_id, None)
-                        state.record_committed(utt_id)
-
-                        if not state.target:
-                            await state.send_json({
-                                "error": "missing_target",
-                                "detail": "target language not set",
-                                "utterance": utt_id,
-                            })
-                        elif state.utterance_queue.full():
-                            await state.send_json({
-                                "error": "overloaded",
-                                "retry_after_ms": 250,
-                                "detail": "utterance queue full (backpressure cap: 3)",
-                                "utterance": utt_id,
-                            })
-                        else:
-                            await state.utterance_queue.put((raw, utt_id))
-
-                        # Rollover remainder into next_utt = utt_id + 1
                         next_utt = (utt_id + 1) & 0xFFFF
+                        await state.send_json({
+                            "event": "auto_commit",
+                            "reason": "max_utterance",
+                            "utt": utt_id,
+                            "rolled_to": next_utt,
+                        })
+                        await _commit_slot(state, slot, seq)
+
                         next_slot = state.slots.setdefault(next_utt, _Slot(next_utt))
                         if remainder:
                             next_slot.buffer.extend(remainder)
                         next_slot.last_seq = seq
                         next_slot.seq_seen.add(seq)
-
-                        await state.send_json({
-                            "event": "auto_commit",
-                            "utt": utt_id,
-                            "rolled_to": next_utt,
-                        })
                         continue
 
                     slot.buffer.extend(payload)
 
+                    # Partials: while frames are arriving and slot.buf_ms >= 800, every partial_ms
+                    if state.settings.partial_ms > 0 and slot.buf_ms >= 800:
+                        interval_s = state.settings.partial_ms / 1000.0
+                        now = time.monotonic()
+                        if now - slot.last_partial_started >= interval_s:
+                            if slot.partial_task is not None and not slot.partial_task.done():
+                                if PIPELINE is not None:
+                                    PIPELINE.metrics.incr("partials_skipped")
+                            elif slot.tentative_task is None or slot.tentative_task.done() or slot.tentative_seq != seq:
+                                slot.last_partial_started = now
+                                slot.partial_task = asyncio.create_task(_run_partial(state, slot, seq))
+
                     # Check flags: bit 1 is LAST (commit)
                     if flags & 0x02:
-                        if not state.target:
-                            await state.send_json({
-                                "error": "missing_target",
-                                "detail": "target language not set",
-                                "utterance": utt_id,
-                            })
-                            continue
-
-                        # I8-1: check full() BEFORE popping slot or clearing buffer!
-                        if state.utterance_queue.full():
-                            await state.send_json({
-                                "error": "overloaded",
-                                "retry_after_ms": 250,
-                                "detail": "utterance queue full (backpressure cap: 3)",
-                                "utterance": utt_id,
-                            })
-                            continue
-
-                        slot.closed = True
-                        raw = bytes(slot.buffer)
-                        state.slots.pop(utt_id, None)
-                        state.record_committed(utt_id)
-                        await state.utterance_queue.put((raw, utt_id))
+                        await _commit_slot(state, slot, seq)
                         continue
 
                 except Exception as exc:
@@ -708,6 +1104,14 @@ async def translate_stream(websocket: WebSocket) -> None:
         except Exception:
             pass
     finally:
+        state.closed = True
+        for s in list(state.slots.values()):
+            if s.tentative_task and not s.tentative_task.done():
+                s.tentative_task.cancel()
+            if s.partial_task and not s.partial_task.done():
+                s.partial_task.cancel()
+        state.slots.clear()
+        state.mt_cache.clear()
         if state.worker_task is not None and not state.worker_task.done():
             try:
                 state.utterance_queue.put_nowait(None)
@@ -728,12 +1132,62 @@ async def _utterance_worker(state: _StreamState) -> None:
             break
         if item is None:
             break
-        raw, utt_id = item
         try:
             if state.closed:
-                log.debug("connection closed; draining queued utterance %s", utt_id)
+                log.debug("connection closed; draining queued item")
                 continue
-            await _handle_utterance_payload(state, raw, utt_id)
+
+            # Check item kind
+            if isinstance(item, tuple) and len(item) == 5 and item[0] == "serve_cached":
+                _, slot, seq, (frames, final_frame, tentative_pass_ms), commit_time = item
+                utt_id = slot.utt_id
+                c2f_ms = (time.perf_counter() - commit_time) * 1000.0
+                if PIPELINE is not None:
+                    PIPELINE.metrics.observe("commit_to_first_frame_ms", c2f_ms)
+                    PIPELINE.metrics.observe("tentative_pass_ms", tentative_pass_ms)
+
+                for sf in frames:
+                    await state.send_json({**sf, "utterance": utt_id})
+
+                final_copy = dict(final_frame)
+                final_copy["tentative_hit"] = True
+                final_copy["time_saved_ms"] = round(tentative_pass_ms, 2)
+                await state.send_json({**final_copy, "utterance": utt_id})
+
+            elif isinstance(item, tuple) and len(item) == 5 and item[0] == "await_then_serve":
+                _, slot, seq, task, commit_time = item
+                utt_id = slot.utt_id
+                try:
+                    await task
+                except Exception:
+                    pass
+
+                if slot.tentative_result is not None:
+                    frames, final_frame, tentative_pass_ms = slot.tentative_result
+                    c2f_ms = (time.perf_counter() - commit_time) * 1000.0
+                    if PIPELINE is not None:
+                        PIPELINE.metrics.observe("commit_to_first_frame_ms", c2f_ms)
+                        PIPELINE.metrics.observe("tentative_pass_ms", tentative_pass_ms)
+
+                    for sf in frames:
+                        await state.send_json({**sf, "utterance": utt_id})
+
+                    final_copy = dict(final_frame)
+                    final_copy["tentative_hit"] = True
+                    final_copy["time_saved_ms"] = round(tentative_pass_ms, 2)
+                    await state.send_json({**final_copy, "utterance": utt_id})
+                else:
+                    raw = bytes(slot.buffer)
+                    await _handle_utterance_payload(state, raw, utt_id)
+
+            elif isinstance(item, tuple) and len(item) == 4 and item[0] == "fresh":
+                _, raw, utt_id, commit_time = item
+                await _handle_utterance_payload(state, raw, utt_id)
+
+            elif isinstance(item, tuple) and len(item) == 2:
+                raw, utt_id = item
+                await _handle_utterance_payload(state, raw, utt_id)
+
         except Exception:
             log.exception("utterance worker error")
         finally:

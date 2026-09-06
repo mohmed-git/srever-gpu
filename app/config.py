@@ -118,6 +118,8 @@ class Settings:
     )
     # CPU verification path: a real CT2 translation model that fits this box.
     mt_cpu_model_path: str = field(default_factory=lambda: _env("MT_CPU_MODEL_PATH", ""))
+    mt_tokenizer: str = field(default_factory=lambda: _env("MT_TOKENIZER", "Qwen/Qwen2.5-1.5B-Instruct"))
+    partial_ms: int = field(default_factory=lambda: _env_int("PARTIAL_MS", 320))
 
     # ---- admission control --------------------------------------------
     # Latency budget scaled to realistic real-time GPU target (500ms).

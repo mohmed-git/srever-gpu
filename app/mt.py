@@ -553,6 +553,11 @@ class M2M100Ct2Engine(MtEngine):
 # =====================================================================
 # Qwen2.5-Instruct on CTranslate2 -- fast low-latency generator path.
 # =====================================================================
+# Qwen2.5-Instruct on CTranslate2 -- fast low-latency generator path.
+# =====================================================================
+_TURN_FMT: Final[str] = "<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n"
+
+
 class QwenCt2Engine(MtEngine):
     """Qwen2.5-*-Instruct via CTranslate2 Generator.
 
@@ -568,13 +573,71 @@ class QwenCt2Engine(MtEngine):
     def __init__(self, settings: Settings, model_path: str = "") -> None:
         super().__init__(settings)
         self.model_path = model_path or settings.mt_model
+        self.tokenizer_path = settings.mt_tokenizer or self.model_path
         self._generator: Any = None
         self._tokenizer: Any = None
         self._static_tokens: dict[str, list[str]] = {}
         self.load_seconds: float = 0.0
+        self.warmup_first_call_ms: float | None = None
+        self.warmup_second_call_ms: float | None = None
+        self.static_prompt_cached: bool | None = None
+
+    def _split_prompt(self, text: str, src: str, dst: str) -> tuple[str, list[str], list[str]]:
+        """Return (cache_key, static_tokens, per_request_tokens) such that
+        static + per_request == tokenize(apply_chat_template(full_messages)). Asserted at load."""
+        msgs = make_translation_messages(text, src, dst)
+        assert msgs[-1]["role"] == "user", "prompt builder must end with the user turn"
+        key = f"{src}->{dst}"
+        static = self._static_tokens.get(key)
+        if static is None:  # lazy, once per direction
+            prefix_text = self._tokenizer.apply_chat_template(
+                msgs[:-1], tokenize=False, add_generation_prompt=False
+            )
+            static = self._tokenizer.tokenize(prefix_text)
+            self._static_tokens[key] = static
+        per_request = self._tokenizer.tokenize(_TURN_FMT.format(content=msgs[-1]["content"]))
+        return key, static, per_request
+
+    def _self_check(self) -> None:
+        """Load-time proof that the split prompt is byte-identical to the reference. Fails loudly."""
+        probes = [("en", "ar", "PROBE sentence."), ("ar", "en", "جملة اختبار."), ("en", "tr", "PROBE sentence.")]
+        for src, dst, probe in probes:
+            _, static, per_req = self._split_prompt(probe, src, dst)
+            ref_text = self._tokenizer.apply_chat_template(
+                make_translation_messages(probe, src, dst), tokenize=False, add_generation_prompt=True
+            )
+            ref = self._tokenizer.tokenize(ref_text)
+            if static + per_req != ref:
+                raise RuntimeError(f"qwen_ct2 static-prompt split diverges from reference for {src}->{dst}")
+            if ref_text.count("<|im_start|>system") != 1:
+                raise RuntimeError("prompt contains more than one system turn")
+
+    def _resolve_ct2_model_path(self, model_id: str, compute: str) -> str:
+        import os
+        candidates = [
+            model_id,
+            "/models/qwen2.5-1.5b-ct2",
+        ]
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        safe_name = model_id.replace("/", "--")
+        candidates.extend([
+            os.path.join(here, "models", "qwen2.5-1.5b-ct2"),
+            os.path.join(here, "models", f"{safe_name}-ct2-{compute}"),
+            os.path.join(os.path.dirname(here), "models", "qwen2.5-1.5b-ct2"),
+        ])
+        for p in candidates:
+            if os.path.isdir(p) and (
+                os.path.exists(os.path.join(p, "model.bin"))
+                or os.path.exists(os.path.join(p, "model.safetensors"))
+            ):
+                return p
+
+        raise FileNotFoundError(
+            f"CTranslate2 Qwen model directory not found for {model_id}. "
+            "Conversion on the request path is disabled; build-time pre-conversion is required (see Dockerfile)."
+        )
 
     def load(self) -> None:
-        import os
         import ctranslate2
         from transformers import AutoTokenizer
 
@@ -584,7 +647,8 @@ class QwenCt2Engine(MtEngine):
             compute = "float16" if self.settings.on_cuda else "int8"
 
             actual_path = self._resolve_ct2_model_path(self.model_path, compute)
-            self._tokenizer = AutoTokenizer.from_pretrained(self.model_path)
+            tok_path = self.tokenizer_path
+            self._tokenizer = AutoTokenizer.from_pretrained(tok_path)
             self._generator = ctranslate2.Generator(
                 actual_path,
                 device=device,
@@ -592,7 +656,7 @@ class QwenCt2Engine(MtEngine):
                 inter_threads=1,
                 intra_threads=max(1, self.settings.resolved_asr_cpu_threads()),
             )
-            self._precompute_static_prompts()
+            self._self_check()
         except Exception as exc:
             self.error = f"{type(exc).__name__}: {exc}"
             raise
@@ -605,46 +669,30 @@ class QwenCt2Engine(MtEngine):
             self.load_seconds,
         )
 
-    def _resolve_ct2_model_path(self, model_id: str, compute: str) -> str:
-        import os
-        if os.path.isdir(model_id) and (
-            os.path.exists(os.path.join(model_id, "model.bin"))
-            or os.path.exists(os.path.join(model_id, "model.safetensors"))
-        ):
-            return model_id
-
-        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        safe_name = model_id.replace("/", "--")
-        cached_dir = os.path.join(here, "models", f"{safe_name}-ct2-{compute}")
-        if os.path.isdir(cached_dir) and (
-            os.path.exists(os.path.join(cached_dir, "model.bin"))
-            or os.path.exists(os.path.join(cached_dir, "model.safetensors"))
-        ):
-            return cached_dir
-
-        os.makedirs(cached_dir, exist_ok=True)
-        log.info("Converting %s to CTranslate2 %s in %s...", model_id, compute, cached_dir)
-        import ctranslate2.converters
-        converter = ctranslate2.converters.TransformersConverter(
-            model_id,
-            quantization="int8_float16" if compute == "float16" else "int8",
-        )
-        converter.convert(cached_dir)
-        return cached_dir
-
-    def _precompute_static_prompts(self) -> None:
-        for src, dst in [("en", "ar"), ("ar", "en")]:
-            msgs = make_translation_messages("", src, dst)
-            prefix_msgs = msgs[:-1]
-            prefix_text = self._tokenizer.apply_chat_template(
-                prefix_msgs, tokenize=False, add_generation_prompt=False
-            )
-            tokens = self._tokenizer.tokenize(prefix_text)
-            self._static_tokens[f"{src}->{dst}"] = tokens
-
     @property
     def ready(self) -> bool:
         return self._generator is not None and self._tokenizer is not None
+
+    def warmup(self) -> None:
+        if not self.ready:
+            return
+        self._self_check()
+        probe = [("Good morning, how are you today?", "en", "ar")]
+        t0 = time.perf_counter()
+        _ = self.translate_batch(probe)
+        self.warmup_first_call_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+
+        t1 = time.perf_counter()
+        _ = self.translate_batch(probe)
+        self.warmup_second_call_ms = round((time.perf_counter() - t1) * 1000.0, 2)
+
+        self.static_prompt_cached = bool(self.warmup_second_call_ms < 0.6 * self.warmup_first_call_ms)
+        log.info(
+            "QwenCt2Engine warmup: first=%.1fms, second=%.1fms, static_prompt_cached=%s",
+            self.warmup_first_call_ms,
+            self.warmup_second_call_ms,
+            self.static_prompt_cached,
+        )
 
     def translate_batch(self, items: list[tuple[str, str, str]]) -> list[MtResult]:
         if not self.ready:
@@ -652,42 +700,38 @@ class QwenCt2Engine(MtEngine):
         if not items:
             return []
 
-        first_s, first_d = items[0][1], items[0][2]
-        all_same_dir = all(s == first_s and d == first_d for _, s, d in items)
-        static_prompt = self._static_tokens.get(f"{first_s}->{first_d}") if all_same_dir else None
+        # Group items by translation direction while tracking original indices
+        groups: dict[str, list[tuple[int, str, str, str, list[str]]]] = {}
+        for idx, (text, src, dst) in enumerate(items):
+            key, static, per_req = self._split_prompt(text, src, dst)
+            groups.setdefault(key, []).append((idx, text, src, dst, per_req))
 
-        start_tokens_batch = []
-        for text, src, dst in items:
-            if static_prompt is not None:
-                user_msg = [{"role": "user", "content": text}]
-                user_text = self._tokenizer.apply_chat_template(
-                    user_msg, tokenize=False, add_generation_prompt=True
-                )
-                start_tokens = self._tokenizer.tokenize(user_text)
-            else:
-                msgs = make_translation_messages(text, src, dst)
-                full_text = self._tokenizer.apply_chat_template(
-                    msgs, tokenize=False, add_generation_prompt=True
-                )
-                start_tokens = self._tokenizer.tokenize(full_text)
-            start_tokens_batch.append(start_tokens)
-
-        dyn_tokens = _estimate_dynamic_tokens(items, self.settings.mt_max_new_tokens, tokenizer=self._tokenizer)
-
+        collected: list[tuple[int, Any, list[str], str, str, str]] = []
         started = time.perf_counter()
-        outputs = self._generator.generate_batch(
-            start_tokens_batch,
-            static_prompt=static_prompt,
-            cache_static_prompt=bool(static_prompt),
-            include_prompt_in_result=False,
-            max_length=dyn_tokens,
-            sampling_topk=1,
-            end_token=["<|im_end|>", "<|endoftext|>"],
-        )
+
+        for key, grp in groups.items():
+            static = self._static_tokens[key]
+            start_tokens_batch = [item[4] for item in grp]
+            group_items = [(item[1], item[2], item[3]) for item in grp]
+            dyn_tokens = _estimate_dynamic_tokens(group_items, self.settings.mt_max_new_tokens, tokenizer=self._tokenizer)
+
+            outputs = self._generator.generate_batch(
+                start_tokens_batch,
+                static_prompt=static,
+                cache_static_prompt=True,
+                include_prompt_in_result=False,
+                max_length=dyn_tokens,
+                sampling_topk=1,
+                end_token=["<|im_end|>", "<|endoftext|>"],
+            )
+            for (idx, text, src, dst, per_req), out in zip(grp, outputs):
+                collected.append((idx, out, static + per_req, text, src, dst))
+
         elapsed_ms = round((time.perf_counter() - started) * 1000.0, 2)
+        collected.sort(key=lambda x: x[0])
 
         results: list[MtResult] = []
-        for (text, _s, _d), output in zip(items, outputs):
+        for _idx, output, full_prompt_tokens, text, _s, _d in collected:
             out_tokens = output.sequences[0] if output.sequences else []
             decoded_raw = self._tokenizer.convert_tokens_to_string(out_tokens)
             decoded = clean_translation(decoded_raw, target_lang=_d, source_text=text)
@@ -704,7 +748,7 @@ class QwenCt2Engine(MtEngine):
                     mt_ms=elapsed_ms,
                     backend=self.name,
                     model=self.model_path,
-                    input_tokens=len(start_tokens_batch[0]),
+                    input_tokens=len(full_prompt_tokens),
                     output_tokens=len(out_tokens),
                     batch_size=len(items),
                     hollow=hollow,
@@ -724,6 +768,9 @@ class QwenCt2Engine(MtEngine):
             "load_seconds": round(self.load_seconds, 2) if self.load_seconds else None,
             "ready": self.ready,
             "error": self.error,
+            "warmup_first_call_ms": self.warmup_first_call_ms,
+            "warmup_second_call_ms": self.warmup_second_call_ms,
+            "static_prompt_cached": self.static_prompt_cached,
         }
 
 
@@ -1133,13 +1180,15 @@ def build_mt_engine(settings: Settings) -> MtEngine:
     if backend not in {"auto", ""}:
         raise ValueError(f"unknown MT_BACKEND: {settings.mt_backend}")
 
-    # auto: on a GPU prefer vLLM if available, else Qwen on CTranslate2 (Phase 2.4 fast path).
-    if settings.on_cuda and _vllm_available():
-        return QwenVllmEngine(settings)
+    # auto: on CUDA prefer Qwen on CTranslate2 (Phase 2.4 fast path), then vLLM
     if settings.on_cuda:
         return QwenCt2Engine(settings)
     path = _discover_ct2_model(settings)
     if path is not None:
         return M2M100Ct2Engine(settings, path)
-    return QwenCt2Engine(settings)
+    raise FileNotFoundError(
+        "no usable MT backend: running Qwen on CPU transformers would not meet any latency target, "
+        "and no local CTranslate2 model was found. Set MT_CPU_MODEL_PATH to a CTranslate2 model directory, "
+        "or MT_BACKEND=qwen_hf to force the slow portable path."
+    )
 
