@@ -61,8 +61,10 @@ what the latency budget is actually spent on.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
+import zlib
 from dataclasses import dataclass
 from typing import Any, Final
 
@@ -389,6 +391,27 @@ def _hollow_check(text: str, source_text: str) -> tuple[bool, str | None]:
     return False, None
 
 
+def _compression_ratio(text: str) -> float:
+    raw = text.encode("utf-8")
+    if not raw:
+        return 0.0
+    compressed = zlib.compress(raw)
+    return len(raw) / max(1, len(compressed))
+
+
+def _script_ratio(text: str, target_lang: str) -> float:
+    letters = [ch for ch in text if ch.isalpha()]
+    if not letters:
+        return 0.0
+    if target_lang.startswith("ar"):
+        target_count = sum(1 for ch in letters if ("\u0600" <= ch <= "\u06FF") or ("\u0750" <= ch <= "\u077F") or ("\u08A0" <= ch <= "\u08FF"))
+    elif target_lang in {"en", "tr", "fr", "de", "es", "it"}:
+        target_count = sum(1 for ch in letters if ("a" <= ch <= "z") or ("A" <= ch <= "Z") or ch in "çÇğĞıİöÖşŞüÜéèàùâêîôûëïüÿæœ")
+    else:
+        target_count = len(letters)
+    return target_count / len(letters)
+
+
 # =====================================================================
 # M2M100 on CTranslate2 -- the dedicated NMT path.
 # =====================================================================
@@ -676,37 +699,70 @@ class QwenCt2Engine(MtEngine):
     def ready(self) -> bool:
         if self._fallback_engine is not None:
             return self._fallback_engine.ready
-        return self._generator is not None and self._tokenizer is not None
+        return self._generator is not None and self._tokenizer is not None and self.error is None
 
     def warmup(self) -> None:
         if not self.ready:
             return
         self._self_check()
-        probe = [("Good morning, how are you today?", "en", "ar")]
+
+        # 3 structural probes: en->ar, ar->en, en->tr
+        probes = [
+            ("Hello, how are you today?", "en", "ar"),
+            ("مرحبا، كيف حالك اليوم؟", "ar", "en"),
+            ("Good morning", "en", "tr"),
+        ]
+
         t0 = time.perf_counter()
-        probe_res = self.translate_batch(probe)
+        probe_res = self.translate_batch(probes)
         self.warmup_first_call_ms = round((time.perf_counter() - t0) * 1000.0, 2)
 
         t1 = time.perf_counter()
-        probe_res2 = self.translate_batch(probe)
+        probe_res2 = self.translate_batch(probes)
         self.warmup_second_call_ms = round((time.perf_counter() - t1) * 1000.0, 2)
 
-        self.static_prompt_cached = True
-        probe_out = probe_res2[0].text if probe_res2 else ""
+        self.static_prompt_cached = False
         log.info(
-            "QwenCt2Engine warmup: first=%.1fms, second=%.1fms, probe_out=%r",
+            "QwenCt2Engine warmup: first=%.1fms, second=%.1fms",
             self.warmup_first_call_ms,
             self.warmup_second_call_ms,
-            probe_out,
         )
-        if not probe_out or set(probe_out.strip()) == {"!"}:
-            log.warning(
-                "QwenCt2Engine warmup produced corrupt output (%r); activating fallback to QwenHfEngine",
-                probe_out,
-            )
+
+        # Structural validation across probes
+        for (src_text, src_lang, dst_lang), res in zip(probes, probe_res2):
+            out_text = (res.text or "").strip()
+            # 1. Non-empty
+            if not out_text:
+                self._handle_warmup_failure(f"empty output for {src_lang}->{dst_lang}")
+                return
+            # 2. No special / system tokens
+            if any(tok in out_text for tok in ["<|im_start|>", "<|im_end|>", "<|endoftext|>"]):
+                self._handle_warmup_failure(f"system/special tokens leaked in {src_lang}->{dst_lang}: {out_text!r}")
+                return
+            # 3. Compression ratio < 2.0
+            comp_ratio = _compression_ratio(out_text)
+            if comp_ratio >= 2.0:
+                self._handle_warmup_failure(f"degenerate repetition (compression_ratio={comp_ratio:.2f}) in {src_lang}->{dst_lang}: {out_text!r}")
+                return
+            # 4. Target script ratio >= 60%
+            script_rat = _script_ratio(out_text, dst_lang)
+            if script_rat < 0.60:
+                self._handle_warmup_failure(f"target script ratio {script_rat:.1%} < 60% in {src_lang}->{dst_lang}: {out_text!r}")
+                return
+
+        log.info("QwenCt2Engine structural warmup gate: ALL 3 PROBES PASSED")
+
+    def _handle_warmup_failure(self, reason: str) -> None:
+        log.error("QwenCt2Engine warmup failure: %s", reason)
+        if os.environ.get("MT_ALLOW_DEGRADED_FALLBACK") == "1":
+            log.warning("MT_ALLOW_DEGRADED_FALLBACK=1: activating QwenHfEngine fallback")
             self._fallback_engine = QwenHfEngine(self.settings)
             self._fallback_engine.load()
-            log.info("Fallback to QwenHfEngine active and ready")
+            self._degraded = True
+            self._degraded_reason = reason
+        else:
+            self.error = f"warmup probe degenerate: {reason}"
+            self.ready = False
 
     def translate_batch(self, items: list[tuple[str, str, str]]) -> list[MtResult]:
         if self._fallback_engine is not None and self._fallback_engine.ready:
@@ -736,7 +792,7 @@ class QwenCt2Engine(MtEngine):
                 include_prompt_in_result=False,
                 max_length=dyn_tokens,
                 sampling_topk=1,
-                repetition_penalty=1.05,
+                repetition_penalty=1.0,
                 end_token=["<|im_end|>", "<|endoftext|>"],
             )
             for (idx, text, src, dst, per_req), out in zip(grp, outputs):
@@ -753,9 +809,17 @@ class QwenCt2Engine(MtEngine):
                 decoded_raw = self._tokenizer.convert_tokens_to_string(output.sequences[0])
             else:
                 decoded_raw = ""
-            if "\n" in decoded_raw:
-                decoded_raw = decoded_raw.split("\n")[0]
-            decoded = clean_translation(decoded_raw, target_lang=_d, source_text=text)
+            
+            # Pick the first non-empty line that contains translatable content
+            lines = [ln.strip() for ln in decoded_raw.split("\n") if ln.strip()]
+            candidate = ""
+            for ln in lines:
+                if is_translatable(ln):
+                    candidate = ln
+                    break
+            if not candidate and lines:
+                candidate = lines[0]
+            decoded = clean_translation(candidate or decoded_raw, target_lang=_d, source_text=text)
 
             if detect_person_mismatch(text, decoded, _s, _d):
                 global PERSON_MISMATCH_OBSERVED_COUNT
@@ -780,7 +844,10 @@ class QwenCt2Engine(MtEngine):
 
     def info(self) -> dict[str, Any]:
         if self._fallback_engine is not None and self._fallback_engine.ready:
-            return self._fallback_engine.info()
+            inf = self._fallback_engine.info()
+            inf["degraded"] = True
+            inf["degraded_reason"] = getattr(self, "_degraded_reason", None)
+            return inf
         return {
             "backend": self.name,
             "engine": "ctranslate2",
@@ -794,6 +861,8 @@ class QwenCt2Engine(MtEngine):
             "warmup_first_call_ms": self.warmup_first_call_ms,
             "warmup_second_call_ms": self.warmup_second_call_ms,
             "static_prompt_cached": self.static_prompt_cached,
+            "degraded": getattr(self, "_degraded", False),
+            "degraded_reason": getattr(self, "_degraded_reason", None),
         }
 
 

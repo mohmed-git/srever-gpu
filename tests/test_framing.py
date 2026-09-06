@@ -331,6 +331,25 @@ class DummyPipeline:
         self.metrics = metrics
         self.ready = True
 
+    async def translate_audio_streaming(self, raw, **kwargs):
+        yield {
+            "type": "final",
+            "source_text": "fresh",
+            "translated_text": "جديد",
+            "source_lang": "en",
+            "target_lang": "ar",
+            "total_server_ms": 20.0,
+        }
+
+    async def translate_audio(self, raw, **kwargs):
+        return {
+            "source_text": "fresh",
+            "translated_text": "جديد",
+            "source_lang": "en",
+            "target_lang": "ar",
+            "total_server_ms": 20.0,
+        }
+
 
 class TestPhase24SpeculativeFraming(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -455,6 +474,32 @@ class TestPhase24SpeculativeFraming(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item[0], "fresh")
         self.assertEqual(item[2], 3)
 
+    async def test_commit_stale_tentative_seq_drops_cache_and_misses(self):
+        slot = self.state.slots.setdefault(5, _Slot(5))
+        slot.buffer.extend(b"\x01\x00" * 3200)
+        slot.last_seq = 12
+        slot.tentative_seq = 10
+        slot.tentative_result = (
+            [{"type": "sentence", "index": 0, "is_last": True, "text": "Stale", "translated_text": "قديم"}],
+            {"type": "final", "source_text": "Stale", "translated_text": "قديم"},
+            50.0,
+        )
+        # Commit with seq=12 != tentative_seq (10)
+        await _commit_slot(self.state, slot, seq=12)
+
+        self.assertEqual(self.metrics.counter("tentative_miss"), 1)
+        self.assertEqual(self.metrics.counter("tentative_hit"), 0)
+
+        # Utterance worker should process fresh pass, NOT serve_cached
+        worker = asyncio.create_task(_utterance_worker(self.state))
+        await self.state.utterance_queue.put(None)
+        await worker
+
+        # Ensure NO delivery frames from cached tentative_result were sent, and fresh frames were delivered
+        delivery = [m for m in self.ws.sent_json if m.get("type") in {"sentence", "final"}]
+        self.assertFalse(any(m.get("translated_text") == "قديم" for m in delivery))
+        self.assertTrue(any(m.get("translated_text") == "جديد" for m in delivery))
+
     async def test_tentative_discard_on_audio_seq_advance(self):
         slot = self.state.slots.setdefault(4, _Slot(4))
         slot.buffer.extend(b"\x01\x00" * 8000)
@@ -543,20 +588,28 @@ class TestPhase24SpeculativeFraming(unittest.IsolatedAsyncioTestCase):
         app.server.PIPELINE = pipeline
 
         try:
+            import math
+            sine_samples = [int(8000 * math.sin(2 * math.pi * 220 * (t / 16000))) for t in range(16000)]
+            audible_pcm = struct.pack(f"<{len(sine_samples)}h", *sine_samples)
+
             slot = self.state.slots.setdefault(1, _Slot(1))
-            slot.buffer.extend(b"\x01\x00" * 16000)  # 1.0s audio
+            slot.buffer.extend(audible_pcm)  # 1.0s audible 220Hz sine wave
             slot.last_seq = 10
             self.state.target = "ar"
 
             # 1. Run actual server _run_tentative handler
             await _run_tentative(self.state, slot, seq=10)
 
+            # Assert that a tentative frame was actually built and emitted
+            tentative_frames = [m for m in self.ws.sent_json if m.get("type") == "tentative"]
+            self.assertGreater(len(tentative_frames), 0, "No tentative frame was emitted; handler skipped or silent audio!")
+
             # 2. Trigger discard via real _on_audio_frame
-            await _on_audio_frame(self.state, pack_v2(0, 1, 11, b"\x01\x00" * 160))
+            await _on_audio_frame(self.state, pack_v2(0, 1, 11, audible_pcm[:320]))
 
             # 3. Trigger too_short tentative via real _on_control_frame
             slot2 = self.state.slots.setdefault(2, _Slot(2))
-            slot2.buffer.extend(b"\x01\x00" * 1600)  # 100ms
+            slot2.buffer.extend(audible_pcm[:1600])  # 100ms
             slot2.last_seq = 1
             await _on_control_frame(self.state, {"action": "tentative", "utt": 2, "seq": 1})
 
