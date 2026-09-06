@@ -64,5 +64,30 @@ class TestQwenCt2PromptSplit(unittest.TestCase):
                 self.assertEqual(per_req[1], "user")
 
 
+class TestQwenCt2WarmupGate(unittest.TestCase):
+    def test_warmup_failure_without_env_var_sets_error_and_not_ready(self):
+        import os
+        from app.config import Settings
+        from app.mt import QwenCt2Engine
+
+        old_env = os.environ.pop("MT_ALLOW_DEGRADED_FALLBACK", None)
+        try:
+            settings = Settings()
+            engine = QwenCt2Engine(settings)
+            engine._generator = object()
+            engine._tokenizer = object()
+            self.assertTrue(engine.ready)
+
+            engine._handle_warmup_failure("target script ratio 10.0% < 60% in en->ar: 'test'")
+
+            self.assertFalse(engine.ready)
+            self.assertIsNotNone(engine.error)
+            self.assertIn("degenerate", engine.error)
+            self.assertIsNone(engine._fallback_engine)
+        finally:
+            if old_env is not None:
+                os.environ["MT_ALLOW_DEGRADED_FALLBACK"] = old_env
+
+
 if __name__ == "__main__":
     unittest.main()

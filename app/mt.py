@@ -762,7 +762,6 @@ class QwenCt2Engine(MtEngine):
             self._degraded_reason = reason
         else:
             self.error = f"warmup probe degenerate: {reason}"
-            self.ready = False
 
     def translate_batch(self, items: list[tuple[str, str, str]]) -> list[MtResult]:
         if self._fallback_engine is not None and self._fallback_engine.ready:
