@@ -333,14 +333,14 @@ async def translate_stream(websocket: WebSocket) -> None:
     try:
         while True:
             has_pending_audio = bool(state.buffer) or any(len(s.buffer) > 0 for s in state.slots.values())
-            recv_timeout = 1.2 if has_pending_audio else 120.0
+            recv_timeout = 3.0 if has_pending_audio else 120.0
             try:
                 message = await asyncio.wait_for(websocket.receive(), timeout=recv_timeout)
             except asyncio.TimeoutError:
                 if has_pending_audio:
-                    # Inactivity / silence auto-commit fallback:
-                    # If client spoke and stopped sending packets for 1.2s without LAST flag or flush,
-                    # automatically commit any slot with substantive speech (>= 100ms / 3200 bytes).
+                    # Leak guard: 3.0s silence safety net.
+                    # In clean operation the client owns utterance closure via LAST flag.
+                    # If 3.0s elapses with pending audio, auto-commit as a client_timeout fallback.
                     if state.protocol_version == 2:
                         for s in list(state.slots.values()):
                             slot_id = s.utt_id
@@ -349,20 +349,31 @@ async def translate_stream(websocket: WebSocket) -> None:
                                 state.slots.pop(slot_id, None)
                                 state.record_committed(slot_id)
                                 if PIPELINE is not None:
-                                    PIPELINE.metrics.incr("silence_auto_commit")
-                                log.info("Auto-committed slot %d on silence timeout (%d bytes)", slot_id, len(raw))
+                                    PIPELINE.metrics.incr("auto_commit")
+                                    PIPELINE.metrics.incr("auto_commit_timeout")
+                                log.warning("Slot %d committed by 3.0s leak-guard (client_timeout, %d bytes)", slot_id, len(raw))
+                                await state.send_json({
+                                    "event": "auto_commit",
+                                    "reason": "client_timeout",
+                                    "utt": slot_id,
+                                })
                                 if state.target and not state.utterance_queue.full():
                                     await state.utterance_queue.put((raw, slot_id))
                             else:
-                                # Clean up tiny sub-100ms noise burst
+                                # Drop tiny sub-100ms noise burst
                                 state.slots.pop(slot_id, None)
                     elif state.buffer:
                         if len(state.buffer) >= 3200:
                             raw = bytes(state.buffer)
                             state.buffer.clear()
                             if PIPELINE is not None:
-                                PIPELINE.metrics.incr("silence_auto_commit")
-                            log.info("Auto-committed v1 buffer on silence timeout (%d bytes)", len(raw))
+                                PIPELINE.metrics.incr("auto_commit")
+                                PIPELINE.metrics.incr("auto_commit_timeout")
+                            log.warning("V1 buffer committed by 3.0s leak-guard (client_timeout, %d bytes)", len(raw))
+                            await state.send_json({
+                                "event": "auto_commit",
+                                "reason": "client_timeout",
+                            })
                             if state.target and not state.utterance_queue.full():
                                 await state.utterance_queue.put((raw, None))
                         else:

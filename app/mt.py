@@ -551,6 +551,183 @@ class M2M100Ct2Engine(MtEngine):
 
 
 # =====================================================================
+# Qwen2.5-Instruct on CTranslate2 -- fast low-latency generator path.
+# =====================================================================
+class QwenCt2Engine(MtEngine):
+    """Qwen2.5-*-Instruct via CTranslate2 Generator.
+
+    Optimized for low latency:
+      - Static prompt caching (cache_static_prompt=True) computes the system + few-shot KV cache once.
+      - Tokenizer-based dynamic token cap: 2.5 * input_tokens + 12.
+      - Generates with greedy sampling (sampling_topk=1) and stops on <|im_end|> and <|endoftext|>.
+      - Releases Python GIL during C++ generation (keeping WebSocket ping/pong sub-5ms).
+    """
+
+    name = "qwen_ct2"
+
+    def __init__(self, settings: Settings, model_path: str = "") -> None:
+        super().__init__(settings)
+        self.model_path = model_path or settings.mt_model
+        self._generator: Any = None
+        self._tokenizer: Any = None
+        self._static_tokens: dict[str, list[str]] = {}
+        self.load_seconds: float = 0.0
+
+    def load(self) -> None:
+        import os
+        import ctranslate2
+        from transformers import AutoTokenizer
+
+        started = time.perf_counter()
+        try:
+            device = "cuda" if self.settings.on_cuda else "cpu"
+            compute = "float16" if self.settings.on_cuda else "int8"
+
+            actual_path = self._resolve_ct2_model_path(self.model_path, compute)
+            self._tokenizer = AutoTokenizer.from_pretrained(self.model_path)
+            self._generator = ctranslate2.Generator(
+                actual_path,
+                device=device,
+                compute_type=compute,
+                inter_threads=1,
+                intra_threads=max(1, self.settings.resolved_asr_cpu_threads()),
+            )
+            self._precompute_static_prompts()
+        except Exception as exc:
+            self.error = f"{type(exc).__name__}: {exc}"
+            raise
+        self.load_seconds = time.perf_counter() - started
+        log.info(
+            "MT ready: qwen_ct2 model=%s (path=%s) device=%s load=%.2fs",
+            self.model_path,
+            actual_path,
+            device,
+            self.load_seconds,
+        )
+
+    def _resolve_ct2_model_path(self, model_id: str, compute: str) -> str:
+        import os
+        if os.path.isdir(model_id) and (
+            os.path.exists(os.path.join(model_id, "model.bin"))
+            or os.path.exists(os.path.join(model_id, "model.safetensors"))
+        ):
+            return model_id
+
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        safe_name = model_id.replace("/", "--")
+        cached_dir = os.path.join(here, "models", f"{safe_name}-ct2-{compute}")
+        if os.path.isdir(cached_dir) and (
+            os.path.exists(os.path.join(cached_dir, "model.bin"))
+            or os.path.exists(os.path.join(cached_dir, "model.safetensors"))
+        ):
+            return cached_dir
+
+        os.makedirs(cached_dir, exist_ok=True)
+        log.info("Converting %s to CTranslate2 %s in %s...", model_id, compute, cached_dir)
+        import ctranslate2.converters
+        converter = ctranslate2.converters.TransformersConverter(
+            model_id,
+            quantization="int8_float16" if compute == "float16" else "int8",
+        )
+        converter.convert(cached_dir)
+        return cached_dir
+
+    def _precompute_static_prompts(self) -> None:
+        for src, dst in [("en", "ar"), ("ar", "en")]:
+            msgs = make_translation_messages("", src, dst)
+            prefix_msgs = msgs[:-1]
+            prefix_text = self._tokenizer.apply_chat_template(
+                prefix_msgs, tokenize=False, add_generation_prompt=False
+            )
+            tokens = self._tokenizer.tokenize(prefix_text)
+            self._static_tokens[f"{src}->{dst}"] = tokens
+
+    @property
+    def ready(self) -> bool:
+        return self._generator is not None and self._tokenizer is not None
+
+    def translate_batch(self, items: list[tuple[str, str, str]]) -> list[MtResult]:
+        if not self.ready:
+            raise RuntimeError("MT model not loaded")
+        if not items:
+            return []
+
+        first_s, first_d = items[0][1], items[0][2]
+        all_same_dir = all(s == first_s and d == first_d for _, s, d in items)
+        static_prompt = self._static_tokens.get(f"{first_s}->{first_d}") if all_same_dir else None
+
+        start_tokens_batch = []
+        for text, src, dst in items:
+            if static_prompt is not None:
+                user_msg = [{"role": "user", "content": text}]
+                user_text = self._tokenizer.apply_chat_template(
+                    user_msg, tokenize=False, add_generation_prompt=True
+                )
+                start_tokens = self._tokenizer.tokenize(user_text)
+            else:
+                msgs = make_translation_messages(text, src, dst)
+                full_text = self._tokenizer.apply_chat_template(
+                    msgs, tokenize=False, add_generation_prompt=True
+                )
+                start_tokens = self._tokenizer.tokenize(full_text)
+            start_tokens_batch.append(start_tokens)
+
+        dyn_tokens = _estimate_dynamic_tokens(items, self.settings.mt_max_new_tokens, tokenizer=self._tokenizer)
+
+        started = time.perf_counter()
+        outputs = self._generator.generate_batch(
+            start_tokens_batch,
+            static_prompt=static_prompt,
+            cache_static_prompt=bool(static_prompt),
+            include_prompt_in_result=False,
+            max_length=dyn_tokens,
+            sampling_topk=1,
+            end_token=["<|im_end|>", "<|endoftext|>"],
+        )
+        elapsed_ms = round((time.perf_counter() - started) * 1000.0, 2)
+
+        results: list[MtResult] = []
+        for (text, _s, _d), output in zip(items, outputs):
+            out_tokens = output.sequences[0] if output.sequences else []
+            decoded_raw = self._tokenizer.convert_tokens_to_string(out_tokens)
+            decoded = clean_translation(decoded_raw, target_lang=_d, source_text=text)
+
+            if detect_person_mismatch(text, decoded, _s, _d):
+                global PERSON_MISMATCH_OBSERVED_COUNT
+                PERSON_MISMATCH_OBSERVED_COUNT += 1
+                log.info("Person mismatch observed (observe-only): src=%r tgt=%r", text, decoded)
+
+            hollow, reason = _hollow_check(decoded, text)
+            results.append(
+                MtResult(
+                    text=decoded,
+                    mt_ms=elapsed_ms,
+                    backend=self.name,
+                    model=self.model_path,
+                    input_tokens=len(start_tokens_batch[0]),
+                    output_tokens=len(out_tokens),
+                    batch_size=len(items),
+                    hollow=hollow,
+                    hollow_reason=reason,
+                )
+            )
+        return results
+
+    def info(self) -> dict[str, Any]:
+        return {
+            "backend": self.name,
+            "engine": "ctranslate2",
+            "model": self.model_path,
+            "device": "cuda" if self.settings.on_cuda else "cpu",
+            "compute_type": "float16" if self.settings.on_cuda else "int8",
+            "max_new_tokens": self.settings.mt_max_new_tokens,
+            "load_seconds": round(self.load_seconds, 2) if self.load_seconds else None,
+            "ready": self.ready,
+            "error": self.error,
+        }
+
+
+# =====================================================================
 # Qwen2.5-Instruct on vLLM -- the intended RTX 3060 path.
 # =====================================================================
 class QwenVllmEngine(MtEngine):
@@ -941,6 +1118,8 @@ def build_mt_engine(settings: Settings) -> MtEngine:
 
     if backend == "qwen_vllm":
         return QwenVllmEngine(settings)
+    if backend == "qwen_ct2":
+        return QwenCt2Engine(settings)
     if backend == "qwen_hf":
         return QwenHfEngine(settings)
     if backend == "m2m100_ct2":
@@ -954,17 +1133,13 @@ def build_mt_engine(settings: Settings) -> MtEngine:
     if backend not in {"auto", ""}:
         raise ValueError(f"unknown MT_BACKEND: {settings.mt_backend}")
 
-    # auto: on a GPU prefer vLLM, else the local NMT model, else HF Qwen.
+    # auto: on a GPU prefer vLLM if available, else Qwen on CTranslate2 (Phase 2.4 fast path).
     if settings.on_cuda and _vllm_available():
         return QwenVllmEngine(settings)
+    if settings.on_cuda:
+        return QwenCt2Engine(settings)
     path = _discover_ct2_model(settings)
     if path is not None:
         return M2M100Ct2Engine(settings, path)
-    if settings.on_cuda:
-        return QwenHfEngine(settings)
-    raise FileNotFoundError(
-        "no usable MT backend: vLLM absent, no local CT2 model found, and running "
-        "Qwen on CPU transformers would not meet any latency target. "
-        "Set MT_CPU_MODEL_PATH to a CTranslate2 M2M100 directory, or MT_BACKEND=qwen_hf "
-        "to force the slow portable path."
-    )
+    return QwenCt2Engine(settings)
+

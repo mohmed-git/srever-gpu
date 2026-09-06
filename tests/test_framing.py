@@ -175,6 +175,12 @@ class TestFramingInvariants(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(raw), 3200)
         self.assertIn(88, self.state.committed_utts)
 
+    def test_auto_commit_timeout_counter(self):
+        # Verify that auto_commit_timeout metric counter is registered and incrementable
+        self.assertEqual(self.metrics.counter("auto_commit_timeout"), 0)
+        self.metrics.incr("auto_commit_timeout")
+        self.assertEqual(self.metrics.counter("auto_commit_timeout"), 1)
+
     async def test_reset_drains_utterance_queue(self):
         await self.state.utterance_queue.put((b'audio1', 1))
         await self.state.utterance_queue.put((b'audio2', 2))

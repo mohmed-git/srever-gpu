@@ -110,8 +110,13 @@ class Metrics:
             "duplicate_preroll": 0,
             "bad_frame": 0,
             "auto_commit": 0,
+            "auto_commit_timeout": 0,
             "guard_dropped_segments": 0,
             "person_mismatch_observed": 0,
+            "tentative_hit": 0,
+            "tentative_await": 0,
+            "tentative_miss": 0,
+            "tentative_cancelled": 0,
         }
         self._started_at = time.time()
         self._inflight = 0
