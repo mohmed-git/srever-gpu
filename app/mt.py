@@ -100,6 +100,14 @@ def make_translation_messages(text: str, src: str, dst: str) -> list[dict[str, s
             {"role": "assistant", "content": "أود طلب قهوة من فضلك."},
             {"role": "user", "content": "I am fine, thank you."},
             {"role": "assistant", "content": "أنا بخير، شكراً لك."},
+            {"role": "user", "content": "I am good, and you?"},
+            {"role": "assistant", "content": "أنا بخير، وأنت؟"},
+            {"role": "user", "content": "and I am good and you"},
+            {"role": "assistant", "content": "وأنا بخير، وأنت؟"},
+            {"role": "user", "content": "I don't eat beef."},
+            {"role": "assistant", "content": "لا آكل لحم البقر."},
+            {"role": "user", "content": "I eat breakfast in the morning."},
+            {"role": "assistant", "content": "أتناول الفطور في الصباح."},
             {"role": "user", "content": text},
         ]
     elif src == "ar" or src.startswith("ar"):
@@ -267,10 +275,12 @@ def clean_translation(text: str, target_lang: str = "", source_text: str = "") -
 
     # Never sanitize CJK scripts when target is a CJK language!
     if norm_target not in _CJK_TARGETS and base_target not in _CJK_TARGETS:
-        # If translating to Arabic, strip any stray Chinese characters or prefix labels
+        # If translating to Arabic, strip any stray Chinese characters, prefix labels, or French leak tokens
         if norm_target == "ar" or base_target == "ar":
             out = re.sub(r"[\u4e00-\u9fff\u3400-\u4dbf]+", "", out).strip()
             out = re.sub(r"^(?:الترجمة|الترجمة إلى العربية|النص المترجم)\s*[:\-]\s*", "", out).strip()
+            # Clean common multilingual LLM greeting leak: 'vous' / 'et vous' -> 'وأنت؟'
+            out = re.sub(r"\b(?:et\s+)?vous\b[?؟]?", "وأنت؟", out, flags=re.IGNORECASE).strip()
 
     return out.strip()
 
