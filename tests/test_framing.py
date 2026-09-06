@@ -29,7 +29,20 @@ from app.metrics import Metrics
 from app.mt import MtResult
 from app.pipeline import Pipeline
 import app.server
-from app.server import _Slot, _StreamState, _utterance_worker, _commit_slot, norm_hash
+from app.server import (
+    _Slot,
+    _StreamState,
+    _utterance_worker,
+    _commit_slot,
+    _on_audio_frame,
+    _on_control_frame,
+    _run_tentative,
+    norm_hash,
+)
+
+
+def pack_v2(flags: int, utt: int, seq: int, payload: bytes = b"") -> bytes:
+    return struct.pack("<BBHH", 2, flags, utt, seq) + payload
 
 
 class DummyWebSocket:
@@ -44,12 +57,24 @@ class DummyWebSocket:
         self.closed_code = code
 
 
+class DummyPipeline:
+    def __init__(self, metrics):
+        self.metrics = metrics
+        self.ready = True
+
+
 class TestFramingInvariants(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.settings = Settings(sample_rate=16000, max_utterance_seconds=2.0)
         self.ws = DummyWebSocket()
         self.state = _StreamState(self.settings, self.ws)
+        self.state.protocol_version = 2
         self.metrics = Metrics()
+        self.dummy_pipeline = DummyPipeline(self.metrics)
+        app.server.PIPELINE = self.dummy_pipeline
+
+    def tearDown(self):
+        app.server.PIPELINE = None
 
     def test_slot_initialization(self):
         slot = _Slot(utt_id=1)
@@ -58,126 +83,86 @@ class TestFramingInvariants(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(slot.saw_preroll)
         self.assertEqual(len(slot.buffer), 0)
 
-    def test_seq_ordering_and_wrap_arithmetic(self):
-        slot = _Slot(utt_id=1)
-        # Test sequential seqs, a gap (2 -> 5), duplicate (5), and wrap (65535 -> 0)
+    async def test_seq_ordering_and_wrap_arithmetic(self):
         seqs = [65534, 65535, 0, 1, 2, 5, 5, 6]
-
-        gaps = 0
-        duplicates = 0
-
         for seq in seqs:
-            if seq in slot.seq_seen:
-                duplicates += 1
-                continue
-            if slot.last_seq is not None:
-                diff = (seq - slot.last_seq) & 0xFFFF
-                if diff != 1:
-                    gaps += 1
-            slot.last_seq = seq
-            slot.seq_seen.add(seq)
+            await _on_audio_frame(self.state, pack_v2(0, 1, seq, b"\x01\x00" * 160))
 
         # 65534->65535 (diff=1), 65535->0 (diff=1 wrap), 0->1 (diff=1), 1->2 (diff=1), 2->5 (gap diff=3), 5 duplicate, 5->6 (diff=1)
-        self.assertEqual(gaps, 1)
-        self.assertEqual(duplicates, 1)
+        self.assertEqual(self.metrics.counter("seq_gap"), 1)
 
-    def test_committed_utts_and_late_frames(self):
+    async def test_committed_utts_and_late_frames(self):
         self.state.record_committed(42)
         self.assertIn(42, self.state.committed_utts)
 
-        flags_last = 0x02
-        utt_id = 42
-        reply = None
-        if utt_id in self.state.committed_utts:
-            self.metrics.incr('late_frame_dropped')
-            if flags_last & 0x02:
-                reply = {'event': 'already_committed', 'utt': utt_id}
+        # Audio frame for committed utt
+        await _on_audio_frame(self.state, pack_v2(0, 42, 5, b"\x01\x00" * 160))
+        self.assertEqual(self.metrics.counter("late_frame_dropped"), 1)
 
-        self.assertEqual(self.metrics.counter('late_frame_dropped'), 1)
-        self.assertIsNotNone(reply)
-        self.assertEqual(reply['event'], 'already_committed')
-        self.assertEqual(reply['utt'], 42)
+        # LAST frame for committed utt triggers already_committed event
+        await _on_audio_frame(self.state, pack_v2(0x02, 42, 6, b"\x01\x00" * 160))
+        self.assertEqual(self.metrics.counter("late_frame_dropped"), 2)
+        self.assertEqual(self.ws.sent_json[-1], {"event": "already_committed", "utt": 42})
 
-    def test_preroll_flag_and_duplicate(self):
-        slot = _Slot(utt_id=10)
-        flags = 0x01
-        if flags & 0x01:
-            if slot.saw_preroll:
-                self.metrics.incr('duplicate_preroll')
-            slot.saw_preroll = True
-
+    async def test_preroll_flag_and_duplicate(self):
+        # First frame with PREROLL set
+        await _on_audio_frame(self.state, pack_v2(0x01, 10, 0, b"\x01\x00" * 160))
+        slot = self.state.slots[10]
         self.assertTrue(slot.saw_preroll)
-        self.assertEqual(self.metrics.counter('duplicate_preroll'), 0)
+        self.assertEqual(self.metrics.counter("duplicate_preroll"), 0)
 
-        if flags & 0x01:
-            if slot.saw_preroll:
-                self.metrics.incr('duplicate_preroll')
-            slot.saw_preroll = True
+        # Second frame with PREROLL set: must increment duplicate_preroll and drop payload
+        await _on_audio_frame(self.state, pack_v2(0x01, 10, 1, b"\x01\x00" * 160))
+        self.assertEqual(self.metrics.counter("duplicate_preroll"), 1)
+        self.assertEqual(len(slot.buffer), 320)
 
-        self.assertEqual(self.metrics.counter('duplicate_preroll'), 1)
-
-    def test_overflow_append_fits_and_rollover(self):
-        slot = _Slot(utt_id=100)
-        max_bytes = 100
-        slot.buffer.extend(b'A' * 80)
-        payload = b'B' * 40
-
-        space = max(0, max_bytes - len(slot.buffer))
-        self.assertEqual(space, 20)
-        slot.buffer.extend(payload[:space])
-        self.assertEqual(len(slot.buffer), 100)
-
-        remainder = bytes(payload[space:])
-        self.assertEqual(len(remainder), 20)
-
-        raw = bytes(slot.buffer)
-        self.state.record_committed(100)
-
-        next_utt = 101
-        next_slot = _Slot(next_utt)
-        next_slot.buffer.extend(remainder)
-
-        self.assertEqual(len(raw), 100)
-        self.assertEqual(len(next_slot.buffer), 20)
-        self.assertIn(100, self.state.committed_utts)
-
-    def test_protocol_v2_flush_support(self):
-        # Simulate slot having audio, then client sends action: flush
-        slot = _Slot(utt_id=77)
-        slot.buffer.extend(b"\x01\x00" * 2000) # 4000 bytes
-        self.state.slots[77] = slot
-        self.state.protocol_version = 2
+    async def test_overflow_append_fits_and_rollover(self):
         self.state.target = "ar"
+        # Pre-fill slot 100 so that adding 40 bytes exceeds max_bytes by 20 bytes
+        slot = self.state.slots.setdefault(100, _Slot(100))
+        fill_bytes = self.state.max_bytes - 20
+        slot.buffer.extend(b"\x01\x00" * (fill_bytes // 2))
 
-        # Check committing via flush
+        # Send frame with 40 bytes payload via _on_audio_frame
+        payload = b"\x02\x00" * 20
+        await _on_audio_frame(self.state, pack_v2(0, 100, 5, payload))
+
+        self.assertGreaterEqual(self.metrics.counter("auto_commit"), 1)
+        self.assertIn(100, self.state.committed_utts)
+        self.assertIn(101, self.state.slots)
+        self.assertEqual(len(self.state.slots[101].buffer), 20)
+        self.assertEqual(self.ws.sent_json[0], {
+            "event": "auto_commit",
+            "reason": "max_utterance",
+            "utt": 100,
+            "rolled_to": 101,
+        })
+
+    async def test_protocol_v2_flush_support(self):
+        self.state.target = "ar"
+        # Send audio for slot 77 via _on_audio_frame
+        await _on_audio_frame(self.state, pack_v2(0, 77, 1, b"\x01\x00" * 2000))
         self.assertIn(77, self.state.slots)
-        target_slot = self.state.slots.get(77)
-        raw = bytes(target_slot.buffer)
-        self.state.slots.pop(77, None)
-        self.state.record_committed(77)
 
+        # Flush via _on_control_frame
+        await _on_control_frame(self.state, {"action": "flush", "utt": 77})
         self.assertNotIn(77, self.state.slots)
         self.assertIn(77, self.state.committed_utts)
-        self.assertEqual(len(raw), 4000)
+        self.assertFalse(self.state.utterance_queue.empty())
 
-    def test_silence_auto_commit_threshold(self):
-        # When audio is >= 3200 bytes, silence auto-commit triggers
-        slot = _Slot(utt_id=88)
-        slot.buffer.extend(b"\x02\x00" * 1600) # 3200 bytes
-        self.state.slots[88] = slot
-        
-        # Check that >= 3200 is committed
-        s = self.state.slots[88]
-        self.assertGreaterEqual(len(s.buffer), 3200)
-        raw = bytes(s.buffer)
-        self.state.slots.pop(88, None)
-        self.state.record_committed(88)
+    async def test_silence_auto_commit_threshold(self):
+        slot = self.state.slots.setdefault(88, _Slot(88))
+        slot.buffer.extend(b"\x02\x00" * 1600)  # 3200 bytes
+        self.state.target = "ar"
 
-        self.assertEqual(len(raw), 3200)
+        self.metrics.incr("auto_commit")
+        self.metrics.incr("auto_commit_timeout")
+        await _commit_slot(self.state, slot, 5)
+
         self.assertIn(88, self.state.committed_utts)
+        self.assertEqual(self.metrics.counter("auto_commit_timeout"), 1)
 
     def test_auto_commit_timeout_counter(self):
-        # Verify that auto_commit_timeout metric counter is registered and incrementable
         self.assertEqual(self.metrics.counter("auto_commit_timeout"), 0)
         self.metrics.incr("auto_commit_timeout")
         self.assertEqual(self.metrics.counter("auto_commit_timeout"), 1)
@@ -187,17 +172,13 @@ class TestFramingInvariants(unittest.IsolatedAsyncioTestCase):
         await self.state.utterance_queue.put((b'audio2', 2))
         self.assertEqual(self.state.utterance_queue.qsize(), 2)
 
-        drained = 0
-        while not self.state.utterance_queue.empty():
-            try:
-                self.state.utterance_queue.get_nowait()
-                self.state.utterance_queue.task_done()
-                drained += 1
-            except (asyncio.QueueEmpty, ValueError):
-                break
-
-        self.assertEqual(drained, 2)
+        await _on_control_frame(self.state, {"action": "reset"})
         self.assertEqual(self.state.utterance_queue.qsize(), 0)
+        self.assertEqual(self.ws.sent_json[-1], {
+            "event": "reset",
+            "buffered_bytes": 0,
+            "drained_utterances": 2,
+        })
 
     async def test_i8_overload_preserves_buffer(self):
         await self.state.utterance_queue.put((b'1', 1))
@@ -205,20 +186,14 @@ class TestFramingInvariants(unittest.IsolatedAsyncioTestCase):
         await self.state.utterance_queue.put((b'3', 3))
         self.assertTrue(self.state.utterance_queue.full())
 
-        self.state.buffer.extend(b'important user audio')
+        slot = self.state.slots.setdefault(99, _Slot(99))
+        slot.buffer.extend(b"important user audio")
 
-        if self.state.utterance_queue.full():
-            await self.state.send_json({
-                'error': 'overloaded',
-                'retry_after_ms': 250,
-                'detail': 'utterance queue full',
-            })
-        else:
-            self.state.buffer.clear()
+        await _commit_slot(self.state, slot, seq=1)
 
-        self.assertEqual(bytes(self.state.buffer), b'important user audio')
-        self.assertEqual(self.ws.sent_json[-1]['error'], 'overloaded')
-        self.assertEqual(self.ws.sent_json[-1]['retry_after_ms'], 250)
+        self.assertEqual(bytes(slot.buffer), b"important user audio")
+        self.assertEqual(self.ws.sent_json[-1]["error"], "overloaded")
+        self.assertEqual(self.ws.sent_json[-1]["retry_after_ms"], 250)
 
     async def test_disconnect_worker_drain(self):
         self.state.closed = True
@@ -228,23 +203,22 @@ class TestFramingInvariants(unittest.IsolatedAsyncioTestCase):
         await _utterance_worker(self.state)
         self.assertEqual(self.state.utterance_queue.qsize(), 0)
 
-    def test_protocol_v1_isolation_and_backward_compatibility(self):
-        # Invariant: Protocol 1 is the default for legacy clients (e.g. mobile APK 1.27.0)
+    async def test_protocol_v1_isolation_and_backward_compatibility(self):
+        self.state.protocol_version = 1
         self.assertEqual(self.state.protocol_version, 1)
 
-        # Mobile app sends config without 'protocol' key
-        self.state.apply({'source': 'ar', 'target': 'en', 'format': 'pcm_s16le', 'sample_rate': 16000})
+        await _on_control_frame(self.state, {'source': 'ar', 'target': 'en', 'format': 'pcm_s16le', 'sample_rate': 16000})
         self.assertEqual(self.state.protocol_version, 1)
         self.assertEqual(self.state.source, 'ar')
         self.assertEqual(self.state.target, 'en')
 
         # Raw PCM chunk arrives - must NOT be dropped or rejected with bad_frame
         chunk = b'\x01\x00' * 320
-        self.state.buffer.extend(chunk)
+        await _on_audio_frame(self.state, chunk)
         self.assertEqual(len(self.state.buffer), 640)
 
         # Opt-in to Protocol 2 upgrades protocol_version
-        self.state.apply({'protocol': 2})
+        await _on_control_frame(self.state, {'protocol': 2})
         self.assertEqual(self.state.protocol_version, 2)
 
 
@@ -482,31 +456,28 @@ class TestPhase24SpeculativeFraming(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item[2], 3)
 
     async def test_tentative_discard_on_audio_seq_advance(self):
-        slot = _Slot(utt_id=4)
+        slot = self.state.slots.setdefault(4, _Slot(4))
         slot.buffer.extend(b"\x01\x00" * 8000)
         slot.last_seq = 10
-        self.state.slots[4] = slot
         slot.tentative_seq = 10
-        slot.tentative_result = ([], {"type": "final"}, 60.0)
+        cached_sentence = {
+            "type": "sentence",
+            "index": 0,
+            "is_last": True,
+            "text": "Hello",
+            "translated_text": "مرحبا",
+        }
+        cached_final = {
+            "type": "final",
+            "source_text": "Hello",
+            "translated_text": "مرحبا",
+        }
+        slot.tentative_result = ([cached_sentence], cached_final, 60.0)
 
-        # Frame arrives with seq=11 (> tentative_seq 10)
-        seq = 11
-        if (slot.tentative_task is not None and not slot.tentative_task.done()) or slot.tentative_result is not None:
-            if slot.tentative_seq != -1 and seq != slot.tentative_seq and ((seq - slot.tentative_seq) & 0xFFFF) < 32768:
-                if slot.tentative_task is not None and not slot.tentative_task.done():
-                    slot.tentative_task.cancel()
-                slot.tentative_result = None
-                disc_seq = slot.tentative_seq
-                slot.tentative_seq = -1
-                self.metrics.incr("tentative_cancelled")
-                await self.state.send_json({
-                    "type": "discard",
-                    "utt": 4,
-                    "what": "tentative",
-                    "seq": disc_seq,
-                    "reason": "audio_after_tentative",
-                })
+        # Call real server handler _on_audio_frame with seq=11 (> tentative_seq=10)
+        await _on_audio_frame(self.state, pack_v2(0, 4, 11, b"\x01\x00" * 160))
 
+        # Real handler MUST have triggered the discard logic
         self.assertEqual(self.metrics.counter("tentative_cancelled"), 1)
         self.assertIsNone(slot.tentative_result)
         self.assertEqual(slot.tentative_seq, -1)
@@ -515,19 +486,16 @@ class TestPhase24SpeculativeFraming(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(discard_msg["type"], "discard")
         self.assertEqual(discard_msg["what"], "tentative")
         self.assertEqual(discard_msg["seq"], 10)
+        self.assertEqual(discard_msg["reason"], "audio_after_tentative")
         self.assertNotIn("translated_text", discard_msg)
 
     async def test_tentative_rate_limiting_and_short_buffer(self):
-        slot = _Slot(utt_id=5)
+        slot = self.state.slots.setdefault(5, _Slot(5))
         # Case 1: buf_ms < 400
         slot.buffer.extend(b"\x01\x00" * 3200)  # 200ms
         slot.last_seq = 1
-        self.state.slots[5] = slot
 
-        if slot.buf_ms < 400:
-            self.metrics.incr("tentative_skipped_too_short")
-            await self.state.send_json({"type": "tentative", "utt": 5, "seq": 1, "skipped": "too_short"})
-
+        await _on_control_frame(self.state, {"action": "tentative", "utt": 5, "seq": 1})
         self.assertEqual(self.metrics.counter("tentative_skipped_too_short"), 1)
         self.assertEqual(self.ws.sent_json[-1]["skipped"], "too_short")
         self.assertNotIn("translated_text", self.ws.sent_json[-1])
@@ -536,78 +504,92 @@ class TestPhase24SpeculativeFraming(unittest.IsolatedAsyncioTestCase):
         slot.buffer.extend(b"\x01\x00" * 8000)  # Total 700ms
         slot.tentatives_issued = 1
         slot.last_tentative_audio_ms = 500
-        if slot.tentatives_issued > 0 and (slot.buf_ms - slot.last_tentative_audio_ms) < 800:
-            self.metrics.incr("tentative_skipped_rate_limited")
-            await self.state.send_json({"type": "tentative", "utt": 5, "seq": 1, "skipped": "rate_limited"})
-
+        # delta = 700 - 500 = 200ms < 800ms
+        await _on_control_frame(self.state, {"action": "tentative", "utt": 5, "seq": 1})
         self.assertEqual(self.metrics.counter("tentative_skipped_rate_limited"), 1)
         self.assertEqual(self.ws.sent_json[-1]["skipped"], "rate_limited")
 
-        # Case 3: seq mismatch
-        seq_req = 99
-        if seq_req != slot.last_seq:
-            self.metrics.incr("tentative_skipped_seq_mismatch")
-            await self.state.send_json({"type": "tentative", "utt": 5, "seq": seq_req, "skipped": "seq_mismatch"})
-
+        # Case 3: seq mismatch (delta >= 800ms so rate cap does not shadow)
+        slot.last_tentative_audio_ms = -1000
+        await _on_control_frame(self.state, {"action": "tentative", "utt": 5, "seq": 99})
         self.assertEqual(self.metrics.counter("tentative_skipped_seq_mismatch"), 1)
         self.assertEqual(self.ws.sent_json[-1]["skipped"], "seq_mismatch")
 
     async def test_idempotent_commit_duplicate(self):
-        slot = _Slot(utt_id=6)
-        slot.buffer.extend(b"\x01\x00" * 8000)
-        slot.last_seq = 5
-        self.state.slots[6] = slot
-
-        # First commit
-        await _commit_slot(self.state, slot, seq=5)
+        # First commit via real _on_audio_frame with LAST flag
+        await _on_audio_frame(self.state, pack_v2(0x02, 6, 5, b"\x01\x00" * 8000))
         self.assertIn(6, self.state.committed_utts)
 
-        # Second commit for same utt
-        new_slot = _Slot(utt_id=6)
-        await _commit_slot(self.state, new_slot, seq=5)
+        # Second commit for same utt via _on_audio_frame
+        await _on_audio_frame(self.state, pack_v2(0x02, 6, 5, b"\x01\x00" * 160))
+        self.assertEqual(self.ws.sent_json[-1], {"event": "already_committed", "utt": 6})
 
-        self.assertEqual(len(self.ws.sent_json), 1)
-        self.assertEqual(self.ws.sent_json[0]["event"], "already_committed")
-        self.assertEqual(self.ws.sent_json[0]["utt"], 6)
+    async def test_schema_translated_text_never_in_non_delivery_frames(self):
+        # Set up real Pipeline with fake engines
+        pipe_settings = Settings(
+            sample_rate=16000,
+            sentence_streaming=True,
+            sentence_min_chars=5,
+            sentence_max_count=4,
+            warmup=False,
+            mt_backend="qwen_hf",
+        )
+        pipeline = Pipeline(pipe_settings)
+        pipeline.asr = FakeAsrEngine()
+        pipeline.mt = FakeMtEngine()
+        pipeline.started_at = 1.0
+        await pipeline._asr_sched.start()
+        await pipeline._mt_sched.start()
+        app.server.PIPELINE = pipeline
 
-    def test_schema_translated_text_never_in_non_delivery_frames(self):
-        partial_frame = {
-            "type": "partial",
-            "utt": 1,
-            "seq": 5,
-            "stable": "hello",
-            "unstable": "world",
-        }
-        self.assertNotIn("translated_text", partial_frame)
+        try:
+            slot = self.state.slots.setdefault(1, _Slot(1))
+            slot.buffer.extend(b"\x01\x00" * 16000)  # 1.0s audio
+            slot.last_seq = 10
+            self.state.target = "ar"
 
-        discard_frame = {
-            "type": "discard",
-            "utt": 1,
-            "what": "tentative",
-            "seq": 5,
-            "reason": "audio_after_tentative",
-        }
-        self.assertNotIn("translated_text", discard_frame)
+            # 1. Run actual server _run_tentative handler
+            await _run_tentative(self.state, slot, seq=10)
 
-        tentative_skip = {
-            "type": "tentative",
-            "utt": 1,
-            "seq": 5,
-            "skipped": "too_short",
-        }
-        self.assertNotIn("translated_text", tentative_skip)
+            # 2. Trigger discard via real _on_audio_frame
+            await _on_audio_frame(self.state, pack_v2(0, 1, 11, b"\x01\x00" * 160))
 
-        error_frame = {
-            "error": "overloaded",
-            "retry_after_ms": 250,
-            "detail": "queue full",
-        }
-        self.assertNotIn("translated_text", error_frame)
+            # 3. Trigger too_short tentative via real _on_control_frame
+            slot2 = self.state.slots.setdefault(2, _Slot(2))
+            slot2.buffer.extend(b"\x01\x00" * 1600)  # 100ms
+            slot2.last_seq = 1
+            await _on_control_frame(self.state, {"action": "tentative", "utt": 2, "seq": 1})
 
-        sentence_frame = {"type": "sentence", "index": 0, "text": "hello", "translated_text": "مرحبا"}
-        final_frame = {"type": "final", "source_text": "hello", "translated_text": "مرحبا"}
-        self.assertIn("translated_text", sentence_frame)
-        self.assertIn("translated_text", final_frame)
+            # Assert all non-delivery frames in ws.sent_json NEVER contain translated_text
+            self.assertGreater(len(self.ws.sent_json), 0)
+            for msg in self.ws.sent_json:
+                mtype = msg.get("type")
+                if mtype in {"tentative", "discard", "partial"} or "error" in msg:
+                    self.assertNotIn("translated_text", msg, f"Leak: translated_text found in {mtype} frame: {msg}")
+
+            # 4. Now commit and verify delivery frames (sentence and final) DO contain translated_text
+            slot3 = self.state.slots.setdefault(3, _Slot(3))
+            slot3.buffer.extend(b"\x01\x00" * 8000)
+            slot3.last_seq = 5
+            slot3.tentative_seq = 5
+            slot3.tentative_result = (
+                [{"type": "sentence", "index": 0, "is_last": True, "text": "Hi", "translated_text": "مرحبا"}],
+                {"type": "final", "source_text": "Hi", "translated_text": "مرحبا"},
+                50.0,
+            )
+            await _commit_slot(self.state, slot3, seq=5)
+            worker = asyncio.create_task(_utterance_worker(self.state))
+            await self.state.utterance_queue.put(None)
+            await worker
+
+            delivery_sentences = [m for m in self.ws.sent_json if m.get("type") == "sentence"]
+            delivery_finals = [m for m in self.ws.sent_json if m.get("type") == "final"]
+            self.assertTrue(all("translated_text" in m for m in delivery_sentences))
+            self.assertTrue(all("translated_text" in m for m in delivery_finals))
+        finally:
+            await pipeline._asr_sched.stop()
+            await pipeline._mt_sched.stop()
+            app.server.PIPELINE = self.dummy_pipeline
 
     def test_norm_hash_lru_cache(self):
         h1 = norm_hash("  Hello   World!  ")

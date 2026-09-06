@@ -618,6 +618,350 @@ async def _commit_slot(state: _StreamState, slot: _Slot, seq: int) -> None:
         await state.send_json({"error": "overloaded", "retry_after_ms": 250, "detail": "utterance queue full", "utterance": utt_id})
 
 
+async def _on_control_frame(state: _StreamState, control: dict[str, Any]) -> None:
+    pipeline = PIPELINE
+    unknown = set(control) - _CONTROL_KEYS
+    state.apply(control)
+    action = str(control.get("action", "")).strip().lower()
+
+    if action in {"commit", "flush", "end", "eou"}:
+        if state.protocol_version == 2:
+            utt_val = control.get("utt")
+            seq_val = control.get("seq")
+            target_slot = None
+            if utt_val is not None:
+                try:
+                    target_slot = state.slots.get(int(utt_val))
+                except (TypeError, ValueError):
+                    pass
+            if target_slot is None and state.slots:
+                for s in reversed(list(state.slots.values())):
+                    if s.buffer:
+                        target_slot = s
+                        break
+
+            if target_slot is not None:
+                slot_id = target_slot.utt_id
+                if not state.target:
+                    await state.send_json({
+                        "error": "missing_target",
+                        "detail": "target language not set",
+                        "utterance": slot_id,
+                    })
+                    return
+                c_seq = int(seq_val) if seq_val is not None else target_slot.last_seq
+                await _commit_slot(state, target_slot, c_seq)
+                return
+
+            if utt_val is not None:
+                try:
+                    u_id = int(utt_val)
+                    if u_id in state.committed_utts:
+                        await state.send_json({"event": "already_committed", "utt": u_id})
+                        return
+                except (TypeError, ValueError):
+                    pass
+
+        # Legacy v1 buffer commit
+        if not state.buffer:
+            await state.send_json(
+                {"error": "empty_utterance", "detail": "flush received but no audio was buffered"}
+            )
+        elif not state.target:
+            await state.send_json(
+                {
+                    "error": "missing_target",
+                    "detail": "send {'target': '<lang>'} before flushing audio",
+                }
+            )
+            state.buffer.clear()
+        else:
+            if state.utterance_queue.full():
+                await state.send_json({
+                    "error": "overloaded",
+                    "retry_after_ms": 250,
+                    "detail": "utterance queue full (backpressure cap: 3)",
+                })
+            else:
+                raw = bytes(state.buffer)
+                state.buffer.clear()
+                await state.utterance_queue.put(("fresh", raw, None, time.perf_counter()))
+        return
+
+    if action == "reset":
+        state.buffer.clear()
+        for s in state.slots.values():
+            if s.tentative_task and not s.tentative_task.done():
+                s.tentative_task.cancel()
+            if s.partial_task and not s.partial_task.done():
+                s.partial_task.cancel()
+        state.slots.clear()
+        state.mt_cache.clear()
+        state.committed_utts.clear()
+        drained = 0
+        while not state.utterance_queue.empty():
+            try:
+                state.utterance_queue.get_nowait()
+                state.utterance_queue.task_done()
+                drained += 1
+            except (asyncio.QueueEmpty, ValueError):
+                break
+        await state.send_json({"event": "reset", "buffered_bytes": 0, "drained_utterances": drained})
+        return
+
+    if action == "ping":
+        await state.send_json({"event": "pong", "time": time.time()})
+        return
+
+    if action == "tentative":
+        utt_val = control.get("utt")
+        seq_val = control.get("seq")
+        try:
+            utt_int = int(utt_val) if utt_val is not None else None
+            seq_int = int(seq_val) if seq_val is not None else None
+        except (TypeError, ValueError):
+            await state.send_json({"error": "bad_request", "detail": "tentative utt and seq must be integers"})
+            return
+
+        if utt_int is None or seq_int is None:
+            await state.send_json({"error": "bad_request", "detail": "tentative requires utt and seq"})
+            return
+
+        # 1. utt unknown or committed -> {"error":"unknown_utt"}
+        if utt_int in state.committed_utts or utt_int not in state.slots:
+            await state.send_json({"error": "unknown_utt", "utt": utt_int})
+            return
+
+        slot = state.slots[utt_int]
+
+        # 2. slot.buf_ms < 400 -> {"type":"tentative","utt","seq","skipped":"too_short"}; no work.
+        if slot.buf_ms < 400:
+            if pipeline is not None:
+                pipeline.metrics.incr("tentative_skipped_too_short")
+            await state.send_json({"type": "tentative", "utt": utt_int, "seq": seq_int, "skipped": "too_short"})
+            return
+
+        # 3. Rate cap: if slot.buf_ms - last_tentative_audio_ms < 800 and a tentative already ran -> skipped:"rate_limited"
+        if slot.tentatives_issued > 0 and (slot.buf_ms - slot.last_tentative_audio_ms) < 800:
+            if pipeline is not None:
+                pipeline.metrics.incr("tentative_skipped_rate_limited")
+            await state.send_json({"type": "tentative", "utt": utt_int, "seq": seq_int, "skipped": "rate_limited"})
+            return
+
+        # 4. seq != slot.last_seq -> skipped:"seq_mismatch" (client's view is stale; a frame is still in flight).
+        if seq_int != slot.last_seq:
+            if pipeline is not None:
+                pipeline.metrics.incr("tentative_skipped_seq_mismatch")
+            await state.send_json({"type": "tentative", "utt": utt_int, "seq": seq_int, "skipped": "seq_mismatch"})
+            return
+
+        # 5. Cancel running tentative, update tracking, launch new run_tentative
+        if slot.tentative_task is not None and not slot.tentative_task.done():
+            slot.tentative_task.cancel()
+
+        slot.tentative_seq = seq_int
+        slot.last_tentative_audio_ms = slot.buf_ms
+        slot.tentatives_issued += 1
+        slot.tentative_task = asyncio.create_task(_run_tentative(state, slot, seq_int))
+        return
+
+    if action == "abort":
+        utt_val = control.get("utt")
+        try:
+            utt_int = int(utt_val) if utt_val is not None else None
+        except (TypeError, ValueError):
+            utt_int = None
+        if utt_int is not None:
+            slot = state.slots.pop(utt_int, None)
+            if slot is not None:
+                if slot.tentative_task and not slot.tentative_task.done():
+                    slot.tentative_task.cancel()
+                if slot.partial_task and not slot.partial_task.done():
+                    slot.partial_task.cancel()
+                slot.tentative_result = None
+                freed_bytes = len(slot.buffer)
+            else:
+                freed_bytes = 0
+            if pipeline is not None:
+                pipeline.metrics.incr("aborted")
+            await state.send_json({"event": "aborted", "utt": utt_int, "freed_bytes": freed_bytes})
+        return
+
+    await state.send_json(
+        {
+            "event": "config",
+            "source": state.source,
+            "target": state.target,
+            "format": state.audio_format,
+            "sample_rate": state.sample_rate,
+            "channels": state.channels,
+            "protocol": state.protocol_version,
+            "ignored_keys": sorted(unknown) or None,
+        }
+    )
+
+
+async def _on_audio_frame(state: _StreamState, chunk: bytes) -> None:
+    pipeline = PIPELINE
+    settings = state.settings
+
+    # Protocol v2 framed audio: struct "<BBHH" (version, flags, utt_id, seq)
+    if state.protocol_version == 2 or state.audio_format == "pcm_s16le_framed":
+        if len(chunk) < 6:
+            if pipeline is not None:
+                pipeline.metrics.incr("bad_frame")
+            await state.send_json({
+                "error": "bad_frame",
+                "detail": f"chunk length {len(chunk)} < 6 bytes header",
+            })
+            return
+
+        try:
+            version, flags, utt_id, seq = struct.unpack("<BBHH", chunk[:6])
+            if version != 2:
+                if pipeline is not None:
+                    pipeline.metrics.incr("bad_frame")
+                await state.send_json({"error": "bad_frame", "detail": f"unsupported protocol version {version}"})
+                try:
+                    await state.websocket.close(code=1003)
+                except Exception:
+                    pass
+                return
+
+            payload = memoryview(chunk)[6:]
+            if len(payload) % 2 != 0:
+                if pipeline is not None:
+                    pipeline.metrics.incr("bad_frame")
+                await state.send_json({
+                    "error": "bad_frame",
+                    "detail": f"odd payload length {len(payload)}: 16-bit PCM requires even bytes",
+                    "utterance": utt_id,
+                    "seq": seq,
+                })
+                return
+
+            # I2 & I7: Check if utterance was already committed
+            if utt_id in state.committed_utts:
+                if pipeline is not None:
+                    pipeline.metrics.incr("late_frame_dropped")
+                if flags & 0x02:
+                    await state.send_json({"event": "already_committed", "utt": utt_id})
+                return
+
+            slot = state.slots.setdefault(utt_id, _Slot(utt_id))
+
+            # PREROLL flag check (bit 0: 0x01)
+            if flags & 0x01:
+                if slot.saw_preroll:
+                    if pipeline is not None:
+                        pipeline.metrics.incr("duplicate_preroll")
+                    return
+                slot.saw_preroll = True
+
+            # Sequence check and modulo 2^16 wrap arithmetic (I1 / I10)
+            if seq in slot.seq_seen:
+                # Duplicate frame: drop
+                return
+
+            if slot.last_seq is not None:
+                diff = (seq - slot.last_seq) & 0xFFFF
+                if diff != 1:
+                    if pipeline is not None:
+                        pipeline.metrics.incr("seq_gap")
+                    log.warning("slot %d seq gap: expected %d, got %d (diff=%d)", utt_id, (slot.last_seq + 1) & 0xFFFF, seq, diff)
+
+            # Note: slot.last_seq = seq is updated before the discard check uses slot.tentative_seq.
+            # Order is fine; seq_mismatch in the tentative handler depends on slot.last_seq
+            # recording the most recently processed audio frame before comparing with tentative_seq.
+            slot.last_seq = seq
+            slot.seq_seen.add(seq)
+
+            # B.2 Discard: If tentative running or cached result present and seq > tentative_seq
+            if (slot.tentative_task is not None and not slot.tentative_task.done()) or slot.tentative_result is not None:
+                if slot.tentative_seq != -1 and seq != slot.tentative_seq and ((seq - slot.tentative_seq) & 0xFFFF) < 32768:
+                    if slot.tentative_task is not None and not slot.tentative_task.done():
+                        slot.tentative_task.cancel()
+                    slot.tentative_result = None
+                    disc_seq = slot.tentative_seq
+                    slot.tentative_seq = -1
+                    if pipeline is not None:
+                        pipeline.metrics.incr("tentative_cancelled")
+                    await state.send_json({
+                        "type": "discard",
+                        "utt": utt_id,
+                        "what": "tentative",
+                        "seq": disc_seq,
+                        "reason": "audio_after_tentative",
+                    })
+
+            # Overflow handling: append what fits, auto-commit, roll remainder to utt+1
+            if len(slot.buffer) + len(payload) > state.max_bytes:
+                if pipeline is not None:
+                    pipeline.metrics.incr("auto_commit")
+                space = max(0, state.max_bytes - len(slot.buffer))
+                if space > 0:
+                    slot.buffer.extend(payload[:space])
+                remainder = bytes(payload[space:])
+
+                next_utt = (utt_id + 1) & 0xFFFF
+                await state.send_json({
+                    "event": "auto_commit",
+                    "reason": "max_utterance",
+                    "utt": utt_id,
+                    "rolled_to": next_utt,
+                })
+                await _commit_slot(state, slot, seq)
+
+                next_slot = state.slots.setdefault(next_utt, _Slot(next_utt))
+                if remainder:
+                    next_slot.buffer.extend(remainder)
+                next_slot.last_seq = seq
+                next_slot.seq_seen.add(seq)
+                return
+
+            slot.buffer.extend(payload)
+
+            # Partials: while frames are arriving and slot.buf_ms >= 800, every partial_ms
+            if state.settings.partial_ms > 0 and slot.buf_ms >= 800:
+                interval_s = state.settings.partial_ms / 1000.0
+                now = time.monotonic()
+                if now - slot.last_partial_started >= interval_s:
+                    if slot.partial_task is not None and not slot.partial_task.done():
+                        if pipeline is not None:
+                            pipeline.metrics.incr("partials_skipped")
+                    elif slot.tentative_task is None or slot.tentative_task.done() or slot.tentative_seq != seq:
+                        slot.last_partial_started = now
+                        slot.partial_task = asyncio.create_task(_run_partial(state, slot, seq))
+
+            # Check flags: bit 1 is LAST (commit)
+            if flags & 0x02:
+                await _commit_slot(state, slot, seq)
+                return
+
+        except Exception as exc:
+            if pipeline is not None:
+                pipeline.metrics.incr("bad_frame")
+            log.warning("error parsing framed binary audio: %s", exc)
+            return
+
+        return
+
+    # Protocol v1 legacy un-framed audio
+    if len(state.buffer) + len(chunk) > state.max_bytes:
+        state.buffer.clear()
+        await state.send_json(
+            {
+                "error": "utterance_too_long",
+                "detail": (
+                    f"buffered audio exceeded {settings.max_utterance_seconds}s; "
+                    "buffer cleared. Send {'action':'flush'} at end of speech."
+                ),
+            }
+        )
+        return
+    state.buffer.extend(chunk)
+
+
 @app.websocket("/ws/v1/translate-stream")
 async def translate_stream(websocket: WebSocket) -> None:
     await websocket.accept()
@@ -757,343 +1101,19 @@ async def translate_stream(websocket: WebSocket) -> None:
                     )
                     continue
 
-                unknown = set(control) - _CONTROL_KEYS
-                state.apply(control)
-                action = str(control.get("action", "")).strip().lower()
-
-                if action in {"commit", "flush", "end", "eou"}:
-                    if state.protocol_version == 2:
-                        utt_val = control.get("utt")
-                        seq_val = control.get("seq")
-                        target_slot = None
-                        if utt_val is not None:
-                            try:
-                                target_slot = state.slots.get(int(utt_val))
-                            except (TypeError, ValueError):
-                                pass
-                        if target_slot is None and state.slots:
-                            for s in reversed(list(state.slots.values())):
-                                if s.buffer:
-                                    target_slot = s
-                                    break
-
-                        if target_slot is not None:
-                            slot_id = target_slot.utt_id
-                            if not state.target:
-                                await state.send_json({
-                                    "error": "missing_target",
-                                    "detail": "target language not set",
-                                    "utterance": slot_id,
-                                })
-                                continue
-                            c_seq = int(seq_val) if seq_val is not None else target_slot.last_seq
-                            await _commit_slot(state, target_slot, c_seq)
-                            continue
-
-                        if utt_val is not None:
-                            try:
-                                u_id = int(utt_val)
-                                if u_id in state.committed_utts:
-                                    await state.send_json({"event": "already_committed", "utt": u_id})
-                                    continue
-                            except (TypeError, ValueError):
-                                pass
-
-                    # Legacy v1 buffer commit
-                    if not state.buffer:
-                        await state.send_json(
-                            {"error": "empty_utterance", "detail": "flush received but no audio was buffered"}
-                        )
-                    elif not state.target:
-                        await state.send_json(
-                            {
-                                "error": "missing_target",
-                                "detail": "send {'target': '<lang>'} before flushing audio",
-                            }
-                        )
-                        state.buffer.clear()
-                    else:
-                        if state.utterance_queue.full():
-                            await state.send_json({
-                                "error": "overloaded",
-                                "retry_after_ms": 250,
-                                "detail": "utterance queue full (backpressure cap: 4)",
-                            })
-                        else:
-                            raw = bytes(state.buffer)
-                            state.buffer.clear()
-                            await state.utterance_queue.put(("fresh", raw, None, time.perf_counter()))
-                    continue
-
-                if action == "reset":
-                    state.buffer.clear()
-                    for s in state.slots.values():
-                        if s.tentative_task and not s.tentative_task.done():
-                            s.tentative_task.cancel()
-                        if s.partial_task and not s.partial_task.done():
-                            s.partial_task.cancel()
-                    state.slots.clear()
-                    state.mt_cache.clear()
-                    state.committed_utts.clear()
-                    drained = 0
-                    while not state.utterance_queue.empty():
-                        try:
-                            state.utterance_queue.get_nowait()
-                            state.utterance_queue.task_done()
-                            drained += 1
-                        except (asyncio.QueueEmpty, ValueError):
-                            break
-                    await state.send_json({"event": "reset", "buffered_bytes": 0, "drained_utterances": drained})
-                    continue
-
-                if action == "ping":
-                    await state.send_json({"event": "pong", "time": time.time()})
-                    continue
-
-                if action == "tentative":
-                    utt_val = control.get("utt")
-                    seq_val = control.get("seq")
-                    try:
-                        utt_int = int(utt_val) if utt_val is not None else None
-                        seq_int = int(seq_val) if seq_val is not None else None
-                    except (TypeError, ValueError):
-                        await state.send_json({"error": "bad_request", "detail": "tentative utt and seq must be integers"})
-                        continue
-
-                    if utt_int is None or seq_int is None:
-                        await state.send_json({"error": "bad_request", "detail": "tentative requires utt and seq"})
-                        continue
-
-                    # 1. utt unknown or committed -> {"error":"unknown_utt"}
-                    if utt_int in state.committed_utts or utt_int not in state.slots:
-                        await state.send_json({"error": "unknown_utt", "utt": utt_int})
-                        continue
-
-                    slot = state.slots[utt_int]
-
-                    # 2. slot.buf_ms < 400 -> {"type":"tentative","utt","seq","skipped":"too_short"}; no work.
-                    if slot.buf_ms < 400:
-                        if PIPELINE is not None:
-                            PIPELINE.metrics.incr("tentative_skipped_too_short")
-                        await state.send_json({"type": "tentative", "utt": utt_int, "seq": seq_int, "skipped": "too_short"})
-                        continue
-
-                    # 3. Rate cap: if slot.buf_ms - last_tentative_audio_ms < 800 and a tentative already ran -> skipped:"rate_limited"
-                    if slot.tentatives_issued > 0 and (slot.buf_ms - slot.last_tentative_audio_ms) < 800:
-                        if PIPELINE is not None:
-                            PIPELINE.metrics.incr("tentative_skipped_rate_limited")
-                        await state.send_json({"type": "tentative", "utt": utt_int, "seq": seq_int, "skipped": "rate_limited"})
-                        continue
-
-                    # 4. seq != slot.last_seq -> skipped:"seq_mismatch" (client's view is stale; a frame is still in flight).
-                    if seq_int != slot.last_seq:
-                        if PIPELINE is not None:
-                            PIPELINE.metrics.incr("tentative_skipped_seq_mismatch")
-                        await state.send_json({"type": "tentative", "utt": utt_int, "seq": seq_int, "skipped": "seq_mismatch"})
-                        continue
-
-                    # 5. Cancel running tentative, update tracking, launch new run_tentative
-                    if slot.tentative_task is not None and not slot.tentative_task.done():
-                        slot.tentative_task.cancel()
-
-                    slot.tentative_seq = seq_int
-                    slot.last_tentative_audio_ms = slot.buf_ms
-                    slot.tentatives_issued += 1
-                    slot.tentative_task = asyncio.create_task(_run_tentative(state, slot, seq_int))
-                    continue
-
-                if action == "abort":
-                    utt_val = control.get("utt")
-                    try:
-                        utt_int = int(utt_val) if utt_val is not None else None
-                    except (TypeError, ValueError):
-                        utt_int = None
-                    if utt_int is not None:
-                        slot = state.slots.pop(utt_int, None)
-                        if slot is not None:
-                            if slot.tentative_task and not slot.tentative_task.done():
-                                slot.tentative_task.cancel()
-                            if slot.partial_task and not slot.partial_task.done():
-                                slot.partial_task.cancel()
-                            slot.tentative_result = None
-                            freed_bytes = len(slot.buffer)
-                        else:
-                            freed_bytes = 0
-                        if PIPELINE is not None:
-                            PIPELINE.metrics.incr("aborted")
-                        await state.send_json({"event": "aborted", "utt": utt_int, "freed_bytes": freed_bytes})
-                    continue
-
-                if action == "close":
+                if control.get("action") == "close":
                     break
 
-                await state.send_json(
-                    {
-                        "event": "config",
-                        "source": state.source,
-                        "target": state.target,
-                        "format": state.audio_format,
-                        "sample_rate": state.sample_rate,
-                        "channels": state.channels,
-                        "protocol": state.protocol_version,
-                        "ignored_keys": sorted(unknown) or None,
-                    }
-                )
+                await _on_control_frame(state, control)
                 continue
 
             # ---- audio frames ---------------------------------------
             chunk = message.get("bytes")
-            if chunk is None:
+            if chunk is not None:
+                await _on_audio_frame(state, chunk)
+                if state.closed:
+                    break
                 continue
-            # Protocol v2 framed audio: struct "<BBHH" (version, flags, utt_id, seq)
-            if state.protocol_version == 2 or state.audio_format == "pcm_s16le_framed":
-                if len(chunk) < 6:
-                    if PIPELINE is not None:
-                        PIPELINE.metrics.incr("bad_frame")
-                    await state.send_json({
-                        "error": "bad_frame",
-                        "detail": f"chunk length {len(chunk)} < 6 bytes header",
-                    })
-                    continue
-
-                try:
-                    version, flags, utt_id, seq = struct.unpack("<BBHH", chunk[:6])
-                    if version != 2:
-                        if PIPELINE is not None:
-                            PIPELINE.metrics.incr("bad_frame")
-                        await state.send_json({"error": "bad_frame", "detail": f"unsupported protocol version {version}"})
-                        await websocket.close(code=1003)
-                        break
-
-                    payload = memoryview(chunk)[6:]
-                    if len(payload) % 2 != 0:
-                        if PIPELINE is not None:
-                            PIPELINE.metrics.incr("bad_frame")
-                        await state.send_json({
-                            "error": "bad_frame",
-                            "detail": f"odd payload length {len(payload)}: 16-bit PCM requires even bytes",
-                            "utterance": utt_id,
-                            "seq": seq,
-                        })
-                        continue
-
-                    # I2 & I7: Check if utterance was already committed
-                    if utt_id in state.committed_utts:
-                        if PIPELINE is not None:
-                            PIPELINE.metrics.incr("late_frame_dropped")
-                        if flags & 0x02:
-                            await state.send_json({"event": "already_committed", "utt": utt_id})
-                        continue
-
-                    slot = state.slots.setdefault(utt_id, _Slot(utt_id))
-
-                    # PREROLL flag check (bit 0: 0x01)
-                    if flags & 0x01:
-                        if slot.saw_preroll:
-                            if PIPELINE is not None:
-                                PIPELINE.metrics.incr("duplicate_preroll")
-                            continue
-                        slot.saw_preroll = True
-
-                    # Sequence check and modulo 2^16 wrap arithmetic (I1 / I10)
-                    if seq in slot.seq_seen:
-                        # Duplicate frame: drop
-                        continue
-
-                    if slot.last_seq is not None:
-                        diff = (seq - slot.last_seq) & 0xFFFF
-                        if diff != 1:
-                            if PIPELINE is not None:
-                                PIPELINE.metrics.incr("seq_gap")
-                            log.warning("slot %d seq gap: expected %d, got %d (diff=%d)", utt_id, (slot.last_seq + 1) & 0xFFFF, seq, diff)
-
-                    slot.last_seq = seq
-                    slot.seq_seen.add(seq)
-
-                    # B.2 Discard: If tentative running or cached result present and seq > tentative_seq
-                    if (slot.tentative_task is not None and not slot.tentative_task.done()) or slot.tentative_result is not None:
-                        if slot.tentative_seq != -1 and seq != slot.tentative_seq and ((seq - slot.tentative_seq) & 0xFFFF) < 32768:
-                            if slot.tentative_task is not None and not slot.tentative_task.done():
-                                slot.tentative_task.cancel()
-                            slot.tentative_result = None
-                            disc_seq = slot.tentative_seq
-                            slot.tentative_seq = -1
-                            if PIPELINE is not None:
-                                PIPELINE.metrics.incr("tentative_cancelled")
-                            await state.send_json({
-                                "type": "discard",
-                                "utt": utt_id,
-                                "what": "tentative",
-                                "seq": disc_seq,
-                                "reason": "audio_after_tentative",
-                            })
-
-                    # Overflow handling: append what fits, auto-commit, roll remainder to utt+1
-                    if len(slot.buffer) + len(payload) > state.max_bytes:
-                        if PIPELINE is not None:
-                            PIPELINE.metrics.incr("auto_commit")
-                        space = max(0, state.max_bytes - len(slot.buffer))
-                        if space > 0:
-                            slot.buffer.extend(payload[:space])
-                        remainder = bytes(payload[space:])
-
-                        next_utt = (utt_id + 1) & 0xFFFF
-                        await state.send_json({
-                            "event": "auto_commit",
-                            "reason": "max_utterance",
-                            "utt": utt_id,
-                            "rolled_to": next_utt,
-                        })
-                        await _commit_slot(state, slot, seq)
-
-                        next_slot = state.slots.setdefault(next_utt, _Slot(next_utt))
-                        if remainder:
-                            next_slot.buffer.extend(remainder)
-                        next_slot.last_seq = seq
-                        next_slot.seq_seen.add(seq)
-                        continue
-
-                    slot.buffer.extend(payload)
-
-                    # Partials: while frames are arriving and slot.buf_ms >= 800, every partial_ms
-                    if state.settings.partial_ms > 0 and slot.buf_ms >= 800:
-                        interval_s = state.settings.partial_ms / 1000.0
-                        now = time.monotonic()
-                        if now - slot.last_partial_started >= interval_s:
-                            if slot.partial_task is not None and not slot.partial_task.done():
-                                if PIPELINE is not None:
-                                    PIPELINE.metrics.incr("partials_skipped")
-                            elif slot.tentative_task is None or slot.tentative_task.done() or slot.tentative_seq != seq:
-                                slot.last_partial_started = now
-                                slot.partial_task = asyncio.create_task(_run_partial(state, slot, seq))
-
-                    # Check flags: bit 1 is LAST (commit)
-                    if flags & 0x02:
-                        await _commit_slot(state, slot, seq)
-                        continue
-
-                except Exception as exc:
-                    if PIPELINE is not None:
-                        PIPELINE.metrics.incr("bad_frame")
-                    log.warning("error parsing framed binary audio: %s", exc)
-                    continue
-
-                continue
-
-            # Protocol v1 legacy un-framed audio
-            if len(state.buffer) + len(chunk) > state.max_bytes:
-                state.buffer.clear()
-                await state.send_json(
-                    {
-                        "error": "utterance_too_long",
-                        "detail": (
-                            f"buffered audio exceeded {settings.max_utterance_seconds}s; "
-                            "buffer cleared. Send {'action':'flush'} at end of speech."
-                        ),
-                    }
-                )
-                continue
-            state.buffer.extend(chunk)
 
     except WebSocketDisconnect:
         pass

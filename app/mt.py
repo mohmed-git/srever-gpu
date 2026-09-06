@@ -722,7 +722,7 @@ class QwenCt2Engine(MtEngine):
                 include_prompt_in_result=False,
                 max_length=dyn_tokens,
                 sampling_topk=1,
-                end_token=["<|im_end|>", "<|endoftext|>"],
+                end_token=["<|im_end|>", "<|endoftext|>", "\n"],
             )
             for (idx, text, src, dst, per_req), out in zip(grp, outputs):
                 collected.append((idx, out, static + per_req, text, src, dst))
