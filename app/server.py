@@ -332,15 +332,49 @@ async def translate_stream(websocket: WebSocket) -> None:
 
     try:
         while True:
+            has_pending_audio = bool(state.buffer) or any(len(s.buffer) > 0 for s in state.slots.values())
+            recv_timeout = 1.2 if has_pending_audio else 120.0
             try:
-                message = await asyncio.wait_for(websocket.receive(), timeout=120.0)
+                message = await asyncio.wait_for(websocket.receive(), timeout=recv_timeout)
             except asyncio.TimeoutError:
-                log.info("closing idle websocket after 120s timeout")
-                try:
-                    await websocket.close(code=1000)
-                except Exception:
-                    pass
-                break
+                if has_pending_audio:
+                    # Inactivity / silence auto-commit fallback:
+                    # If client spoke and stopped sending packets for 1.2s without LAST flag or flush,
+                    # automatically commit any slot with substantive speech (>= 100ms / 3200 bytes).
+                    if state.protocol_version == 2:
+                        for s in list(state.slots.values()):
+                            slot_id = s.utt_id
+                            if len(s.buffer) >= 3200:
+                                raw = bytes(s.buffer)
+                                state.slots.pop(slot_id, None)
+                                state.record_committed(slot_id)
+                                if PIPELINE is not None:
+                                    PIPELINE.metrics.incr("silence_auto_commit")
+                                log.info("Auto-committed slot %d on silence timeout (%d bytes)", slot_id, len(raw))
+                                if state.target and not state.utterance_queue.full():
+                                    await state.utterance_queue.put((raw, slot_id))
+                            else:
+                                # Clean up tiny sub-100ms noise burst
+                                state.slots.pop(slot_id, None)
+                    elif state.buffer:
+                        if len(state.buffer) >= 3200:
+                            raw = bytes(state.buffer)
+                            state.buffer.clear()
+                            if PIPELINE is not None:
+                                PIPELINE.metrics.incr("silence_auto_commit")
+                            log.info("Auto-committed v1 buffer on silence timeout (%d bytes)", len(raw))
+                            if state.target and not state.utterance_queue.full():
+                                await state.utterance_queue.put((raw, None))
+                        else:
+                            state.buffer.clear()
+                    continue
+                else:
+                    log.info("closing idle websocket after 120s timeout")
+                    try:
+                        await websocket.close(code=1000)
+                    except Exception:
+                        pass
+                    break
             if message.get("type") == "websocket.disconnect":
                 break
 
@@ -366,6 +400,46 @@ async def translate_stream(websocket: WebSocket) -> None:
 
                 if action in {"flush", "end", "eou"}:
                     # Invariant I8: Hand off buffer to async utterance worker; DO NOT BLOCK receive loop!
+                    if state.protocol_version == 2 and any(len(s.buffer) > 0 for s in state.slots.values()):
+                        # Protocol v2 flush support: find targeted or latest active slot
+                        utt_val = control.get("utt")
+                        target_slot = None
+                        if utt_val is not None:
+                            try:
+                                target_slot = state.slots.get(int(utt_val))
+                            except (TypeError, ValueError):
+                                pass
+                        if target_slot is None:
+                            for s in reversed(list(state.slots.values())):
+                                if s.buffer:
+                                    target_slot = s
+                                    break
+                        if target_slot and target_slot.buffer:
+                            slot_id = target_slot.utt_id
+                            if not state.target:
+                                await state.send_json({
+                                    "error": "missing_target",
+                                    "detail": "target language not set",
+                                    "utterance": slot_id,
+                                })
+                                continue
+                            if state.utterance_queue.full():
+                                await state.send_json({
+                                    "error": "overloaded",
+                                    "retry_after_ms": 250,
+                                    "detail": "utterance queue full (backpressure cap: 3)",
+                                    "utterance": slot_id,
+                                })
+                                continue
+                            raw = bytes(target_slot.buffer)
+                            state.slots.pop(slot_id, None)
+                            state.record_committed(slot_id)
+                            if PIPELINE is not None:
+                                PIPELINE.metrics.incr("flush_v2_committed")
+                            log.info("Committed slot %d via flush action (%d bytes)", slot_id, len(raw))
+                            await state.utterance_queue.put((raw, slot_id))
+                            continue
+
                     if not state.buffer:
                         await state.send_json(
                             {"error": "empty_utterance", "detail": "flush received but no audio was buffered"}

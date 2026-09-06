@@ -140,6 +140,41 @@ class TestFramingInvariants(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(next_slot.buffer), 20)
         self.assertIn(100, self.state.committed_utts)
 
+    def test_protocol_v2_flush_support(self):
+        # Simulate slot having audio, then client sends action: flush
+        slot = _Slot(utt_id=77)
+        slot.buffer.extend(b"\x01\x00" * 2000) # 4000 bytes
+        self.state.slots[77] = slot
+        self.state.protocol_version = 2
+        self.state.target = "ar"
+
+        # Check committing via flush
+        self.assertIn(77, self.state.slots)
+        target_slot = self.state.slots.get(77)
+        raw = bytes(target_slot.buffer)
+        self.state.slots.pop(77, None)
+        self.state.record_committed(77)
+
+        self.assertNotIn(77, self.state.slots)
+        self.assertIn(77, self.state.committed_utts)
+        self.assertEqual(len(raw), 4000)
+
+    def test_silence_auto_commit_threshold(self):
+        # When audio is >= 3200 bytes, silence auto-commit triggers
+        slot = _Slot(utt_id=88)
+        slot.buffer.extend(b"\x02\x00" * 1600) # 3200 bytes
+        self.state.slots[88] = slot
+        
+        # Check that >= 3200 is committed
+        s = self.state.slots[88]
+        self.assertGreaterEqual(len(s.buffer), 3200)
+        raw = bytes(s.buffer)
+        self.state.slots.pop(88, None)
+        self.state.record_committed(88)
+
+        self.assertEqual(len(raw), 3200)
+        self.assertIn(88, self.state.committed_utts)
+
     async def test_reset_drains_utterance_queue(self):
         await self.state.utterance_queue.put((b'audio1', 1))
         await self.state.utterance_queue.put((b'audio2', 2))
@@ -312,3 +347,5 @@ class TestPipelineStreamingNoNameError(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
