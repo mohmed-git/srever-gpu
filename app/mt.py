@@ -262,6 +262,8 @@ def make_retry_translation_messages(text: str, src: str, dst: str) -> list[dict[
 
 def clean_translation(text: str, target_lang: str = "", source_text: str = "") -> str:
     out = (text or "").strip()
+    if "\n" in out:
+        out = out.split("\n")[0].strip()
     out = _PREAMBLE.sub("", out).strip()
     # A model that wrapped the whole answer in quotes should not make the
     # earbuds pronounce the quotes.
@@ -722,7 +724,7 @@ class QwenCt2Engine(MtEngine):
                 include_prompt_in_result=False,
                 max_length=dyn_tokens,
                 sampling_topk=1,
-                end_token=["<|im_end|>", "<|endoftext|>", "\n"],
+                end_token=["<|im_end|>", "<|endoftext|>"],
             )
             for (idx, text, src, dst, per_req), out in zip(grp, outputs):
                 collected.append((idx, out, static + per_req, text, src, dst))
@@ -734,6 +736,8 @@ class QwenCt2Engine(MtEngine):
         for _idx, output, full_prompt_tokens, text, _s, _d in collected:
             out_tokens = output.sequences[0] if output.sequences else []
             decoded_raw = self._tokenizer.convert_tokens_to_string(out_tokens)
+            if "\n" in decoded_raw:
+                decoded_raw = decoded_raw.split("\n")[0]
             decoded = clean_translation(decoded_raw, target_lang=_d, source_text=text)
 
             if detect_person_mismatch(text, decoded, _s, _d):
