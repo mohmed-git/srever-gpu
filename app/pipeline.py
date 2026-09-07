@@ -72,6 +72,7 @@ class Pipeline:
         self.metrics = Metrics(window=settings.metrics_window, budget_ms=settings.latency_budget_ms)
         self.asr = AsrEngine(settings)
         self.mt: MtEngine = build_mt_engine(settings)
+        self.mt.metrics = self.metrics
         self.started_at: float | None = None
         self.load_error: str | None = None
         self.warmup_report: dict[str, Any] = {}
@@ -588,6 +589,7 @@ class Pipeline:
             mt_total_ms = 0.0
             first_sentence_ms: float | None = None
             hollow_reasons: list[str] = []
+            any_retried = False
 
             mt_tasks: list[asyncio.Task] = []
             try:
@@ -597,6 +599,7 @@ class Pipeline:
                         # per sentence so the client's playback path is identical.
                         piece, piece_ms = sentence, 0.0
                         piece_hollow, piece_reason = False, None
+                        piece_retried = False
                         mt_backend, out_tokens = None, None
                     elif index == 0:
                         # Sentence 0 is submitted and awaited immediately so Early Dispatch
@@ -606,6 +609,9 @@ class Pipeline:
                         )
                         piece, piece_ms = mt_result.text, mt_result.mt_ms
                         piece_hollow, piece_reason = mt_result.hollow, mt_result.hollow_reason
+                        piece_retried = getattr(mt_result, "retried", False)
+                        if piece_retried:
+                            any_retried = True
                         mt_backend, out_tokens = mt_result.backend, mt_result.output_tokens
                         mt_total_ms += mt_result.mt_ms
                         self.metrics.observe("mt_ms", mt_result.mt_ms)
@@ -622,6 +628,9 @@ class Pipeline:
                         mt_result, mt_timing = await mt_tasks[task_idx]
                         piece, piece_ms = mt_result.text, mt_result.mt_ms
                         piece_hollow, piece_reason = mt_result.hollow, mt_result.hollow_reason
+                        piece_retried = getattr(mt_result, "retried", False)
+                        if piece_retried:
+                            any_retried = True
                         mt_backend, out_tokens = mt_result.backend, mt_result.output_tokens
                         mt_total_ms += mt_result.mt_ms
                         self.metrics.observe("mt_ms", mt_result.mt_ms)
@@ -653,6 +662,7 @@ class Pipeline:
                         "output_tokens": out_tokens,
                         "hollow": piece_hollow,
                         "hollow_reason": piece_reason,
+                        "retried": piece_retried,
                         "rtl": lang_mod.is_rtl(dst),
                     }
             finally:
@@ -721,6 +731,7 @@ class Pipeline:
                 "passthrough": passthrough,
                 "hollow": bool(hollow_reasons),
                 "hollow_reason": "; ".join(hollow_reasons) or None,
+                "retried": any_retried,
                 "within_budget": total_ms <= self.settings.latency_budget_ms,
                 "first_sentence_within_budget": (
                     first_sentence_ms is not None

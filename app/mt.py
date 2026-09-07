@@ -110,6 +110,10 @@ def make_translation_messages(text: str, src: str, dst: str) -> list[dict[str, s
             {"role": "assistant", "content": "لا آكل لحم البقر."},
             {"role": "user", "content": "I eat breakfast in the morning."},
             {"role": "assistant", "content": "أتناول الفطور في الصباح."},
+            {"role": "user", "content": "Don't wait for tomorrow, start today."},
+            {"role": "assistant", "content": "لا تنتظر الغد، بل ابدأ اليوم."},
+            {"role": "user", "content": "Work hard, and stay humble."},
+            {"role": "assistant", "content": "اعمل بجد، وابقَ متواضعاً."},
             {"role": "user", "content": text},
         ]
     elif src == "ar" or src.startswith("ar"):
@@ -316,6 +320,7 @@ class MtResult:
     batch_size: int
     hollow: bool
     hollow_reason: str | None
+    retried: bool = False
 
 
 class MtEngine:
@@ -327,6 +332,11 @@ class MtEngine:
         self.settings = settings
         self.load_seconds: float | None = None
         self.error: str | None = None
+        self.metrics: Any = None
+
+    def _metrics_incr(self, name: str, count: int = 1) -> None:
+        if self.metrics is not None and hasattr(self.metrics, "incr"):
+            self.metrics.incr(name, count)
 
     def load(self) -> None:  # pragma: no cover - overridden
         raise NotImplementedError
@@ -368,6 +378,9 @@ class MtEngine:
 _HAS_WORD = re.compile(r"\w", re.UNICODE)
 
 
+_LOW_SCRIPT_RATIO: Final[float] = 0.5   # measured threshold; revisit against the 300-item set
+
+
 def is_translatable(text: str) -> bool:
     """True when the text contains at least one word character.
 
@@ -379,15 +392,22 @@ def is_translatable(text: str) -> bool:
     return bool(_HAS_WORD.search(text or ""))
 
 
-def _hollow_check(text: str, source_text: str) -> tuple[bool, str | None]:
+def _low_target_script(text: str, target_lang: str) -> bool:
+    """True when the output is mostly not in the target script (untranslated passthrough)."""
+    if not target_lang or target_lang == "auto":
+        return False
+    return _script_ratio(text, target_lang) < _LOW_SCRIPT_RATIO
+
+
+def _hollow_check(text: str, source_text: str, target_lang: str = "") -> tuple[bool, str | None]:
     """An empty translation is a failure, not a fast success."""
     if not is_translatable(source_text):
         return True, (
             "source text contains no word characters: any output here is a "
             "hallucination (measured: '  ' -> '\u0645\u0640\u0646\u0640\u0647\u0640\u0627')"
         )
-    if not text.strip():
-        return True, "translation engine returned empty text"
+    if not is_translatable(text):
+        return True, f"translation contains no word characters: {text!r}"
     return False, None
 
 
@@ -543,7 +563,7 @@ class M2M100Ct2Engine(MtEngine):
                 target_lang=_dst,
                 source_text=text,
             )
-            hollow, reason = _hollow_check(decoded, text)
+            hollow, reason = _hollow_check(decoded, text, target_lang=_dst)
             out.append(
                 MtResult(
                     text=decoded,
@@ -825,11 +845,24 @@ class QwenCt2Engine(MtEngine):
                 PERSON_MISMATCH_OBSERVED_COUNT += 1
                 log.info("Person mismatch observed (observe-only): src=%r tgt=%r", text, decoded)
 
-            hollow, reason = _hollow_check(decoded, text)
+            retried = False
+            if (not is_translatable(decoded)) or _low_target_script(decoded, _d):
+                retried = True
+                self._metrics_incr("mt_retry")
+                decoded = self._translate_single_retry(text, _s, _d)
+
+            hollow, reason = _hollow_check(decoded, text, target_lang=_d)
+            if not hollow and _low_target_script(decoded, _d):
+                hollow, reason = True, f"target script ratio {_script_ratio(decoded,_d):.0%} < 50% after retry: {decoded!r}"
+            if hollow:
+                if retried and reason and "retry" not in reason:
+                    reason = f"{reason} (after retry)"
+                decoded = ""            # never hand punctuation or passthrough to TTS
+
             results.append(
                 MtResult(
                     text=decoded,
-                    mt_ms=elapsed_ms,
+                    mt_ms=round((time.perf_counter() - started) * 1000.0, 2),
                     backend=self.name,
                     model=self.model_path,
                     input_tokens=len(full_prompt_tokens),
@@ -837,9 +870,42 @@ class QwenCt2Engine(MtEngine):
                     batch_size=len(items),
                     hollow=hollow,
                     hollow_reason=reason,
+                    retried=retried,
                 )
             )
         return results
+
+    def _translate_single_retry(self, text: str, src: str, dst: str) -> str:
+        messages = make_retry_translation_messages(text, src, dst)
+        prompt_text = self._tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        tokens = self._tokenizer.tokenize(prompt_text)
+        dyn_tokens = _estimate_dynamic_tokens([(text, src, dst)], self.settings.mt_max_new_tokens, tokenizer=self._tokenizer)
+        outputs = self._generator.generate_batch(
+            [tokens],
+            include_prompt_in_result=False,
+            max_length=dyn_tokens,
+            sampling_topk=1,
+            repetition_penalty=1.0,
+            end_token=["<|im_end|>", "<|endoftext|>"],
+        )
+        if not outputs:
+            return ""
+        output = outputs[0]
+        if hasattr(output, "sequences_ids") and output.sequences_ids and output.sequences_ids[0]:
+            decoded_raw = self._tokenizer.decode(output.sequences_ids[0], skip_special_tokens=True)
+        elif output.sequences and output.sequences[0]:
+            decoded_raw = self._tokenizer.convert_tokens_to_string(output.sequences[0])
+        else:
+            decoded_raw = ""
+        lines = [ln.strip() for ln in decoded_raw.split("\n") if ln.strip()]
+        candidate = ""
+        for ln in lines:
+            if is_translatable(ln):
+                candidate = ln
+                break
+        if not candidate and lines:
+            candidate = lines[0]
+        return clean_translation(candidate or decoded_raw, target_lang=dst, source_text=text)
 
     def info(self) -> dict[str, Any]:
         if self._fallback_engine is not None and self._fallback_engine.ready:
@@ -997,7 +1063,7 @@ class QwenVllmEngine(MtEngine):
                 PERSON_MISMATCH_OBSERVED_COUNT += 1
                 log.info("Person mismatch observed (observe-only): src=%r tgt=%r", text, decoded)
 
-            hollow, reason = _hollow_check(decoded, text)
+            hollow, reason = _hollow_check(decoded, text, target_lang=_d)
             results.append(
                 MtResult(
                     text=decoded,
@@ -1143,7 +1209,7 @@ class QwenHfEngine(MtEngine):
                 PERSON_MISMATCH_OBSERVED_COUNT += 1
                 log.info("Person mismatch observed (observe-only): src=%r tgt=%r", text, decoded)
 
-            hollow, reason = _hollow_check(decoded, text)
+            hollow, reason = _hollow_check(decoded, text, target_lang=_d)
             results.append(
                 MtResult(
                     text=decoded,

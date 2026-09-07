@@ -125,6 +125,8 @@ class Metrics:
             "presplit_hit": 0,
             "presplit_miss": 0,
             "aborted": 0,
+            "mt_retry": 0,
+            "asr_pinned_lang_mismatch": 0,
         }
         self._started_at = time.time()
         self._inflight = 0

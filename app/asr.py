@@ -42,6 +42,14 @@ _AR_HALLUCINATION_BLOCKLIST: set[str] = {
     "Subscribe to the channel",
 }
 
+_EN_HALLUCINATION_BLOCKLIST: set[str] = {
+    "I hope you guys enjoyed it",
+    "Thanks for watching",
+    "Please subscribe",
+    "See you in the next video",
+    "Thank you for watching",
+}
+
 
 @dataclass(frozen=True)
 class AsrResult:
@@ -172,11 +180,21 @@ class AsrEngine:
             text = ""
         else:
             # Hallucination guard: filter per-segment using AND + compression_ratio + blocklist
+            _en_block_lower = {x.lower() for x in _EN_HALLUCINATION_BLOCKLIST}
+
+            def _is_hallucination_seg(txt: str) -> bool:
+                cleaned = txt.strip().rstrip(".!؟،, ")
+                if cleaned in _AR_HALLUCINATION_BLOCKLIST:
+                    return True
+                if cleaned.lower() in _en_block_lower:
+                    return True
+                return False
+
             kept = [
                 s for s in seg_list
                 if not (getattr(s, "no_speech_prob", 0.0) > 0.6 and getattr(s, "avg_logprob", 0.0) < -1.0)
                 and getattr(s, "compression_ratio", 0.0) <= 2.4
-                and s.text.strip().rstrip(".!؟،, ") not in _AR_HALLUCINATION_BLOCKLIST
+                and not _is_hallucination_seg(s.text)
             ]
             dropped_count = len(seg_list) - len(kept)
             text = " ".join(s.text.strip() for s in kept if s.text).strip()
@@ -197,6 +215,25 @@ class AsrEngine:
             compute_type=self.compute_type,
             batch_size=effective_batch,
         )
+
+    def detect_language(self, samples: np.ndarray) -> tuple[str, float] | None:
+        """Detect dominant spoken language using Whisper's encoder."""
+        if not self.ready:
+            raise RuntimeError("ASR model not loaded")
+        if not hasattr(self._model, "detect_language"):
+            if not getattr(self, "_detect_language_warned", False):
+                log.warning("Whisper model does not support detect_language; skipping")
+                self._detect_language_warned = True
+            return None
+        try:
+            res = self._model.detect_language(samples)
+            if isinstance(res, tuple):
+                lang, prob = res[0], res[1]
+                return str(lang), float(prob)
+            return None
+        except Exception as exc:
+            log.warning("Language detection failed: %s", exc)
+            return None
 
     def info(self) -> dict[str, Any]:
         return {

@@ -183,8 +183,10 @@ def norm_hash(text: str) -> str:
 class _Slot:
     """Per-utterance buffer slot for Protocol v2 framed streaming."""
 
-    def __init__(self, utt_id: int) -> None:
+    def __init__(self, utt_id: int, source: str | None = None, target: str | None = None) -> None:
         self.utt_id = utt_id
+        self.source = source
+        self.target = target
         self.buffer = bytearray()
         self.seq_seen: set[int] = set()
         self.last_seq: int | None = None
@@ -221,6 +223,7 @@ class _StreamState:
         self.websocket = websocket
         self.source: str | None = None
         self.target: str | None = None
+        self.verify_lang_next: bool = True
         self.audio_format: str | None = None
         self.sample_rate: int = settings.sample_rate
         self.channels: int = 1
@@ -268,6 +271,8 @@ class _StreamState:
         return int(self.settings.max_utterance_seconds * self.sample_rate * 2 * self.channels)
 
     def apply(self, message: dict[str, Any]) -> None:
+        if "source" in message or "target" in message:
+            self.verify_lang_next = True
         if "source" in message:
             self.source = str(message["source"]) if message["source"] is not None else None
         if "target" in message:
@@ -307,6 +312,39 @@ class _StreamState:
                     self.stream = False
 
 
+async def _verify_pinned_language(
+    pipeline: Any,
+    state: _StreamState,
+    raw: bytes,
+    slot_source: str | None,
+) -> dict[str, Any]:
+    if not state.verify_lang_next:
+        return {}
+    if slot_source in (None, "auto"):
+        return {}
+    state.verify_lang_next = False
+    try:
+        decoded_tmp, _ = await pipeline._decode_checked(
+            raw,
+            declared_format=state.audio_format,
+            input_sample_rate=state.sample_rate,
+            channels=state.channels,
+        )
+        det = await asyncio.to_thread(pipeline.asr.detect_language, decoded_tmp.samples)
+        if det is not None and isinstance(det, tuple) and len(det) >= 2:
+            det_lang, det_prob = det[0], det[1]
+            out = {
+                "detected_lang": det_lang,
+                "detected_prob": round(float(det_prob), 4),
+            }
+            if det_prob >= 0.6 and det_lang != slot_source:
+                pipeline.metrics.incr("asr_pinned_lang_mismatch")
+            return out
+    except Exception as exc:
+        log.warning("Verification detect_language failed: %s", exc)
+    return {}
+
+
 async def _run_tentative(state: _StreamState, slot: _Slot, seq: int) -> None:
     slot_id = slot.utt_id
     started = time.perf_counter()
@@ -323,8 +361,8 @@ async def _run_tentative(state: _StreamState, slot: _Slot, seq: int) -> None:
             channels=state.channels,
         )
 
-        src = state.source or "auto"
-        dst = state.target or ""
+        src = slot.source or "auto"
+        dst = slot.target or ""
         pinned_src = None if src == "auto" else src
 
         asr_result, asr_timing = await pipeline._asr_sched.submit(
@@ -504,7 +542,7 @@ async def _run_partial(state: _StreamState, slot: _Slot, seq: int) -> None:
             input_sample_rate=state.sample_rate,
             channels=state.channels,
         )
-        src = state.source or "auto"
+        src = slot.source or "auto"
         pinned_src = None if src == "auto" else src
 
         asr_result, _ = await pipeline._asr_sched.submit(
@@ -545,7 +583,8 @@ async def _run_partial(state: _StreamState, slot: _Slot, seq: int) -> None:
         })
 
         # Closed-sentence pre-translation (priority 2)
-        if state.target and detected != state.target and len(stable_words) >= 2:
+        tgt = slot.target or state.target
+        if tgt and detected != tgt and len(stable_words) >= 2:
             split = split_sentences(stable_str, min_chars=10, max_sentences=4, enabled=True)
             candidate_sents = list(split.sentences)
             if len(candidate_sents) > 1:
@@ -555,7 +594,7 @@ async def _run_partial(state: _StreamState, slot: _Slot, seq: int) -> None:
                     if state.cache_get(h) is None:
                         try:
                             mt_res, _ = await pipeline._mt_sched.submit(
-                                (cs, detected, state.target),
+                                (cs, detected, tgt),
                                 priority=2,
                             )
                             state.cache_put(h, mt_res)
@@ -614,7 +653,7 @@ async def _commit_slot(state: _StreamState, slot: _Slot, seq: int) -> None:
         slot.tentative_task.cancel()
     raw = bytes(slot.buffer)
     if not state.utterance_queue.full():
-        await state.utterance_queue.put(("fresh", raw, utt_id, commit_time))
+        await state.utterance_queue.put(("fresh", raw, utt_id, commit_time, slot.source, slot.target))
     else:
         await state.send_json({"error": "overloaded", "retry_after_ms": 250, "detail": "utterance queue full", "utterance": utt_id})
 
@@ -788,6 +827,14 @@ async def _on_control_frame(state: _StreamState, control: dict[str, Any]) -> Non
             await state.send_json({"event": "aborted", "utt": utt_int, "freed_bytes": freed_bytes})
         return
 
+    applies_from_utt: int | None = None
+    if state.slots:
+        applies_from_utt = max(state.slots.keys()) + 1
+    elif state.committed_utts:
+        applies_from_utt = max(state.committed_utts) + 1
+    elif state.utterances > 0:
+        applies_from_utt = state.utterances + 1
+
     await state.send_json(
         {
             "event": "config",
@@ -797,6 +844,7 @@ async def _on_control_frame(state: _StreamState, control: dict[str, Any]) -> Non
             "sample_rate": state.sample_rate,
             "channels": state.channels,
             "protocol": state.protocol_version,
+            "applies_from_utt": applies_from_utt,
             "ignored_keys": sorted(unknown) or None,
         }
     )
@@ -849,7 +897,7 @@ async def _on_audio_frame(state: _StreamState, chunk: bytes) -> None:
                     await state.send_json({"event": "already_committed", "utt": utt_id})
                 return
 
-            slot = state.slots.setdefault(utt_id, _Slot(utt_id))
+            slot = state.slots.setdefault(utt_id, _Slot(utt_id, state.source, state.target))
 
             # PREROLL flag check (bit 0: 0x01)
             if flags & 0x01:
@@ -918,7 +966,7 @@ async def _on_audio_frame(state: _StreamState, chunk: bytes) -> None:
                 })
                 await _commit_slot(state, slot, seq)
 
-                next_slot = state.slots.setdefault(next_utt, _Slot(next_utt))
+                next_slot = state.slots.setdefault(next_utt, _Slot(next_utt, state.source, state.target))
                 if remainder:
                     next_slot.buffer.extend(remainder)
                 next_slot.last_seq = seq
@@ -1179,6 +1227,9 @@ async def _utterance_worker(state: _StreamState) -> None:
                 final_copy = dict(final_frame)
                 final_copy["tentative_hit"] = True
                 final_copy["time_saved_ms"] = round(tentative_pass_ms, 2)
+                if PIPELINE is not None:
+                    ver_fields = await _verify_pinned_language(PIPELINE, state, bytes(slot.buffer), slot.source)
+                    final_copy.update(ver_fields)
                 await state.send_json({**final_copy, "utterance": utt_id})
 
             elif isinstance(item, tuple) and len(item) == 5 and item[0] == "await_then_serve":
@@ -1202,14 +1253,21 @@ async def _utterance_worker(state: _StreamState) -> None:
                     final_copy = dict(final_frame)
                     final_copy["tentative_hit"] = True
                     final_copy["time_saved_ms"] = round(tentative_pass_ms, 2)
+                    if PIPELINE is not None:
+                        ver_fields = await _verify_pinned_language(PIPELINE, state, bytes(slot.buffer), slot.source)
+                        final_copy.update(ver_fields)
                     await state.send_json({**final_copy, "utterance": utt_id})
                 else:
                     raw = bytes(slot.buffer)
-                    await _handle_utterance_payload(state, raw, utt_id)
+                    await _handle_utterance_payload(state, raw, utt_id, source=slot.source, target=slot.target)
 
-            elif isinstance(item, tuple) and len(item) == 4 and item[0] == "fresh":
-                _, raw, utt_id, commit_time = item
-                await _handle_utterance_payload(state, raw, utt_id)
+            elif isinstance(item, tuple) and item[0] == "fresh":
+                if len(item) == 6:
+                    _, raw, utt_id, commit_time, slot_src, slot_dst = item
+                else:
+                    _, raw, utt_id, commit_time = item[:4]
+                    slot_src, slot_dst = None, None
+                await _handle_utterance_payload(state, raw, utt_id, source=slot_src, target=slot_dst)
 
             elif isinstance(item, tuple) and len(item) == 2:
                 raw, utt_id = item
@@ -1222,7 +1280,11 @@ async def _utterance_worker(state: _StreamState) -> None:
 
 
 async def _handle_utterance_payload(
-    state: _StreamState, raw: bytes, utt_id: int | None = None
+    state: _StreamState,
+    raw: bytes,
+    utt_id: int | None = None,
+    source: str | None = None,
+    target: str | None = None,
 ) -> None:
     state.utterances += 1
     utt_tag = utt_id if utt_id is not None else state.utterances
@@ -1230,14 +1292,17 @@ async def _handle_utterance_payload(
     assert PIPELINE is not None
 
     if state.stream:
-        await _stream_utterance(state, raw, utt_tag)
+        await _stream_utterance(state, raw, utt_tag, source=source, target=target)
         return
+
+    effective_src = source if source is not None else (state.source or "auto")
+    effective_dst = target if target is not None else state.target
 
     try:
         outcome = await PIPELINE.translate_audio(
             raw,
-            source=state.source or "auto",
-            target=state.target,
+            source=effective_src,
+            target=effective_dst,
             declared_format=state.audio_format,
             input_sample_rate=state.sample_rate,
             channels=state.channels,
@@ -1261,11 +1326,18 @@ async def _handle_utterance_payload(
         )
         return
 
-    await state.send_json({**outcome.to_json(), "utterance": utt_tag})
+    out_payload = outcome.to_json()
+    ver_fields = await _verify_pinned_language(PIPELINE, state, raw, effective_src)
+    out_payload.update(ver_fields)
+    await state.send_json({**out_payload, "utterance": utt_tag})
 
 
 async def _stream_utterance(
-    state: _StreamState, raw: bytes, utt_tag: int
+    state: _StreamState,
+    raw: bytes,
+    utt_tag: int,
+    source: str | None = None,
+    target: str | None = None,
 ) -> None:
     """Relay the pipeline's per-sentence frames to the client.
 
@@ -1282,16 +1354,21 @@ async def _stream_utterance(
     happened", and the client needs to act differently on each.
     """
     assert PIPELINE is not None
+    effective_src = source if source is not None else (state.source or "auto")
+    effective_dst = target if target is not None else (state.target or "")
     frames = 0
+    ver_fields = await _verify_pinned_language(PIPELINE, state, raw, effective_src)
     try:
         async for frame in PIPELINE.translate_audio_streaming(
             raw,
-            source=state.source or "auto",
-            target=state.target or "",
+            source=effective_src,
+            target=effective_dst,
             declared_format=state.audio_format,
             input_sample_rate=state.sample_rate,
             channels=state.channels,
         ):
+            if frame.get("type") == "final" and ver_fields:
+                frame = {**frame, **ver_fields}
             await state.send_json({**frame, "utterance": utt_tag})
             frames += 1
         return
