@@ -626,6 +626,32 @@ class TestPhase24SpeculativeFraming(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.metrics.counter("tentative_hit"), 1)
         self.assertEqual(self.metrics.counter("tentative_cancelled"), 0)
 
+    async def test_json_commit_no_seq_after_empty_frames_hits_tentative(self):
+        slot = self.state.slots.setdefault(23, _Slot(23))
+        slot.buffer.extend(b"\x01\x00" * 3200)
+        slot.last_seq = 10
+        slot.last_audio_seq = 10
+        slot.seq_seen.add(10)
+        slot.tentative_seq = 10
+        cached_sentence = {"type": "sentence", "index": 0, "is_last": True, "text": "Cached", "translated_text": "مخزن"}
+        cached_final = {"type": "final", "source_text": "Cached", "translated_text": "مخزن"}
+        slot.tentative_result = ([cached_sentence], cached_final, 45.0)
+
+        # Send empty audio frames 11..13 via _on_audio_frame
+        for s in (11, 12, 13):
+            await _on_audio_frame(self.state, pack_v2(0, 23, s, b""))
+
+        self.assertEqual(slot.last_seq, 13)
+        self.assertEqual(slot.last_audio_seq, 10)
+
+        # JSON commit with no seq
+        await _on_control_frame(self.state, {"action": "commit", "utt": 23})
+
+        self.assertEqual(self.metrics.counter("tentative_hit"), 1)
+        self.assertEqual(self.metrics.counter("tentative_cancelled"), 0)
+        self.assertEqual(self.metrics.counter("tentative_miss"), 0)
+        self.assertTrue(slot.committed)
+
     async def test_schema_translated_text_never_in_non_delivery_frames(self):
         # Set up real Pipeline with fake engines
         pipe_settings = Settings(
