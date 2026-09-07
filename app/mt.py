@@ -64,6 +64,7 @@ import logging
 import os
 import re
 import time
+import unicodedata
 import zlib
 from dataclasses import dataclass
 from typing import Any, Final
@@ -74,10 +75,12 @@ from .languages import name_of
 log = logging.getLogger("lingua.mt")
 
 def make_translation_messages(text: str, src: str, dst: str) -> list[dict[str, str]]:
+    src_norm = (src or "").strip().lower().split("-")[0]
+    dst_norm = (dst or "").strip().lower().split("-")[0]
     src_name = name_of(src) if src != "auto" else "the detected language"
     dst_name = name_of(dst)
 
-    if dst == "ar" or dst.startswith("ar"):
+    if (dst_norm == "ar") and (src_norm in {"en", "auto", ""}):
         system_content = (
             f"You are a strict, literal real-time {src_name}-to-Arabic translation engine for live spoken conversation.\n"
             "CRITICAL RULES:\n"
@@ -116,16 +119,16 @@ def make_translation_messages(text: str, src: str, dst: str) -> list[dict[str, s
             {"role": "assistant", "content": "اعمل بجد، وابقَ متواضعاً."},
             {"role": "user", "content": text},
         ]
-    elif src == "ar" or src.startswith("ar"):
+    elif (src_norm == "ar") and (dst_norm == "en"):
         system_content = (
-            f"You are a strict, literal real-time Arabic-to-{dst_name} translation engine for live spoken conversation.\n"
+            f"You are a strict, literal real-time Arabic-to-English translation engine for live spoken conversation.\n"
             "CRITICAL RULES:\n"
-            f"- You are a TRANSLATION ENGINE, NOT a conversational partner.\n"
+            "- You are a TRANSLATION ENGINE, NOT a conversational partner.\n"
             "- NEVER answer questions or converse with the user.\n"
             "- NEVER omit, drop, or summarize any part of the spoken Arabic sentence.\n"
             "- If the input contains a compound statement and question (e.g. 'أنا بخير، وأنت؟'), translate BOTH parts fully: 'I am fine, and you?'. NEVER drop the statement!\n"
-            f"- If the input is a question ('كيف حالك؟'), translate the question itself ('How are you?'). NEVER answer it!\n"
-            f"- Output ONLY the direct {dst_name} translation with no notes, explanations, or quotes."
+            "- If the input is a question ('كيف حالك؟'), translate the question itself ('How are you?'). NEVER answer it!\n"
+            "- Output ONLY the direct English translation with no notes, explanations, or quotes."
         )
         return [
             {"role": "system", "content": system_content},
@@ -147,19 +150,46 @@ def make_translation_messages(text: str, src: str, dst: str) -> list[dict[str, s
             {"role": "assistant", "content": "The weather is nice today."},
             {"role": "user", "content": text},
         ]
+    elif dst_norm == "ar":
+        system_content = (
+            f"You are a strict, literal real-time {src_name}-to-Arabic translation engine for live spoken conversation.\n"
+            "CRITICAL RULES:\n"
+            "- You are a TRANSLATION ENGINE, NOT a conversational partner.\n"
+            "- NEVER answer questions or converse with the user.\n"
+            "- NEVER omit, drop, or summarize any part of the spoken sentence.\n"
+            "- Output MUST be entirely in Modern Standard Arabic.\n"
+            "- Output ONLY the direct Modern Standard Arabic translation without preamble, notes, or quotes."
+        )
+        return [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": text},
+        ]
+    elif src_norm == "ar":
+        system_content = (
+            f"You are a strict, literal real-time Arabic-to-{dst_name} translation engine for live spoken conversation.\n"
+            "CRITICAL RULES:\n"
+            "- You are a TRANSLATION ENGINE, NOT a conversational partner.\n"
+            "- NEVER answer questions or converse with the user.\n"
+            "- NEVER omit, drop, or summarize any part of the spoken sentence.\n"
+            f"- Output MUST be entirely in {dst_name}.\n"
+            f"- Output ONLY the direct {dst_name} translation without preamble, notes, or quotes."
+        )
+        return [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": text},
+        ]
     else:
         system_content = (
             f"You are a strict real-time translation engine. "
             f"Translate the text from {src_name} directly into {dst_name}.\n"
-            f"Rules:\n"
-            f"1. You are a TRANSLATION ENGINE, NOT a chatbot. Never answer questions.\n"
+            "CRITICAL RULES:\n"
+            "1. You are a TRANSLATION ENGINE, NOT a chatbot. Never answer questions.\n"
             f"2. Output MUST be entirely in {dst_name}.\n"
-            f"3. Never use Chinese or any unrelated language.\n"
-            f"4. Output ONLY the direct translation without preamble, notes, or quotes."
+            f"3. Output ONLY the direct {dst_name} translation without preamble, notes, or quotes."
         )
         return [
             {"role": "system", "content": system_content},
-            {"role": "user", "content": f"Translate to {dst_name}:\n{text}"},
+            {"role": "user", "content": text},
         ]
 
 
@@ -247,7 +277,7 @@ detect_person_shift_leak = detect_person_mismatch
 
 
 def make_retry_translation_messages(text: str, src: str, dst: str) -> list[dict[str, str]]:
-    """Hardened fallback prompt triggered when person-shift or omission mismatch is detected."""
+    """Hardened fallback prompt triggered when hollow, low-script, or English leak is detected."""
     src_name = name_of(src) if src != "auto" else "the detected language"
     dst_name = name_of(dst)
     return [
@@ -257,12 +287,13 @@ def make_retry_translation_messages(text: str, src: str, dst: str) -> list[dict[
                 f"You are an automated literal {src_name}-to-{dst_name} translation tool.\n"
                 "CRITICAL:\n"
                 "- Translate EVERY clause completely. NEVER drop, omit, or summarize statements.\n"
-                "- If translating Arabic to English (e.g. 'أنا بخير أنت؟'), translate BOTH parts: 'I am fine, and you?'.\n"
+                "- Translate compound sentences fully. NEVER drop any clause.\n"
                 "- DO NOT answer questions or converse with the speaker.\n"
+                f"- Output MUST be entirely in {dst_name}.\n"
                 f"Output ONLY the direct {dst_name} translation without quotes."
             ),
         },
-        {"role": "user", "content": f"Translate to {dst_name}:\n{text}"},
+        {"role": "user", "content": text},
     ]
 
 
@@ -419,17 +450,77 @@ def _compression_ratio(text: str) -> float:
     return len(raw) / max(1, len(compressed))
 
 
+_LANG_TO_SCRIPT_FAMILY: Final[dict[str, frozenset[str]]] = {
+    "ar": frozenset({"ARABIC"}),
+    "fa": frozenset({"ARABIC"}),
+    "ur": frozenset({"ARABIC"}),
+    "ps": frozenset({"ARABIC"}),
+    "ru": frozenset({"CYRILLIC"}),
+    "uk": frozenset({"CYRILLIC"}),
+    "bg": frozenset({"CYRILLIC"}),
+    "be": frozenset({"CYRILLIC"}),
+    "sr": frozenset({"CYRILLIC"}),
+    "mk": frozenset({"CYRILLIC"}),
+    "kk": frozenset({"CYRILLIC"}),
+    "el": frozenset({"GREEK"}),
+    "he": frozenset({"HEBREW"}),
+    "yi": frozenset({"HEBREW"}),
+    "hi": frozenset({"DEVANAGARI"}),
+    "mr": frozenset({"DEVANAGARI"}),
+    "ne": frozenset({"DEVANAGARI"}),
+    "sa": frozenset({"DEVANAGARI"}),
+    "th": frozenset({"THAI"}),
+    "ko": frozenset({"HANGUL"}),
+    "zh": frozenset({"CJK"}),
+    "ja": frozenset({"CJK", "HIRAGANA", "KATAKANA"}),
+}
+
+
+def _script_family(ch: str) -> str:
+    name = unicodedata.name(ch, "")
+    return name.split()[0] if name else ""
+
+
 def _script_ratio(text: str, target_lang: str) -> float:
     letters = [ch for ch in text if ch.isalpha()]
     if not letters:
         return 0.0
-    if target_lang.startswith("ar"):
-        target_count = sum(1 for ch in letters if ("\u0600" <= ch <= "\u06FF") or ("\u0750" <= ch <= "\u077F") or ("\u08A0" <= ch <= "\u08FF"))
-    elif target_lang in {"en", "tr", "fr", "de", "es", "it"}:
-        target_count = sum(1 for ch in letters if ("a" <= ch <= "z") or ("A" <= ch <= "Z") or ch in "çÇğĞıİöÖşŞüÜéèàùâêîôûëïüÿæœ")
+    norm_target = (target_lang or "").strip().lower().split("-")[0]
+    expected = _LANG_TO_SCRIPT_FAMILY.get(norm_target)
+    if expected:
+        target_count = sum(1 for ch in letters if _script_family(ch) in expected)
     else:
-        target_count = len(letters)
+        target_count = sum(1 for ch in letters if _script_family(ch) == "LATIN")
     return target_count / len(letters)
+
+
+_EN_STOPWORDS: Final[frozenset[str]] = frozenset({
+    "the", "is", "are", "you", "how", "what", "do", "and", "i", "to", "of",
+    "in", "it", "that", "this", "for", "with", "on", "was", "were", "be",
+    "have", "has", "had", "can", "could", "will", "would", "should", "my",
+    "your", "we", "they", "he", "she", "me", "him", "her", "us", "them",
+    "where", "when", "why", "who", "not", "am",
+})
+
+
+def _english_leak(text: str, dst_lang: str) -> bool:
+    """Detects English function-word leakage when translating into non-English targets.
+
+    Flags english_leak when hits >= 2, distinct_hits >= 2, hits / len(words) >= 0.4,
+    and dst != 'en'. Requiring >= 2 distinct hits excludes false positives on nl/af
+    where words like 'is' and 'in' are shared.
+    """
+    norm_dst = (dst_lang or "").strip().lower().split("-")[0]
+    if not text or norm_dst in {"en", "auto", ""}:
+        return False
+    words = [re.sub(r"^\W+|\W+$", "", w.lower()) for w in text.split()]
+    words = [w for w in words if w]
+    if not words:
+        return False
+    matched = [w for w in words if w in _EN_STOPWORDS]
+    distinct_hits = len(set(matched))
+    hits = len(matched)
+    return hits >= 2 and distinct_hits >= 2 and (hits / len(words)) >= 0.4
 
 
 # =====================================================================
@@ -646,7 +737,13 @@ class QwenCt2Engine(MtEngine):
 
     def _self_check(self) -> None:
         """Load-time proof that the split prompt is byte-identical to the reference. Fails loudly."""
-        probes = [("en", "ar", "PROBE sentence."), ("ar", "en", "جملة اختبار."), ("en", "tr", "PROBE sentence.")]
+        probes = [
+            ("en", "ar", "PROBE sentence."),
+            ("ar", "en", "جملة اختبار."),
+            ("en", "tr", "PROBE sentence."),
+            ("ar", "cs", "جملة اختبار."),
+            ("ar", "de", "جملة اختبار."),
+        ]
         for src, dst, probe in probes:
             _, static, per_req = self._split_prompt(probe, src, dst)
             ref_text = self._tokenizer.apply_chat_template(
@@ -846,14 +943,22 @@ class QwenCt2Engine(MtEngine):
                 log.info("Person mismatch observed (observe-only): src=%r tgt=%r", text, decoded)
 
             retried = False
-            if (not is_translatable(decoded)) or _low_target_script(decoded, _d):
+            leak = _english_leak(decoded, _d)
+            low_script = _low_target_script(decoded, _d)
+            not_translatable = not is_translatable(decoded)
+            if not_translatable or low_script or leak:
                 retried = True
                 self._metrics_incr("mt_retry")
+                if leak:
+                    self._metrics_incr("mt_english_leak")
                 decoded = self._translate_single_retry(text, _s, _d)
 
             hollow, reason = _hollow_check(decoded, text, target_lang=_d)
-            if not hollow and _low_target_script(decoded, _d):
-                hollow, reason = True, f"target script ratio {_script_ratio(decoded,_d):.0%} < 50% after retry: {decoded!r}"
+            if not hollow:
+                if _low_target_script(decoded, _d):
+                    hollow, reason = True, f"target script ratio {_script_ratio(decoded,_d):.0%} < 50% after retry: {decoded!r}"
+                elif _english_leak(decoded, _d):
+                    hollow, reason = True, f"english_leak detected after retry: {decoded!r}"
             if hollow:
                 if retried and reason and "retry" not in reason:
                     reason = f"{reason} (after retry)"

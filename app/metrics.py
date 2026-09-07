@@ -126,6 +126,7 @@ class Metrics:
             "presplit_miss": 0,
             "aborted": 0,
             "mt_retry": 0,
+            "mt_english_leak": 0,
             "asr_pinned_lang_mismatch": 0,
         }
         self._started_at = time.time()

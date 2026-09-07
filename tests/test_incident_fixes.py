@@ -27,8 +27,10 @@ from app.config import Settings
 from app.metrics import Metrics
 from app.mt import (
     _LOW_SCRIPT_RATIO,
+    _english_leak,
     _hollow_check,
     _low_target_script,
+    make_translation_messages,
     QwenCt2Engine,
 )
 import app.server
@@ -138,6 +140,96 @@ class TestIncidentFixes(unittest.TestCase):
         self.assertEqual(res.text, "", "Hollow translation must be blanked to avoid handing punctuation to TTS")
         self.assertIsNotNone(res.hollow_reason)
         self.assertIn("retry", res.hollow_reason.lower(), "Hollow reason must mention retry")
+
+    # ---- T8: _english_leak detector ----------------------------------------
+    def test_t8_english_leak_detector(self):
+        self.assertTrue(_english_leak("How are you?", "cs"), "'How are you?' must be detected as English leak into Czech")
+        self.assertFalse(_english_leak("Jak se máš?", "cs"), "'Jak se máš?' is native Czech and must not be flagged")
+        self.assertFalse(_english_leak("Wie geht es dir?", "de"), "'Wie geht es dir?' is native German and must not be flagged")
+        self.assertFalse(_english_leak("How are you?", "en"), "English target must never be flagged as English leak")
+        self.assertTrue(_english_leak("Hello, how are you?", "de"), "English phrase into German must be flagged as English leak")
+
+    # ---- T9: Mocked generator english_leak retry recovery ------------------
+    def test_t9_mocked_generator_english_leak_retry_recovery(self):
+        settings = Settings()
+        engine = QwenCt2Engine(settings)
+        engine._tokenizer = self.tokenizer
+        engine.metrics = Metrics()
+
+        # Call 1 emits 'How are you?' (leak), Call 2 (retry) emits 'Jak se máš?'
+        tok_leak = engine._tokenizer.encode("How are you?")
+        tok_czech = engine._tokenizer.encode("Jak se máš?")
+        mock_out1 = SimpleNamespace(sequences_ids=[tok_leak], sequences=[engine._tokenizer.tokenize("How are you?")])
+        mock_out2 = SimpleNamespace(sequences_ids=[tok_czech], sequences=[engine._tokenizer.tokenize("Jak se máš?")])
+
+        call_count = 0
+
+        def fake_generate_batch(batch, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return [mock_out1]
+            return [mock_out2]
+
+        engine._generator = MagicMock()
+        engine._generator.generate_batch.side_effect = fake_generate_batch
+
+        results = engine.translate_batch([("كيف حالك", "ar", "cs")])
+        self.assertEqual(len(results), 1)
+        res = results[0]
+        self.assertEqual(call_count, 2, "Generator must be called twice (initial + retry)")
+        self.assertTrue(res.retried, "Result must be marked as retried")
+        self.assertEqual(res.text, "Jak se máš?", "Decoded text must be the recovered Czech output")
+        self.assertFalse(res.hollow, "Recovered translation must not be hollow")
+        self.assertEqual(engine.metrics.counter("mt_english_leak"), 1, "mt_english_leak counter must be incremented")
+        self.assertEqual(engine.metrics.counter("mt_retry"), 1, "mt_retry counter must be incremented")
+
+    # ---- T10: Mocked generator english_leak exhausted hollow ---------------
+    def test_t10_mocked_generator_english_leak_exhausted_hollow(self):
+        settings = Settings()
+        engine = QwenCt2Engine(settings)
+        engine._tokenizer = self.tokenizer
+        engine.metrics = Metrics()
+
+        # Both initial call and retry emit 'How are you?'
+        tok_leak = engine._tokenizer.encode("How are you?")
+        mock_out = SimpleNamespace(sequences_ids=[tok_leak], sequences=[engine._tokenizer.tokenize("How are you?")])
+
+        engine._generator = MagicMock()
+        engine._generator.generate_batch.return_value = [mock_out]
+
+        results = engine.translate_batch([("كيف حالك", "ar", "cs")])
+        self.assertEqual(len(results), 1)
+        res = results[0]
+        self.assertTrue(res.retried, "Result must be marked as retried")
+        self.assertTrue(res.hollow, "Exhausted leak must be marked hollow")
+        self.assertEqual(res.text, "", "Hollow text must be blanked out for TTS suppression")
+        self.assertIsNotNone(res.hollow_reason)
+        self.assertIn("english_leak", res.hollow_reason, "Hollow reason must explicitly cite english_leak")
+
+    # ---- T11: Multilingual prompt isolation & bare user turn ---------------
+    def test_t11_multilingual_prompt_isolation(self):
+        # ar -> cs must be zero-shot with bare user turn
+        msgs_cs = make_translation_messages("كيف حالك", "ar", "cs")
+        self.assertEqual(len(msgs_cs), 2, "ar -> cs must have exactly 2 turns (zero-shot)")
+        self.assertEqual(msgs_cs[1]["content"], "كيف حالك", "User turn must be bare text")
+        self.assertNotIn("Where is the train station?", msgs_cs[0]["content"])
+
+        # ar -> de must be zero-shot with bare user turn
+        msgs_de = make_translation_messages("مرحبا", "ar", "de")
+        self.assertEqual(len(msgs_de), 2, "ar -> de must have exactly 2 turns (zero-shot)")
+        self.assertEqual(msgs_de[1]["content"], "مرحبا")
+
+        # fr -> ar must be zero-shot with bare user turn
+        msgs_fr_ar = make_translation_messages("Bonjour", "fr", "ar")
+        self.assertEqual(len(msgs_fr_ar), 2, "fr -> ar must have exactly 2 turns (zero-shot)")
+        self.assertEqual(msgs_fr_ar[1]["content"], "Bonjour")
+
+        # en -> ar and ar -> en must retain hardened few-shot prompts
+        msgs_en_ar = make_translation_messages("Where is the train station?", "en", "ar")
+        self.assertGreater(len(msgs_en_ar), 2, "en -> ar must retain few-shot examples")
+        msgs_ar_en = make_translation_messages("أين محطة القطار؟", "ar", "en")
+        self.assertGreater(len(msgs_ar_en), 2, "ar -> en must retain few-shot examples")
 
 
 class TestIncidentFixesAsync(unittest.IsolatedAsyncioTestCase):
