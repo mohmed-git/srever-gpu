@@ -188,6 +188,7 @@ class _Slot:
         self.buffer = bytearray()
         self.seq_seen: set[int] = set()
         self.last_seq: int | None = None
+        self.last_audio_seq: int | None = None
         self.saw_preroll: bool = False
         self.closed: bool = False
         self.committed: bool = False
@@ -649,7 +650,7 @@ async def _on_control_frame(state: _StreamState, control: dict[str, Any]) -> Non
                         "utterance": slot_id,
                     })
                     return
-                c_seq = int(seq_val) if seq_val is not None else target_slot.last_seq
+                c_seq = int(seq_val) if seq_val is not None else (target_slot.last_audio_seq if target_slot.last_audio_seq is not None else target_slot.last_seq)
                 await _commit_slot(state, target_slot, c_seq)
                 return
 
@@ -860,12 +861,15 @@ async def _on_audio_frame(state: _StreamState, chunk: bytes) -> None:
 
             # Sequence check and modulo 2^16 wrap arithmetic (I1 / I10)
             if seq in slot.seq_seen:
-                # Duplicate frame: drop
-                return
+                if flags & 0x02 and seq == slot.last_seq:
+                    pass  # fall through to commit (idempotent) instead of dropping
+                else:
+                    # Duplicate frame: drop
+                    return
 
             if slot.last_seq is not None:
                 diff = (seq - slot.last_seq) & 0xFFFF
-                if diff != 1:
+                if diff != 1 and not (flags & 0x02 and seq == slot.last_seq):
                     if pipeline is not None:
                         pipeline.metrics.incr("seq_gap")
                     log.warning("slot %d seq gap: expected %d, got %d (diff=%d)", utt_id, (slot.last_seq + 1) & 0xFFFF, seq, diff)
@@ -873,11 +877,13 @@ async def _on_audio_frame(state: _StreamState, chunk: bytes) -> None:
             # Note: slot.last_seq = seq is updated before the discard check uses slot.tentative_seq.
             # Order is fine; seq_mismatch in the tentative handler depends on slot.last_seq
             # recording the most recently processed audio frame before comparing with tentative_seq.
+            if len(payload) > 0:
+                slot.last_audio_seq = seq
             slot.last_seq = seq
             slot.seq_seen.add(seq)
 
             # B.2 Discard: If tentative running or cached result present and seq > tentative_seq
-            if (slot.tentative_task is not None and not slot.tentative_task.done()) or slot.tentative_result is not None:
+            if len(payload) > 0 and ((slot.tentative_task is not None and not slot.tentative_task.done()) or slot.tentative_result is not None):
                 if slot.tentative_seq != -1 and seq != slot.tentative_seq and ((seq - slot.tentative_seq) & 0xFFFF) < 32768:
                     if slot.tentative_task is not None and not slot.tentative_task.done():
                         slot.tentative_task.cancel()
@@ -935,7 +941,8 @@ async def _on_audio_frame(state: _StreamState, chunk: bytes) -> None:
 
             # Check flags: bit 1 is LAST (commit)
             if flags & 0x02:
-                await _commit_slot(state, slot, seq)
+                commit_seq = slot.last_audio_seq if not payload and slot.last_audio_seq is not None else seq
+                await _commit_slot(state, slot, commit_seq)
                 return
 
         except Exception as exc:

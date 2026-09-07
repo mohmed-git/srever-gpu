@@ -569,6 +569,63 @@ class TestPhase24SpeculativeFraming(unittest.IsolatedAsyncioTestCase):
         await _on_audio_frame(self.state, pack_v2(0x02, 6, 5, b"\x01\x00" * 160))
         self.assertEqual(self.ws.sent_json[-1], {"event": "already_committed", "utt": 6})
 
+    async def test_binary_last_empty_payload_hits_cached_tentative(self):
+        slot = self.state.slots.setdefault(20, _Slot(20))
+        slot.buffer.extend(b"\x01\x00" * 3200)
+        slot.last_seq = 10
+        slot.last_audio_seq = 10
+        slot.seq_seen.add(10)
+        slot.tentative_seq = 10
+        cached_sentence = {"type": "sentence", "index": 0, "is_last": True, "text": "Cached", "translated_text": "مخزن"}
+        cached_final = {"type": "final", "source_text": "Cached", "translated_text": "مخزن"}
+        slot.tentative_result = ([cached_sentence], cached_final, 45.0)
+
+        # Send binary LAST frame with seq=11, empty payload
+        await _on_audio_frame(self.state, pack_v2(0x02, 20, 11, b""))
+
+        self.assertEqual(self.metrics.counter("tentative_hit"), 1)
+        self.assertEqual(self.metrics.counter("tentative_cancelled"), 0)
+        self.assertEqual(self.metrics.counter("tentative_miss"), 0)
+        self.assertTrue(slot.committed)
+
+    async def test_binary_last_with_audio_payload_misses_cached_tentative(self):
+        slot = self.state.slots.setdefault(21, _Slot(21))
+        slot.buffer.extend(b"\x01\x00" * 3200)
+        slot.last_seq = 10
+        slot.last_audio_seq = 10
+        slot.seq_seen.add(10)
+        slot.tentative_seq = 10
+        cached_sentence = {"type": "sentence", "index": 0, "is_last": True, "text": "Cached", "translated_text": "مخزن"}
+        cached_final = {"type": "final", "source_text": "Cached", "translated_text": "مخزن"}
+        slot.tentative_result = ([cached_sentence], cached_final, 45.0)
+
+        # Send binary LAST frame with seq=11, 20ms audio payload (320 samples @ 16kHz = 640 bytes)
+        await _on_audio_frame(self.state, pack_v2(0x02, 21, 11, b"\x01\x00" * 320))
+
+        self.assertEqual(self.metrics.counter("tentative_miss"), 1)
+        self.assertEqual(self.metrics.counter("tentative_hit"), 0)
+        self.assertEqual(self.metrics.counter("tentative_cancelled"), 1)
+        self.assertTrue(slot.committed)
+
+    async def test_binary_last_reusing_last_audio_seq_commits_not_stalled(self):
+        slot = self.state.slots.setdefault(22, _Slot(22))
+        slot.buffer.extend(b"\x01\x00" * 3200)
+        slot.last_seq = 10
+        slot.last_audio_seq = 10
+        slot.seq_seen.add(10)
+        slot.tentative_seq = 10
+        cached_sentence = {"type": "sentence", "index": 0, "is_last": True, "text": "Cached", "translated_text": "مخزن"}
+        cached_final = {"type": "final", "source_text": "Cached", "translated_text": "مخزن"}
+        slot.tentative_result = ([cached_sentence], cached_final, 45.0)
+
+        # Send binary LAST frame with seq=10 (reusing last_seq), empty payload
+        await _on_audio_frame(self.state, pack_v2(0x02, 22, 10, b""))
+
+        self.assertTrue(slot.committed)
+        self.assertIn(22, self.state.committed_utts)
+        self.assertEqual(self.metrics.counter("tentative_hit"), 1)
+        self.assertEqual(self.metrics.counter("tentative_cancelled"), 0)
+
     async def test_schema_translated_text_never_in_non_delivery_frames(self):
         # Set up real Pipeline with fake engines
         pipe_settings = Settings(
