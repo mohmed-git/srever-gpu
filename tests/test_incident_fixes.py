@@ -22,14 +22,18 @@ from unittest.mock import MagicMock
 import numpy as np
 from transformers import AutoTokenizer
 
+from collections import deque
+
 from app.asr import AsrEngine, AsrResult, _EN_HALLUCINATION_BLOCKLIST
 from app.config import Settings
+from app.languages import AR_VARIANTS, catalogue, normalise_variant
 from app.metrics import Metrics
 from app.mt import (
     _LOW_SCRIPT_RATIO,
     _english_leak,
     _hollow_check,
     _low_target_script,
+    _script_ratio,
     make_translation_messages,
     QwenCt2Engine,
 )
@@ -41,6 +45,7 @@ from app.server import (
     _on_audio_frame,
     _on_control_frame,
     _stream_utterance,
+    is_echo_match,
 )
 
 
@@ -231,6 +236,69 @@ class TestIncidentFixes(unittest.TestCase):
         msgs_ar_en = make_translation_messages("أين محطة القطار؟", "ar", "en")
         self.assertGreater(len(msgs_ar_en), 2, "ar -> en must retain few-shot examples")
 
+    # ---- T12: Script ratio families and cross-script verification ----------
+    def test_t12_script_ratio_families(self):
+        # cs is Latin script (unlisted in _LANG_TO_SCRIPT_FAMILY, falls back to LATIN)
+        self.assertEqual(_script_ratio("Hello", "cs"), 1.0, "Latin text into Czech must have ratio 1.0")
+        self.assertEqual(_script_ratio("مرحبا", "cs"), 0.0, "Arabic text into Czech must have ratio 0.0")
+        # ru is Cyrillic script
+        self.assertEqual(_script_ratio("Hello", "ru"), 0.0, "Latin text into Russian must have ratio 0.0")
+        self.assertEqual(_script_ratio("Привет", "ru"), 1.0, "Cyrillic text into Russian must have ratio 1.0")
+        # ja has Japanese ideographs / kana
+        self.assertEqual(_script_ratio("こんにちは", "ja"), 1.0, "Japanese text into Japanese must have ratio 1.0")
+        # fa is Arabic/Persian script
+        self.assertEqual(_script_ratio("Hello", "fa"), 0.0, "Latin text into Persian must have ratio 0.0")
+        self.assertEqual(_script_ratio("سلام", "fa"), 1.0, "Persian text into Persian must have ratio 1.0")
+        # _low_target_script check
+        self.assertTrue(_low_target_script("Hello", "ru"), "Latin text into Russian must trigger low target script")
+        self.assertFalse(_low_target_script("Привет", "ru"), "Native Russian must not trigger low target script")
+
+    # ---- Dutch / Afrikaans / Frisian stopword exclusion --------------------
+    def test_dutch_afrikaans_stopword_exclusion(self):
+        # Shared Germanic stopwords like 'is', 'in' in Dutch, Afrikaans, Frisian must not trigger false leak
+        self.assertFalse(_english_leak("Dit is in de winkel", "nl"), "'Dit is in de winkel' in Dutch must not flag as English leak")
+        self.assertFalse(_english_leak("Dit is in de winkel", "af"), "'Dit is in de winkel' in Afrikaans must not flag as English leak")
+        self.assertFalse(_english_leak("Dit is in de winkel", "fy"), "'Dit is in de winkel' in Frisian must not flag as English leak")
+        # Genuine English sentence into Dutch must still be flagged
+        self.assertTrue(_english_leak("This is in the shop", "nl"), "English sentence into Dutch must be flagged as leak")
+
+    # ---- Dialect variants in catalogue and prompt messages -----------------
+    def test_dialect_messages_and_catalogue(self):
+        cat = catalogue()
+        ar_entry = next((e for e in cat if e["code"] == "ar"), None)
+        self.assertIsNotNone(ar_entry, "'ar' must be present in catalogue")
+        self.assertIn("variants", ar_entry, "'ar' entry must have variants attribute")
+        self.assertEqual(ar_entry["variants"], AR_VARIANTS)
+
+        # Variant normalisation
+        self.assertEqual(normalise_variant("eg"), "EG")
+        self.assertEqual(normalise_variant("SA"), "SA")
+        self.assertIsNone(normalise_variant("invalid_code"), "Unknown variant must normalise to None")
+
+        # Source variant hint injection
+        msgs_eg = make_translation_messages("إزيك عامل إيه", "ar", "en", source_variant="EG")
+        self.assertIn("The speaker uses Egyptian colloquial Arabic; interpret idioms accordingly.", msgs_eg[0]["content"])
+
+        # Context prefix for S9 split-repair
+        msgs_context = make_translation_messages("عن الذهاب للبيت", "ar", "en", context_prefix="كنت أفكر")
+        self.assertIn("[Context from preceding speech: كنت أفكر]\n\nعن الذهاب للبيت", msgs_context[-1]["content"])
+
+    # ---- S8: is_echo_match unit tests --------------------------------------
+    def test_s8_is_echo_match_unit(self):
+        # Exact match
+        self.assertTrue(is_echo_match("Hello world", deque(["Hello world"])))
+        # Case & punctuation normalisation
+        self.assertTrue(is_echo_match("hello, world!", deque(["Hello World"])))
+        # High token Jaccard >= 0.6
+        self.assertTrue(is_echo_match("I would really love that", deque(["I really love that"])))
+        # Difflib ratio >= 0.75
+        self.assertTrue(is_echo_match("the weather is sunny today", deque(["the weather is very sunny today"])))
+        # Non-matching user turn (barge-in candidate)
+        self.assertFalse(is_echo_match("Can I get a coffee please?", deque(["The train arrives at nine"])))
+        # Empty inputs
+        self.assertFalse(is_echo_match("", deque(["Test"])))
+        self.assertFalse(is_echo_match("Test", deque()))
+
 
 class TestIncidentFixesAsync(unittest.IsolatedAsyncioTestCase):
     # ---- T5: Per-slot language snapshot and config applies_from_utt ---------
@@ -313,7 +381,7 @@ class TestIncidentFixesAsync(unittest.IsolatedAsyncioTestCase):
             # Process queued utterance via worker
             item = await state.utterance_queue.get()
             self.assertEqual(item[0], "fresh")
-            _, raw, utt_id, commit_time, slot_src, slot_dst = item
+            _, raw, utt_id, commit_time, slot_src, slot_dst = item[:6]
             self.assertEqual(slot_src, "en")
             self.assertEqual(slot_dst, "ar")
 
@@ -409,6 +477,281 @@ class TestIncidentFixesAsync(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res.text, "", "Result text must be empty when all segments are dropped")
         self.assertTrue(res.hollow, "Result must be marked hollow")
         self.assertIn("hallucination guard", res.hollow_reason)
+
+    # ---- T13: S8 Echo filter drops playback reflection ---------------------
+    async def test_t13_s8_echo_dropped_during_playback(self):
+        settings = Settings(sample_rate=16000, max_utterance_seconds=2.0)
+        ws = DummyWebSocket()
+        state = _StreamState(settings, ws)
+        state.protocol_version = 2
+        state.source = "en"
+        state.target = "fr"
+        # Seed recent TTS output
+        state.recent_tts_outputs.append("Bonjour tout le monde")
+
+        metrics = Metrics()
+        mt_called = []
+
+        class MockPipeline:
+            def __init__(self):
+                self.metrics = metrics
+                self.ready = True
+                self.settings = settings
+                self.asr = MagicMock()
+
+            async def _decode_checked(self, raw, **kwargs):
+                return SimpleNamespace(samples=np.zeros(1600, dtype=np.float32), duration_s=0.1, source_format="pcm_s16le"), 1.0
+
+            async def translate_audio_streaming(self, raw, source, target, is_echo=None, **kwargs):
+                asr_text = "Bonjour tout le monde"
+                if is_echo is not None and is_echo(asr_text):
+                    self.metrics.incr("echo_dropped")
+                    yield {
+                        "type": "dropped",
+                        "reason": "echo",
+                        "original_text": asr_text,
+                        "asr_ms": 15.0,
+                    }
+                    return
+                mt_called.append(asr_text)
+                yield {
+                    "type": "final",
+                    "original_text": asr_text,
+                    "translated_text": "Hello world",
+                    "source_lang": source,
+                    "target_lang": target,
+                    "asr_ms": 15.0,
+                    "mt_ms": 10.0,
+                    "total_server_ms": 25.0,
+                }
+
+        pipeline = MockPipeline()
+        app.server.PIPELINE = pipeline
+
+        try:
+            # Send framed audio with bit 2 set (DURING_PLAYBACK = 0x04)
+            await _on_audio_frame(state, pack_v2(flags=0x04, utt=1, seq=0, payload=b"\x00\x00" * 160))
+            await _on_audio_frame(state, pack_v2(flags=0x06, utt=1, seq=1, payload=b"\x00\x00" * 160))
+
+            item = await state.utterance_queue.get()
+            self.assertEqual(item[0], "fresh")
+            _, raw, utt_id, commit_time, slot_src, slot_dst, slot_src_var, slot_tgt_var, during_ratio, context_prefix = item
+            self.assertGreaterEqual(during_ratio, 0.5, "during_ratio must be >= 0.5 when all frames have bit 2 set")
+
+            from app.server import _handle_utterance_payload
+            await _handle_utterance_payload(
+                state,
+                raw,
+                utt_id,
+                source=slot_src,
+                target=slot_dst,
+                source_variant=slot_src_var,
+                target_variant=slot_tgt_var,
+                during_ratio=during_ratio,
+                context_prefix=context_prefix,
+            )
+
+            self.assertEqual(metrics.counter("echo_dropped"), 1, "echo_dropped metric must be incremented")
+            self.assertEqual(len(mt_called), 0, "MT must not be called on dropped echo utterance")
+            dropped_frames = [m for m in ws.sent_json if m.get("event") == "dropped"]
+            self.assertEqual(len(dropped_frames), 1)
+            self.assertEqual(dropped_frames[0]["reason"], "echo")
+            self.assertEqual(dropped_frames[0]["utt"], 1)
+        finally:
+            app.server.PIPELINE = None
+
+    # ---- T14: S8 Human barge-in passes through during playback -------------
+    async def test_t14_s8_barge_in_passes_during_playback(self):
+        settings = Settings(sample_rate=16000, max_utterance_seconds=2.0)
+        ws = DummyWebSocket()
+        state = _StreamState(settings, ws)
+        state.protocol_version = 2
+        state.source = "en"
+        state.target = "fr"
+        # Seed recent TTS output
+        state.recent_tts_outputs.append("Bonjour tout le monde")
+
+        metrics = Metrics()
+        mt_called = []
+
+        class MockPipeline:
+            def __init__(self):
+                self.metrics = metrics
+                self.ready = True
+                self.settings = settings
+                self.asr = MagicMock()
+
+            async def _decode_checked(self, raw, **kwargs):
+                return SimpleNamespace(samples=np.zeros(1600, dtype=np.float32), duration_s=0.1, source_format="pcm_s16le"), 1.0
+
+            async def translate_audio_streaming(self, raw, source, target, is_echo=None, **kwargs):
+                asr_text = "Wait, stop talking please"
+                if is_echo is not None and is_echo(asr_text):
+                    self.metrics.incr("echo_dropped")
+                    yield {
+                        "type": "dropped",
+                        "reason": "echo",
+                        "original_text": asr_text,
+                        "asr_ms": 15.0,
+                    }
+                    return
+                mt_called.append(asr_text)
+                yield {
+                    "type": "final",
+                    "original_text": asr_text,
+                    "translated_text": "Attendez, arrêtez de parler s'il vous plaît",
+                    "source_lang": source,
+                    "target_lang": target,
+                    "asr_ms": 15.0,
+                    "mt_ms": 10.0,
+                    "total_server_ms": 25.0,
+                }
+
+        pipeline = MockPipeline()
+        app.server.PIPELINE = pipeline
+
+        try:
+            # Case 1: Utterance with during_ratio < 0.5 (e.g. 1 out of 4 frames) matching TTS text
+            # Must NOT be dropped as echo because during_ratio is below the 50% threshold (Directive S8 Gate 1)
+            await _on_audio_frame(state, pack_v2(flags=0x04, utt=1, seq=0, payload=b"\x00\x00" * 160))
+            await _on_audio_frame(state, pack_v2(flags=0x00, utt=1, seq=1, payload=b"\x00\x00" * 160))
+            await _on_audio_frame(state, pack_v2(flags=0x00, utt=1, seq=2, payload=b"\x00\x00" * 160))
+            await _on_audio_frame(state, pack_v2(flags=0x02, utt=1, seq=3, payload=b"\x00\x00" * 160))
+
+            item1 = await state.utterance_queue.get()
+            _, raw1, utt_id1, _, slot_src, slot_dst, slot_src_var, slot_tgt_var, during_ratio1, context_prefix = item1
+
+            # Mock pipeline returning text that matches recent_tts_outputs
+            class MockPipelineEchoText:
+                def __init__(self):
+                    self.metrics = metrics
+                    self.ready = True
+                    self.settings = settings
+                    self.asr = MagicMock()
+
+                async def _decode_checked(self, raw, **kwargs):
+                    return SimpleNamespace(samples=np.zeros(1600, dtype=np.float32), duration_s=0.1, source_format="pcm_s16le"), 1.0
+
+                async def translate_audio_streaming(self, raw, source, target, is_echo=None, **kwargs):
+                    asr_text = "Bonjour tout le monde"
+                    if is_echo is not None and is_echo(asr_text):
+                        self.metrics.incr("echo_dropped")
+                        yield {"type": "dropped", "reason": "echo", "original_text": asr_text, "asr_ms": 15.0}
+                        return
+                    mt_called.append(asr_text)
+                    yield {
+                        "type": "final",
+                        "original_text": asr_text,
+                        "translated_text": "Hello everyone",
+                        "source_lang": source,
+                        "target_lang": target,
+                        "asr_ms": 15.0,
+                        "mt_ms": 10.0,
+                        "total_server_ms": 25.0,
+                    }
+
+            app.server.PIPELINE = MockPipelineEchoText()
+            from app.server import _handle_utterance_payload
+            await _handle_utterance_payload(
+                state,
+                raw1,
+                utt_id1,
+                source=slot_src,
+                target=slot_dst,
+                source_variant=slot_src_var,
+                target_variant=slot_tgt_var,
+                during_ratio=during_ratio1,
+                context_prefix=context_prefix,
+            )
+
+            self.assertEqual(metrics.counter("echo_dropped"), 0, "Utterance with during_ratio < 0.5 must not be dropped as echo")
+            self.assertEqual(len(mt_called), 1, "MT must be called when during_ratio < 0.5")
+
+            # Case 2: User speaks over TTS playback (during_ratio = 1.0 >= 0.5) with different words (barge-in)
+            app.server.PIPELINE = pipeline
+            await _on_audio_frame(state, pack_v2(flags=0x04, utt=2, seq=0, payload=b"\x00\x00" * 160))
+            await _on_audio_frame(state, pack_v2(flags=0x06, utt=2, seq=1, payload=b"\x00\x00" * 160))
+
+            item2 = await state.utterance_queue.get()
+            _, raw2, utt_id2, _, slot_src, slot_dst, slot_src_var, slot_tgt_var, during_ratio2, context_prefix = item2
+
+            await _handle_utterance_payload(
+                state,
+                raw2,
+                utt_id2,
+                source=slot_src,
+                target=slot_dst,
+                source_variant=slot_src_var,
+                target_variant=slot_tgt_var,
+                during_ratio=during_ratio2,
+                context_prefix=context_prefix,
+            )
+
+            self.assertEqual(metrics.counter("echo_dropped"), 0, "Barge-in must not increment echo_dropped")
+            self.assertEqual(len(mt_called), 2, "MT must be executed for human barge-in turn")
+            final_frames = [m for m in ws.sent_json if m.get("type") == "final"]
+            self.assertEqual(len(final_frames), 2)
+            self.assertEqual(final_frames[-1]["translated_text"], "Attendez, arrêtez de parler s'il vous plaît")
+        finally:
+            app.server.PIPELINE = None
+
+    # ---- S9: Split-repair context across rapid mid-sentence pauses ----------
+    async def test_s9_split_repair_context_prefix(self):
+        settings = Settings(sample_rate=16000, max_utterance_seconds=2.0, split_repair_enabled=True)
+        ws = DummyWebSocket()
+        state = _StreamState(settings, ws)
+        state.protocol_version = 2
+        state.source = "en"
+        state.target = "ar"
+
+        metrics = Metrics()
+        context_prefixes = []
+
+        class MockPipeline:
+            def __init__(self):
+                self.metrics = metrics
+                self.ready = True
+                self.settings = settings
+                self.asr = MagicMock()
+
+            async def _decode_checked(self, raw, **kwargs):
+                return SimpleNamespace(samples=np.zeros(1600, dtype=np.float32), duration_s=0.1, source_format="pcm_s16le"), 1.0
+
+            async def translate_audio_streaming(self, raw, source, target, context_prefix="", **kwargs):
+                context_prefixes.append(context_prefix)
+                yield {
+                    "type": "final",
+                    "original_text": "I was thinking",
+                    "translated_text": "كنت أفكر",
+                    "source_lang": source,
+                    "target_lang": target,
+                    "asr_ms": 15.0,
+                    "mt_ms": 10.0,
+                    "total_server_ms": 25.0,
+                }
+
+        pipeline = MockPipeline()
+        app.server.PIPELINE = pipeline
+
+        try:
+            # Slot 1: ends without terminal punctuation
+            await _on_audio_frame(state, pack_v2(flags=0x02, utt=1, seq=0, payload=b"\x00\x00" * 160))
+            item1 = await state.utterance_queue.get()
+            from app.server import _handle_utterance_payload
+            await _handle_utterance_payload(state, item1[1], item1[2], source=item1[4], target=item1[5], source_variant=item1[6], target_variant=item1[7], during_ratio=item1[8], context_prefix=item1[9])
+
+            # State now has slot 1 commit record
+            self.assertEqual(state.last_committed_src_text, "I was thinking")
+            self.assertFalse(state.last_has_terminal_punct, "Must lack terminal punctuation")
+
+            # Slot 2: arrives shortly after (< 800ms)
+            await _on_audio_frame(state, pack_v2(flags=0x02, utt=2, seq=0, payload=b"\x00\x00" * 160))
+            item2 = await state.utterance_queue.get()
+            # Slot 2 queued context_prefix should be slot 1's source text
+            self.assertEqual(item2[9], "I was thinking")
+            self.assertEqual(metrics.counter("split_repair_count"), 1)
+        finally:
+            app.server.PIPELINE = None
 
 
 if __name__ == "__main__":

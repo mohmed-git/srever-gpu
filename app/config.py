@@ -142,6 +142,9 @@ class Settings:
     sentence_streaming: bool = field(
         default_factory=lambda: _env_bool("SENTENCE_STREAMING", True)
     )
+    split_repair_enabled: bool = field(
+        default_factory=lambda: _env_bool("SPLIT_REPAIR_ENABLED", True)
+    )
     # Fragments shorter than this (in script-weighted units, so CJK is not
     # penalised) are merged: a 2-syllable fragment spends a whole MT round
     # trip on nothing and gives the model no context to translate correctly.

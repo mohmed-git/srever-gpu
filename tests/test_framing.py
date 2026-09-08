@@ -249,7 +249,8 @@ class FakeMtEngine:
 
     def translate_batch(self, items):
         results = []
-        for text, src, dst in items:
+        for item in items:
+            text, src, dst = item[0], item[1], item[2]
             results.append(
                 MtResult(
                     text=f'مترجم: {text}',

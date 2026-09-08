@@ -99,7 +99,7 @@ class Series:
 class Metrics:
     """Thread-safe metric registry. Cheap enough to call on every request."""
 
-    def __init__(self, window: int = 2048, budget_ms: float = 150.0) -> None:
+    def __init__(self, window: int = 2048, budget_ms: float = 500.0) -> None:
         self._lock = threading.Lock()
         self._window = window
         self._budget_ms = budget_ms
@@ -128,6 +128,8 @@ class Metrics:
             "mt_retry": 0,
             "mt_english_leak": 0,
             "asr_pinned_lang_mismatch": 0,
+            "echo_dropped": 0,
+            "split_repair_count": 0,
         }
         self._started_at = time.time()
         self._inflight = 0

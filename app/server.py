@@ -13,9 +13,11 @@ GET  /capabilities             what this build can and cannot do, with numbers
 from __future__ import annotations
 
 import asyncio
+import difflib
 import hashlib
 import json
 import logging
+import re
 import struct
 import time
 from collections import OrderedDict, deque
@@ -108,11 +110,18 @@ class TranslateRequest(BaseModel):
     text: str = Field(..., description="Text to translate")
     source: str = Field(..., description="Source language code, e.g. 'ar'")
     target: str = Field(..., description="Target language code, e.g. 'en'")
+    source_variant: str | None = Field(default=None, description="Source dialect variant, e.g. 'EG'")
+    target_variant: str | None = Field(default=None, description="Target dialect variant, e.g. 'SA'")
 
     @field_validator("source", "target")
     @classmethod
     def _norm(cls, value: str) -> str:
         return value.strip().lower()
+
+    @field_validator("source_variant", "target_variant")
+    @classmethod
+    def _norm_variant(cls, value: str | None) -> str | None:
+        return lang_mod.normalise_variant(value)
 
 
 @app.post("/translate")
@@ -127,7 +136,13 @@ async def translate(req: TranslateRequest) -> JSONResponse:
         )
     started = time.perf_counter()
     try:
-        outcome = await PIPELINE.translate_text(req.text, req.source, req.target)
+        outcome = await PIPELINE.translate_text(
+            req.text,
+            req.source,
+            req.target,
+            source_variant=req.source_variant or "",
+            target_variant=req.target_variant or "",
+        )
     except Overloaded as exc:
         return JSONResponse(
             status_code=503,
@@ -161,6 +176,8 @@ async def translate(req: TranslateRequest) -> JSONResponse:
 _CONTROL_KEYS = {
     "source",
     "target",
+    "source_variant",
+    "target_variant",
     "format",
     "sample_rate",
     "channels",
@@ -171,6 +188,7 @@ _CONTROL_KEYS = {
     "protocol",
     "utt",
     "seq",
+    "text",
 }
 
 
@@ -180,13 +198,56 @@ def norm_hash(text: str) -> str:
     return hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:16]
 
 
+def is_echo_match(asr_text: str, recent_tts_outputs: deque[str] | list[str]) -> bool:
+    """Check if ASR transcript matches recent TTS playback output (Directive S8).
+    Match condition: token Jaccard >= 0.6 or difflib.SequenceMatcher.ratio() >= 0.75.
+    """
+    if not asr_text or not recent_tts_outputs:
+        return False
+
+    def _normalize_words(t: str) -> list[str]:
+        cleaned = re.sub(r"[^\w\s]", " ", (t or "").lower(), flags=re.UNICODE)
+        return [w for w in cleaned.split() if w]
+
+    asr_words = set(_normalize_words(asr_text))
+    if not asr_words:
+        return False
+    asr_norm = " ".join(_normalize_words(asr_text))
+
+    for tts_text in recent_tts_outputs:
+        if not tts_text:
+            continue
+        tts_words = set(_normalize_words(tts_text))
+        if not tts_words:
+            continue
+        intersection = len(asr_words & tts_words)
+        union = len(asr_words | tts_words)
+        jaccard = (intersection / union) if union > 0 else 0.0
+        if jaccard >= 0.6:
+            return True
+        tts_norm = " ".join(_normalize_words(tts_text))
+        ratio = difflib.SequenceMatcher(None, asr_norm, tts_norm).ratio()
+        if ratio >= 0.75:
+            return True
+    return False
+
+
 class _Slot:
     """Per-utterance buffer slot for Protocol v2 framed streaming."""
 
-    def __init__(self, utt_id: int, source: str | None = None, target: str | None = None) -> None:
+    def __init__(
+        self,
+        utt_id: int,
+        source: str | None = None,
+        target: str | None = None,
+        source_variant: str | None = None,
+        target_variant: str | None = None,
+    ) -> None:
         self.utt_id = utt_id
         self.source = source
         self.target = target
+        self.source_variant = source_variant
+        self.target_variant = target_variant
         self.buffer = bytearray()
         self.seq_seen: set[int] = set()
         self.last_seq: int | None = None
@@ -195,6 +256,8 @@ class _Slot:
         self.closed: bool = False
         self.committed: bool = False
         self.created_at: float = time.monotonic()
+        self.during_playback_frames: int = 0
+        self.total_frames: int = 0
 
         # Tentative pass (Phase 2.4)
         self.tentative_task: asyncio.Task[None] | None = None
@@ -223,6 +286,8 @@ class _StreamState:
         self.websocket = websocket
         self.source: str | None = None
         self.target: str | None = None
+        self.source_variant: str | None = None
+        self.target_variant: str | None = None
         self.verify_lang_next: bool = True
         self.audio_format: str | None = None
         self.sample_rate: int = settings.sample_rate
@@ -235,6 +300,10 @@ class _StreamState:
         self.slots: dict[int, _Slot] = {}
         self.mt_cache: OrderedDict[str, Any] = OrderedDict()  # LRU 32, key = norm_hash(sentence)
         self.committed_utts: deque[int] = deque(maxlen=64)
+        self.recent_tts_outputs: deque[str] = deque(maxlen=5)
+        self.last_commit_time: float = 0.0
+        self.last_committed_src_text: str = ""
+        self.last_has_terminal_punct: bool = True
         self.send_lock = asyncio.Lock()
         self.utterance_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=3)
         self.worker_task: asyncio.Task[None] | None = None
@@ -277,6 +346,18 @@ class _StreamState:
             self.source = str(message["source"]) if message["source"] is not None else None
         if "target" in message:
             self.target = str(message["target"]) if message["target"] is not None else None
+        if "source_variant" in message:
+            raw_v = message["source_variant"]
+            norm_v = lang_mod.normalise_variant(raw_v)
+            if raw_v and not norm_v:
+                log.info("variant_unknown: %s", raw_v)
+            self.source_variant = norm_v
+        if "target_variant" in message:
+            raw_v = message["target_variant"]
+            norm_v = lang_mod.normalise_variant(raw_v)
+            if raw_v and not norm_v:
+                log.info("variant_unknown: %s", raw_v)
+            self.target_variant = norm_v
         if "format" in message and message["format"]:
             self.audio_format = str(message["format"]).strip().lower()
         if "sample_rate" in message and message["sample_rate"]:
@@ -421,7 +502,10 @@ async def _run_tentative(state: _StreamState, slot: _Slot, seq: int) -> None:
 
         if uncached and not passthrough:
             mt_jobs = [
-                pipeline._mt_sched.submit((s, detected, dst), priority=1)
+                pipeline._mt_sched.submit(
+                    (s, detected, dst, slot.source_variant or "", slot.target_variant or "", ""),
+                    priority=1,
+                )
                 for s in uncached
             ]
             mt_outcomes = await asyncio.gather(*mt_jobs)
@@ -472,6 +556,8 @@ async def _run_tentative(state: _StreamState, slot: _Slot, seq: int) -> None:
                 "translated_text": piece,
                 "source_lang": detected,
                 "target_lang": dst,
+                "source_variant": slot.source_variant or None,
+                "target_variant": slot.target_variant or None,
                 "elapsed_ms": round(elapsed, 2),
                 "mt_ms": round(piece_ms, 2),
                 "mt_backend": mt_backend,
@@ -492,6 +578,8 @@ async def _run_tentative(state: _StreamState, slot: _Slot, seq: int) -> None:
             "translated_text": " ".join(t for t in translated_pieces if t).strip(),
             "source_lang": detected,
             "target_lang": dst,
+            "source_variant": slot.source_variant or None,
+            "target_variant": slot.target_variant or None,
             "asr_ms": asr_result.asr_ms,
             "mt_ms": round(mt_total_ms, 2),
             "total_server_ms": round(tentative_pass_ms, 2),
@@ -594,7 +682,14 @@ async def _run_partial(state: _StreamState, slot: _Slot, seq: int) -> None:
                     if state.cache_get(h) is None:
                         try:
                             mt_res, _ = await pipeline._mt_sched.submit(
-                                (cs, detected, tgt),
+                                (
+                                    cs,
+                                    detected,
+                                    tgt,
+                                    slot.source_variant or state.source_variant or "",
+                                    slot.target_variant or state.target_variant or "",
+                                    "",
+                                ),
                                 priority=2,
                             )
                             state.cache_put(h, mt_res)
@@ -626,12 +721,36 @@ async def _commit_slot(state: _StreamState, slot: _Slot, seq: int) -> None:
     if slot.partial_task and not slot.partial_task.done():
         slot.partial_task.cancel()
 
+    during_ratio = (slot.during_playback_frames / slot.total_frames) if slot.total_frames > 0 else 0.0
+
+    context_prefix = ""
+    if (
+        state.settings.split_repair_enabled
+        and state.last_commit_time > 0
+        and (commit_time - state.last_commit_time) <= 0.800
+        and not state.last_has_terminal_punct
+        and state.last_committed_src_text
+    ):
+        context_prefix = state.last_committed_src_text
+        if pipeline is not None:
+            pipeline.metrics.incr("split_repair_count")
+
     # HIT: tentative_result present and tentative_seq == seq
     if slot.tentative_result is not None and slot.tentative_seq == seq:
+        frames, final_frame, tentative_pass_ms = slot.tentative_result
+        orig_text = final_frame.get("original_text", "")
+        if during_ratio >= 0.5 and is_echo_match(orig_text, state.recent_tts_outputs):
+            if pipeline is not None:
+                pipeline.metrics.incr("echo_dropped")
+            await state.send_json({"event": "dropped", "type": "dropped", "utt": utt_id, "reason": "echo"})
+            return
+
         if pipeline is not None:
             pipeline.metrics.incr("tentative_hit")
         if not state.utterance_queue.full():
-            await state.utterance_queue.put(("serve_cached", slot, seq, slot.tentative_result, commit_time))
+            await state.utterance_queue.put(
+                ("serve_cached", slot, seq, slot.tentative_result, commit_time, during_ratio, context_prefix)
+            )
         else:
             await state.send_json({"error": "overloaded", "retry_after_ms": 250, "detail": "utterance queue full", "utterance": utt_id})
         return
@@ -641,7 +760,9 @@ async def _commit_slot(state: _StreamState, slot: _Slot, seq: int) -> None:
         if pipeline is not None:
             pipeline.metrics.incr("tentative_await")
         if not state.utterance_queue.full():
-            await state.utterance_queue.put(("await_then_serve", slot, seq, slot.tentative_task, commit_time))
+            await state.utterance_queue.put(
+                ("await_then_serve", slot, seq, slot.tentative_task, commit_time, during_ratio, context_prefix)
+            )
         else:
             await state.send_json({"error": "overloaded", "retry_after_ms": 250, "detail": "utterance queue full", "utterance": utt_id})
         return
@@ -653,7 +774,20 @@ async def _commit_slot(state: _StreamState, slot: _Slot, seq: int) -> None:
         slot.tentative_task.cancel()
     raw = bytes(slot.buffer)
     if not state.utterance_queue.full():
-        await state.utterance_queue.put(("fresh", raw, utt_id, commit_time, slot.source, slot.target))
+        await state.utterance_queue.put(
+            (
+                "fresh",
+                raw,
+                utt_id,
+                commit_time,
+                slot.source,
+                slot.target,
+                slot.source_variant,
+                slot.target_variant,
+                during_ratio,
+                context_prefix,
+            )
+        )
     else:
         await state.send_json({"error": "overloaded", "retry_after_ms": 250, "detail": "utterance queue full", "utterance": utt_id})
 
@@ -753,6 +887,13 @@ async def _on_control_frame(state: _StreamState, control: dict[str, Any]) -> Non
         await state.send_json({"event": "pong", "time": time.time()})
         return
 
+    if action == "played":
+        text_val = control.get("text")
+        if text_val:
+            state.recent_tts_outputs.append(str(text_val))
+        await state.send_json({"event": "played_ack", "utt": control.get("utt")})
+        return
+
     if action == "tentative":
         utt_val = control.get("utt")
         seq_val = control.get("seq")
@@ -840,6 +981,8 @@ async def _on_control_frame(state: _StreamState, control: dict[str, Any]) -> Non
             "event": "config",
             "source": state.source,
             "target": state.target,
+            "source_variant": state.source_variant,
+            "target_variant": state.target_variant,
             "format": state.audio_format,
             "sample_rate": state.sample_rate,
             "channels": state.channels,
@@ -897,7 +1040,19 @@ async def _on_audio_frame(state: _StreamState, chunk: bytes) -> None:
                     await state.send_json({"event": "already_committed", "utt": utt_id})
                 return
 
-            slot = state.slots.setdefault(utt_id, _Slot(utt_id, state.source, state.target))
+            slot = state.slots.setdefault(
+                utt_id,
+                _Slot(
+                    utt_id,
+                    state.source,
+                    state.target,
+                    source_variant=state.source_variant,
+                    target_variant=state.target_variant,
+                ),
+            )
+            slot.total_frames += 1
+            if flags & 0x04:
+                slot.during_playback_frames += 1
 
             # PREROLL flag check (bit 0: 0x01)
             if flags & 0x01:
@@ -966,7 +1121,16 @@ async def _on_audio_frame(state: _StreamState, chunk: bytes) -> None:
                 })
                 await _commit_slot(state, slot, seq)
 
-                next_slot = state.slots.setdefault(next_utt, _Slot(next_utt, state.source, state.target))
+                next_slot = state.slots.setdefault(
+                    next_utt,
+                    _Slot(
+                        next_utt,
+                        state.source,
+                        state.target,
+                        source_variant=state.source_variant,
+                        target_variant=state.target_variant,
+                    ),
+                )
                 if remainder:
                     next_slot.buffer.extend(remainder)
                 next_slot.last_seq = seq
@@ -1213,16 +1377,25 @@ async def _utterance_worker(state: _StreamState) -> None:
                 continue
 
             # Check item kind
-            if isinstance(item, tuple) and len(item) == 5 and item[0] == "serve_cached":
-                _, slot, seq, (frames, final_frame, tentative_pass_ms), commit_time = item
+            if isinstance(item, tuple) and item[0] == "serve_cached":
+                _, slot, seq, (frames, final_frame, tentative_pass_ms), commit_time, *rest = item
+                during_ratio = rest[0] if len(rest) > 0 else 0.0
+                context_prefix = rest[1] if len(rest) > 1 else ""
                 utt_id = slot.utt_id
+
+                if during_ratio >= 0.5 and is_echo_match(final_frame.get("original_text", ""), state.recent_tts_outputs):
+                    if PIPELINE is not None:
+                        PIPELINE.metrics.incr("echo_dropped")
+                    await state.send_json({"event": "dropped", "type": "dropped", "utt": utt_id, "utterance": utt_id, "reason": "echo"})
+                    continue
+
                 c2f_ms = (time.perf_counter() - commit_time) * 1000.0
                 if PIPELINE is not None:
                     PIPELINE.metrics.observe("commit_to_first_frame_ms", c2f_ms)
                     PIPELINE.metrics.observe("tentative_pass_ms", tentative_pass_ms)
 
                 for sf in frames:
-                    await state.send_json({**sf, "utterance": utt_id})
+                    await state.send_json({**sf, "utterance": utt_id, "utt": utt_id})
 
                 final_copy = dict(final_frame)
                 final_copy["tentative_hit"] = True
@@ -1230,10 +1403,19 @@ async def _utterance_worker(state: _StreamState) -> None:
                 if PIPELINE is not None:
                     ver_fields = await _verify_pinned_language(PIPELINE, state, bytes(slot.buffer), slot.source)
                     final_copy.update(ver_fields)
-                await state.send_json({**final_copy, "utterance": utt_id})
+                await state.send_json({**final_copy, "utterance": utt_id, "utt": utt_id})
 
-            elif isinstance(item, tuple) and len(item) == 5 and item[0] == "await_then_serve":
-                _, slot, seq, task, commit_time = item
+                if final_copy.get("translated_text"):
+                    state.recent_tts_outputs.append(final_copy["translated_text"])
+                state.last_commit_time = commit_time
+                src_text = final_copy.get("original_text", "")
+                state.last_committed_src_text = src_text
+                state.last_has_terminal_punct = bool(src_text.rstrip() and src_text.rstrip()[-1] in _TERMINATORS)
+
+            elif isinstance(item, tuple) and item[0] == "await_then_serve":
+                _, slot, seq, task, commit_time, *rest = item
+                during_ratio = rest[0] if len(rest) > 0 else 0.0
+                context_prefix = rest[1] if len(rest) > 1 else ""
                 utt_id = slot.utt_id
                 try:
                     await task
@@ -1242,13 +1424,19 @@ async def _utterance_worker(state: _StreamState) -> None:
 
                 if slot.tentative_result is not None:
                     frames, final_frame, tentative_pass_ms = slot.tentative_result
+                    if during_ratio >= 0.5 and is_echo_match(final_frame.get("original_text", ""), state.recent_tts_outputs):
+                        if PIPELINE is not None:
+                            PIPELINE.metrics.incr("echo_dropped")
+                        await state.send_json({"event": "dropped", "type": "dropped", "utt": utt_id, "utterance": utt_id, "reason": "echo"})
+                        continue
+
                     c2f_ms = (time.perf_counter() - commit_time) * 1000.0
                     if PIPELINE is not None:
                         PIPELINE.metrics.observe("commit_to_first_frame_ms", c2f_ms)
                         PIPELINE.metrics.observe("tentative_pass_ms", tentative_pass_ms)
 
                     for sf in frames:
-                        await state.send_json({**sf, "utterance": utt_id})
+                        await state.send_json({**sf, "utterance": utt_id, "utt": utt_id})
 
                     final_copy = dict(final_frame)
                     final_copy["tentative_hit"] = True
@@ -1256,18 +1444,47 @@ async def _utterance_worker(state: _StreamState) -> None:
                     if PIPELINE is not None:
                         ver_fields = await _verify_pinned_language(PIPELINE, state, bytes(slot.buffer), slot.source)
                         final_copy.update(ver_fields)
-                    await state.send_json({**final_copy, "utterance": utt_id})
+                    await state.send_json({**final_copy, "utterance": utt_id, "utt": utt_id})
+
+                    if final_copy.get("translated_text"):
+                        state.recent_tts_outputs.append(final_copy["translated_text"])
+                    state.last_commit_time = commit_time
+                    src_text = final_copy.get("original_text", "")
+                    state.last_committed_src_text = src_text
+                    state.last_has_terminal_punct = bool(src_text.rstrip() and src_text.rstrip()[-1] in _TERMINATORS)
                 else:
                     raw = bytes(slot.buffer)
-                    await _handle_utterance_payload(state, raw, utt_id, source=slot.source, target=slot.target)
+                    await _handle_utterance_payload(
+                        state,
+                        raw,
+                        utt_id,
+                        source=slot.source,
+                        target=slot.target,
+                        source_variant=slot.source_variant,
+                        target_variant=slot.target_variant,
+                        during_ratio=during_ratio,
+                        context_prefix=context_prefix,
+                    )
 
             elif isinstance(item, tuple) and item[0] == "fresh":
-                if len(item) == 6:
-                    _, raw, utt_id, commit_time, slot_src, slot_dst = item
-                else:
-                    _, raw, utt_id, commit_time = item[:4]
-                    slot_src, slot_dst = None, None
-                await _handle_utterance_payload(state, raw, utt_id, source=slot_src, target=slot_dst)
+                _, raw, utt_id, commit_time, *extra = item
+                slot_src = extra[0] if len(extra) > 0 else None
+                slot_dst = extra[1] if len(extra) > 1 else None
+                slot_src_var = extra[2] if len(extra) > 2 else None
+                slot_tgt_var = extra[3] if len(extra) > 3 else None
+                during_ratio = extra[4] if len(extra) > 4 else 0.0
+                context_prefix = extra[5] if len(extra) > 5 else ""
+                await _handle_utterance_payload(
+                    state,
+                    raw,
+                    utt_id,
+                    source=slot_src,
+                    target=slot_dst,
+                    source_variant=slot_src_var,
+                    target_variant=slot_tgt_var,
+                    during_ratio=during_ratio,
+                    context_prefix=context_prefix,
+                )
 
             elif isinstance(item, tuple) and len(item) == 2:
                 raw, utt_id = item
@@ -1285,6 +1502,10 @@ async def _handle_utterance_payload(
     utt_id: int | None = None,
     source: str | None = None,
     target: str | None = None,
+    source_variant: str | None = None,
+    target_variant: str | None = None,
+    during_ratio: float = 0.0,
+    context_prefix: str = "",
 ) -> None:
     state.utterances += 1
     utt_tag = utt_id if utt_id is not None else state.utterances
@@ -1292,27 +1513,45 @@ async def _handle_utterance_payload(
     assert PIPELINE is not None
 
     if state.stream:
-        await _stream_utterance(state, raw, utt_tag, source=source, target=target)
+        await _stream_utterance(
+            state,
+            raw,
+            utt_tag,
+            source=source,
+            target=target,
+            source_variant=source_variant,
+            target_variant=target_variant,
+            during_ratio=during_ratio,
+            context_prefix=context_prefix,
+        )
         return
 
     effective_src = source if source is not None else (state.source or "auto")
     effective_dst = target if target is not None else state.target
+    effective_src_var = source_variant if source_variant is not None else (state.source_variant or "")
+    effective_tgt_var = target_variant if target_variant is not None else (state.target_variant or "")
+
+    echo_fn = (lambda asr_text: is_echo_match(asr_text, state.recent_tts_outputs)) if during_ratio >= 0.5 else None
 
     try:
         outcome = await PIPELINE.translate_audio(
             raw,
             source=effective_src,
             target=effective_dst,
+            source_variant=effective_src_var,
+            target_variant=effective_tgt_var,
+            context_prefix=context_prefix,
+            is_echo=echo_fn,
             declared_format=state.audio_format,
             input_sample_rate=state.sample_rate,
             channels=state.channels,
         )
     except Overloaded as exc:
-        await state.send_json({**exc.payload(), "utterance": utt_tag})
+        await state.send_json({**exc.payload(), "utterance": utt_tag, "utt": utt_tag})
         return
     except RequestError as exc:
         await state.send_json(
-            {"error": exc.code, "detail": str(exc), "utterance": utt_tag}
+            {"error": exc.code, "detail": str(exc), "utterance": utt_tag, "utt": utt_tag}
         )
         return
     except Exception as exc:
@@ -1322,14 +1561,38 @@ async def _handle_utterance_payload(
                 "error": "internal",
                 "detail": f"{type(exc).__name__}: {exc}",
                 "utterance": utt_tag,
+                "utt": utt_tag,
             }
         )
         return
 
+    if outcome.detail and outcome.detail.get("dropped"):
+        await state.send_json({
+            "event": "dropped",
+            "type": "dropped",
+            "utt": utt_tag,
+            "utterance": utt_tag,
+            "reason": outcome.detail.get("drop_reason", "echo"),
+            "original_text": outcome.original_text,
+            "asr_ms": outcome.asr_ms,
+        })
+        return
+
     out_payload = outcome.to_json()
+    if effective_src_var:
+        out_payload["source_variant"] = effective_src_var
+    if effective_tgt_var:
+        out_payload["target_variant"] = effective_tgt_var
     ver_fields = await _verify_pinned_language(PIPELINE, state, raw, effective_src)
     out_payload.update(ver_fields)
-    await state.send_json({**out_payload, "utterance": utt_tag})
+    await state.send_json({**out_payload, "utterance": utt_tag, "utt": utt_tag})
+
+    if out_payload.get("translated_text"):
+        state.recent_tts_outputs.append(out_payload["translated_text"])
+    state.last_commit_time = time.perf_counter()
+    src_text = out_payload.get("original_text", "")
+    state.last_committed_src_text = src_text
+    state.last_has_terminal_punct = bool(src_text.rstrip() and src_text.rstrip()[-1] in _TERMINATORS)
 
 
 async def _stream_utterance(
@@ -1338,24 +1601,20 @@ async def _stream_utterance(
     utt_tag: int,
     source: str | None = None,
     target: str | None = None,
+    source_variant: str | None = None,
+    target_variant: str | None = None,
+    during_ratio: float = 0.0,
+    context_prefix: str = "",
 ) -> None:
-    """Relay the pipeline's per-sentence frames to the client.
-
-    The error handling here is deliberately different from the unified path,
-    and the reason is the whole point of this function: once sentence 1 has
-    been sent, the earbuds have ALREADY STARTED SPEAKING. A failure after that
-    point cannot be reported as if nothing happened -- a client that receives a
-    bare {"error": ...} after playing half an utterance has no way to know the
-    rest is never coming, and would sit waiting for `final` forever.
-
-    So every error frame carries `frames_sent` and `terminal: true`, and once
-    any frame has gone out the error is also tagged `partial: true`. That is
-    the difference between "this request failed" and "this request half
-    happened", and the client needs to act differently on each.
-    """
+    """Relay the pipeline's per-sentence frames to the client."""
     assert PIPELINE is not None
     effective_src = source if source is not None else (state.source or "auto")
     effective_dst = target if target is not None else (state.target or "")
+    effective_src_var = source_variant if source_variant is not None else (state.source_variant or "")
+    effective_tgt_var = target_variant if target_variant is not None else (state.target_variant or "")
+
+    echo_fn = (lambda asr_text: is_echo_match(asr_text, state.recent_tts_outputs)) if during_ratio >= 0.5 else None
+
     frames = 0
     ver_fields = await _verify_pinned_language(PIPELINE, state, raw, effective_src)
     try:
@@ -1363,13 +1622,40 @@ async def _stream_utterance(
             raw,
             source=effective_src,
             target=effective_dst,
+            source_variant=effective_src_var,
+            target_variant=effective_tgt_var,
+            context_prefix=context_prefix,
+            is_echo=echo_fn,
             declared_format=state.audio_format,
             input_sample_rate=state.sample_rate,
             channels=state.channels,
         ):
-            if frame.get("type") == "final" and ver_fields:
-                frame = {**frame, **ver_fields}
-            await state.send_json({**frame, "utterance": utt_tag})
+            if frame.get("type") == "dropped":
+                await state.send_json({
+                    "event": "dropped",
+                    "type": "dropped",
+                    "utt": utt_tag,
+                    "utterance": utt_tag,
+                    "reason": frame.get("reason", "echo"),
+                    "original_text": frame.get("original_text", ""),
+                    "asr_ms": frame.get("asr_ms", 0.0),
+                })
+                return
+
+            if frame.get("type") == "sentence" and frame.get("translated_text"):
+                state.recent_tts_outputs.append(frame["translated_text"])
+
+            if frame.get("type") == "final":
+                if ver_fields:
+                    frame = {**frame, **ver_fields}
+                if frame.get("translated_text"):
+                    state.recent_tts_outputs.append(frame["translated_text"])
+                state.last_commit_time = time.perf_counter()
+                src_text = frame.get("original_text", "")
+                state.last_committed_src_text = src_text
+                state.last_has_terminal_punct = bool(src_text.rstrip() and src_text.rstrip()[-1] in _TERMINATORS)
+
+            await state.send_json({**frame, "utterance": utt_tag, "utt": utt_tag})
             frames += 1
         return
     except Overloaded as exc:
@@ -1385,6 +1671,7 @@ async def _stream_utterance(
             "type": "error",
             **payload,
             "utterance": utt_tag,
+            "utt": utt_tag,
             "frames_sent": frames,
             "partial": frames > 0,
             "terminal": True,

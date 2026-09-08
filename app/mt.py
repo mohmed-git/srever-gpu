@@ -74,11 +74,65 @@ from .languages import name_of
 
 log = logging.getLogger("lingua.mt")
 
-def make_translation_messages(text: str, src: str, dst: str) -> list[dict[str, str]]:
+_DIALECT_NAMES: Final[dict[str, str]] = {
+    "EG": "Egyptian",
+    "SA": "Saudi / Gulf",
+    "AE": "Emirati",
+    "LB": "Levantine (Lebanese)",
+    "SY": "Levantine (Syrian)",
+    "JO": "Levantine (Jordanian)",
+    "PS": "Levantine (Palestinian)",
+    "IQ": "Iraqi",
+    "MA": "Moroccan (Darija)",
+    "DZ": "Algerian",
+    "TN": "Tunisian",
+    "YE": "Yemeni",
+    "SD": "Sudanese",
+}
+
+
+def _build_variant_hints(
+    src_norm: str,
+    dst_norm: str,
+    source_variant: str = "",
+    target_variant: str = "",
+) -> str:
+    hints: list[str] = []
+    if (source_variant or "").strip() and src_norm == "ar":
+        var_tag = source_variant.strip().upper()
+        name = _DIALECT_NAMES.get(var_tag, var_tag)
+        hints.append(f"- The speaker uses {name} colloquial Arabic; interpret idioms accordingly.")
+    if (target_variant or "").strip() and dst_norm == "ar":
+        var_tag = target_variant.strip().upper()
+        name = _DIALECT_NAMES.get(var_tag, var_tag)
+        hints.append(f"- The listener prefers {name} colloquial Arabic; adapt the translation style accordingly.")
+    if hints:
+        return "\n" + "\n".join(hints)
+    return ""
+
+
+_build_variant_and_context_hints = _build_variant_hints
+
+
+def make_translation_messages(
+    text: str,
+    src: str,
+    dst: str,
+    source_variant: str = "",
+    target_variant: str = "",
+    context_prefix: str = "",
+) -> list[dict[str, str]]:
     src_norm = (src or "").strip().lower().split("-")[0]
     dst_norm = (dst or "").strip().lower().split("-")[0]
     src_name = name_of(src) if src != "auto" else "the detected language"
     dst_name = name_of(dst)
+    extra_hints = _build_variant_hints(src_norm, dst_norm, source_variant, target_variant)
+
+    user_content = (
+        f"[Context from preceding speech: {context_prefix.strip()}]\n\n{text}"
+        if (context_prefix or "").strip()
+        else text
+    )
 
     if (dst_norm == "ar") and (src_norm in {"en", "auto", ""}):
         system_content = (
@@ -92,6 +146,7 @@ def make_translation_messages(text: str, src: str, dst: str) -> list[dict[str, s
             "- Translate 'weather' as 'الطقس' or 'الجو', 'train station' as 'محطة القطار', 'please' as 'من فضلك'.\n"
             "- Translate EVERY word into Arabic. Never leave source words untranslated.\n"
             "- Output ONLY the Modern Standard Arabic translation without quotes, notes, or explanations."
+            f"{extra_hints}"
         )
         return [
             {"role": "system", "content": system_content},
@@ -117,7 +172,7 @@ def make_translation_messages(text: str, src: str, dst: str) -> list[dict[str, s
             {"role": "assistant", "content": "لا تنتظر الغد، بل ابدأ اليوم."},
             {"role": "user", "content": "Work hard, and stay humble."},
             {"role": "assistant", "content": "اعمل بجد، وابقَ متواضعاً."},
-            {"role": "user", "content": text},
+            {"role": "user", "content": user_content},
         ]
     elif (src_norm == "ar") and (dst_norm == "en"):
         system_content = (
@@ -129,6 +184,7 @@ def make_translation_messages(text: str, src: str, dst: str) -> list[dict[str, s
             "- If the input contains a compound statement and question (e.g. 'أنا بخير، وأنت؟'), translate BOTH parts fully: 'I am fine, and you?'. NEVER drop the statement!\n"
             "- If the input is a question ('كيف حالك؟'), translate the question itself ('How are you?'). NEVER answer it!\n"
             "- Output ONLY the direct English translation with no notes, explanations, or quotes."
+            f"{extra_hints}"
         )
         return [
             {"role": "system", "content": system_content},
@@ -148,7 +204,7 @@ def make_translation_messages(text: str, src: str, dst: str) -> list[dict[str, s
             {"role": "assistant", "content": "Good, and you?"},
             {"role": "user", "content": "الطقس جميل اليوم."},
             {"role": "assistant", "content": "The weather is nice today."},
-            {"role": "user", "content": text},
+            {"role": "user", "content": user_content},
         ]
     elif dst_norm == "ar":
         system_content = (
@@ -159,10 +215,11 @@ def make_translation_messages(text: str, src: str, dst: str) -> list[dict[str, s
             "- NEVER omit, drop, or summarize any part of the spoken sentence.\n"
             "- Output MUST be entirely in Modern Standard Arabic.\n"
             "- Output ONLY the direct Modern Standard Arabic translation without preamble, notes, or quotes."
+            f"{extra_hints}"
         )
         return [
             {"role": "system", "content": system_content},
-            {"role": "user", "content": text},
+            {"role": "user", "content": user_content},
         ]
     elif src_norm == "ar":
         system_content = (
@@ -173,10 +230,11 @@ def make_translation_messages(text: str, src: str, dst: str) -> list[dict[str, s
             "- NEVER omit, drop, or summarize any part of the spoken sentence.\n"
             f"- Output MUST be entirely in {dst_name}.\n"
             f"- Output ONLY the direct {dst_name} translation without preamble, notes, or quotes."
+            f"{extra_hints}"
         )
         return [
             {"role": "system", "content": system_content},
-            {"role": "user", "content": text},
+            {"role": "user", "content": user_content},
         ]
     else:
         system_content = (
@@ -186,10 +244,11 @@ def make_translation_messages(text: str, src: str, dst: str) -> list[dict[str, s
             "1. You are a TRANSLATION ENGINE, NOT a chatbot. Never answer questions.\n"
             f"2. Output MUST be entirely in {dst_name}.\n"
             f"3. Output ONLY the direct {dst_name} translation without preamble, notes, or quotes."
+            f"{extra_hints}"
         )
         return [
             {"role": "system", "content": system_content},
-            {"role": "user", "content": text},
+            {"role": "user", "content": user_content},
         ]
 
 
@@ -502,13 +561,17 @@ _EN_STOPWORDS: Final[frozenset[str]] = frozenset({
     "where", "when", "why", "who", "not", "am",
 })
 
+_EN_STOPWORDS_SHARED: Final[frozenset[str]] = frozenset({
+    "is", "in", "was", "me", "we", "he", "am", "us",
+})
+
 
 def _english_leak(text: str, dst_lang: str) -> bool:
     """Detects English function-word leakage when translating into non-English targets.
 
     Flags english_leak when hits >= 2, distinct_hits >= 2, hits / len(words) >= 0.4,
-    and dst != 'en'. Requiring >= 2 distinct hits excludes false positives on nl/af
-    where words like 'is' and 'in' are shared.
+    and dst != 'en'. Excludes _EN_STOPWORDS_SHARED when dst in {"nl", "af", "fy"}
+    to prevent false positives on cognates (e.g. 'Dit is in de winkel').
     """
     norm_dst = (dst_lang or "").strip().lower().split("-")[0]
     if not text or norm_dst in {"en", "auto", ""}:
@@ -517,7 +580,12 @@ def _english_leak(text: str, dst_lang: str) -> bool:
     words = [w for w in words if w]
     if not words:
         return False
-    matched = [w for w in words if w in _EN_STOPWORDS]
+    active_stopwords = (
+        (_EN_STOPWORDS - _EN_STOPWORDS_SHARED)
+        if norm_dst in {"nl", "af", "fy"}
+        else _EN_STOPWORDS
+    )
+    matched = [w for w in words if w in active_stopwords]
     distinct_hits = len(set(matched))
     hits = len(matched)
     return hits >= 2 and distinct_hits >= 2 and (hits / len(words)) >= 0.4
@@ -719,14 +787,32 @@ class QwenCt2Engine(MtEngine):
         self.static_prompt_cached: bool | None = None
         self._fallback_engine: MtEngine | None = None
 
-    def _split_prompt(self, text: str, src: str, dst: str) -> tuple[str, list[str], list[str]]:
+    def _split_prompt(
+        self,
+        text: str,
+        src: str,
+        dst: str,
+        source_variant: str = "",
+        target_variant: str = "",
+        context_prefix: str = "",
+    ) -> tuple[str, list[str], list[str]]:
         """Return (cache_key, static_tokens, per_request_tokens) such that
         static + per_request == tokenize(apply_chat_template(full_messages)). Asserted at load."""
-        msgs = make_translation_messages(text, src, dst)
+        msgs = make_translation_messages(
+            text,
+            src,
+            dst,
+            source_variant=source_variant,
+            target_variant=target_variant,
+            context_prefix=context_prefix,
+        )
         assert msgs[-1]["role"] == "user", "prompt builder must end with the user turn"
-        key = f"{src}->{dst}"
+        if not (source_variant or target_variant or context_prefix):
+            key = f"{src}->{dst}"
+        else:
+            key = f"{src}->{dst}:{source_variant}:{target_variant}:{context_prefix}"
         static = self._static_tokens.get(key)
-        if static is None:  # lazy, once per direction
+        if static is None:  # lazy, once per direction/variant
             prefix_text = self._tokenizer.apply_chat_template(
                 msgs[:-1], tokenize=False, add_generation_prompt=False
             )
@@ -880,7 +966,7 @@ class QwenCt2Engine(MtEngine):
         else:
             self.error = f"warmup probe degenerate: {reason}"
 
-    def translate_batch(self, items: list[tuple[str, str, str]]) -> list[MtResult]:
+    def translate_batch(self, items: list[tuple[str, ...]]) -> list[MtResult]:
         if self._fallback_engine is not None and self._fallback_engine.ready:
             return self._fallback_engine.translate_batch(items)
         if not self.ready:
@@ -889,12 +975,23 @@ class QwenCt2Engine(MtEngine):
             return []
 
         # Group items by translation direction while tracking original indices
-        groups: dict[str, list[tuple[int, str, str, str, list[str]]]] = {}
-        for idx, (text, src, dst) in enumerate(items):
-            key, static, per_req = self._split_prompt(text, src, dst)
-            groups.setdefault(key, []).append((idx, text, src, dst, per_req))
+        groups: dict[str, list[tuple[int, str, str, str, list[str], str, str, str]]] = {}
+        for idx, item in enumerate(items):
+            text, src, dst = item[0], item[1], item[2]
+            source_variant = item[3] if len(item) > 3 else ""
+            target_variant = item[4] if len(item) > 4 else ""
+            context_prefix = item[5] if len(item) > 5 else ""
+            key, static, per_req = self._split_prompt(
+                text, src, dst,
+                source_variant=source_variant,
+                target_variant=target_variant,
+                context_prefix=context_prefix,
+            )
+            groups.setdefault(key, []).append(
+                (idx, text, src, dst, per_req, source_variant, target_variant, context_prefix)
+            )
 
-        collected: list[tuple[int, Any, list[str], str, str, str]] = []
+        collected: list[tuple[int, Any, list[str], str, str, str, str, str, str]] = []
         started = time.perf_counter()
 
         for key, grp in groups.items():
@@ -903,6 +1000,9 @@ class QwenCt2Engine(MtEngine):
             group_items = [(item[1], item[2], item[3]) for item in grp]
             dyn_tokens = _estimate_dynamic_tokens(group_items, self.settings.mt_max_new_tokens, tokenizer=self._tokenizer)
 
+            # End tokens: <|im_end|> and <|endoftext|>.
+            # Note: "Ċ" (newline token) is deliberately omitted so multi-sentence continuations
+            # are not prematurely cut off during generation; first-line selection is done in post-decode.
             outputs = self._generator.generate_batch(
                 full_tokens_batch,
                 include_prompt_in_result=False,
@@ -911,14 +1011,14 @@ class QwenCt2Engine(MtEngine):
                 repetition_penalty=1.0,
                 end_token=["<|im_end|>", "<|endoftext|>"],
             )
-            for (idx, text, src, dst, per_req), out in zip(grp, outputs):
-                collected.append((idx, out, static + per_req, text, src, dst))
+            for (idx, text, src, dst, per_req, s_var, t_var, c_pre), out in zip(grp, outputs):
+                collected.append((idx, out, static + per_req, text, src, dst, s_var, t_var, c_pre))
 
         elapsed_ms = round((time.perf_counter() - started) * 1000.0, 2)
         collected.sort(key=lambda x: x[0])
 
         results: list[MtResult] = []
-        for _idx, output, full_prompt_tokens, text, _s, _d in collected:
+        for _idx, output, full_prompt_tokens, text, _s, _d, _s_var, _t_var, _c_pre in collected:
             if hasattr(output, "sequences_ids") and output.sequences_ids and output.sequences_ids[0]:
                 decoded_raw = self._tokenizer.decode(output.sequences_ids[0], skip_special_tokens=True)
             elif output.sequences and output.sequences[0]:
@@ -951,7 +1051,12 @@ class QwenCt2Engine(MtEngine):
                 self._metrics_incr("mt_retry")
                 if leak:
                     self._metrics_incr("mt_english_leak")
-                decoded = self._translate_single_retry(text, _s, _d)
+                decoded = self._translate_single_retry(
+                    text, _s, _d,
+                    source_variant=_s_var,
+                    target_variant=_t_var,
+                    context_prefix=_c_pre,
+                )
 
             hollow, reason = _hollow_check(decoded, text, target_lang=_d)
             if not hollow:
@@ -980,8 +1085,26 @@ class QwenCt2Engine(MtEngine):
             )
         return results
 
-    def _translate_single_retry(self, text: str, src: str, dst: str) -> str:
+    def _translate_single_retry(
+        self,
+        text: str,
+        src: str,
+        dst: str,
+        source_variant: str = "",
+        target_variant: str = "",
+        context_prefix: str = "",
+    ) -> str:
         messages = make_retry_translation_messages(text, src, dst)
+        extra_hints = _build_variant_hints(
+            (src or "").strip().lower().split("-")[0],
+            (dst or "").strip().lower().split("-")[0],
+            source_variant,
+            target_variant,
+        )
+        if extra_hints:
+            messages[0]["content"] += extra_hints
+        if (context_prefix or "").strip():
+            messages[-1]["content"] = f"[Context from preceding speech: {context_prefix.strip()}]\n\n{text}"
         prompt_text = self._tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         tokens = self._tokenizer.tokenize(prompt_text)
         dyn_tokens = _estimate_dynamic_tokens([(text, src, dst)], self.settings.mt_max_new_tokens, tokenizer=self._tokenizer)
@@ -1127,13 +1250,28 @@ class QwenVllmEngine(MtEngine):
             return self._fallback.ready
         return self._llm is not None
 
-    def _prompt(self, text: str, src: str, dst: str) -> str:
-        messages = make_translation_messages(text, src, dst)
+    def _prompt(
+        self,
+        text: str,
+        src: str,
+        dst: str,
+        source_variant: str = "",
+        target_variant: str = "",
+        context_prefix: str = "",
+    ) -> str:
+        messages = make_translation_messages(
+            text,
+            src,
+            dst,
+            source_variant=source_variant,
+            target_variant=target_variant,
+            context_prefix=context_prefix,
+        )
         return self._tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
 
-    def translate_batch(self, items: list[tuple[str, str, str]]) -> list[MtResult]:
+    def translate_batch(self, items: list[tuple[str, ...]]) -> list[MtResult]:
         if not self.ready:
             raise RuntimeError("MT model not loaded")
         if not items:
@@ -1142,7 +1280,17 @@ class QwenVllmEngine(MtEngine):
             return self._fallback.translate_batch(items)
         from vllm import SamplingParams
 
-        prompts = [self._prompt(t, s, d) for t, s, d in items]
+        prompts = [
+            self._prompt(
+                item[0],
+                item[1],
+                item[2],
+                source_variant=item[3] if len(item) > 3 else "",
+                target_variant=item[4] if len(item) > 4 else "",
+                context_prefix=item[5] if len(item) > 5 else "",
+            )
+            for item in items
+        ]
         dyn_tokens = _estimate_dynamic_tokens(items, self.settings.mt_max_new_tokens, tokenizer=self._tokenizer)
         sampling = SamplingParams(
             temperature=0.0,
@@ -1264,7 +1412,7 @@ class QwenHfEngine(MtEngine):
     def ready(self) -> bool:
         return self._model is not None and self._tokenizer is not None
 
-    def translate_batch(self, items: list[tuple[str, str, str]]) -> list[MtResult]:
+    def translate_batch(self, items: list[tuple[str, ...]]) -> list[MtResult]:
         import torch
 
         if not self.ready:
@@ -1273,8 +1421,19 @@ class QwenHfEngine(MtEngine):
             return []
 
         texts = []
-        for text, src, dst in items:
-            messages = make_translation_messages(text, src, dst)
+        for item in items:
+            text, src, dst = item[0], item[1], item[2]
+            source_variant = item[3] if len(item) > 3 else ""
+            target_variant = item[4] if len(item) > 4 else ""
+            context_prefix = item[5] if len(item) > 5 else ""
+            messages = make_translation_messages(
+                text,
+                src,
+                dst,
+                source_variant=source_variant,
+                target_variant=target_variant,
+                context_prefix=context_prefix,
+            )
             texts.append(
                 self._tokenizer.apply_chat_template(
                     messages, tokenize=False, add_generation_prompt=True

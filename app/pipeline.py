@@ -181,7 +181,12 @@ class Pipeline:
 
     # ---- text translation ---------------------------------------------
     async def translate_text(
-        self, text: str, source: str | None, target: str
+        self,
+        text: str,
+        source: str | None,
+        target: str,
+        source_variant: str = "",
+        target_variant: str = "",
     ) -> TranslationOutcome:
         wall_start = time.perf_counter()
         self.metrics.enter()
@@ -199,7 +204,9 @@ class Pipeline:
                     "(an engine given blank input returns a hallucination, not a blank)",
                     code="empty_text",
                 )
-            mt_result, mt_timing = await self._mt_sched.submit((text, src, dst))
+            mt_result, mt_timing = await self._mt_sched.submit(
+                (text, src, dst, source_variant, target_variant, "")
+            )
             total_ms = (time.perf_counter() - wall_start) * 1000.0
 
             self.metrics.observe_many(
@@ -257,6 +264,10 @@ class Pipeline:
         *,
         source: str | None,
         target: str,
+        source_variant: str = "",
+        target_variant: str = "",
+        context_prefix: str = "",
+        is_echo: Any = None,
         declared_format: str | None = None,
         input_sample_rate: int | None = None,
         channels: int = 1,
@@ -316,6 +327,26 @@ class Pipeline:
                     )
                 detected = normalised
 
+            if is_echo is not None and not asr_result.hollow and is_echo(asr_result.text):
+                self.metrics.incr("echo_dropped")
+                total_ms = (time.perf_counter() - wall_start) * 1000.0
+                return TranslationOutcome(
+                    original_text=asr_result.text,
+                    translated_text="",
+                    source_lang=detected,
+                    target_lang=dst,
+                    asr_ms=asr_result.asr_ms,
+                    mt_ms=0.0,
+                    total_server_ms=round(total_ms, 2),
+                    detail={
+                        "dropped": True,
+                        "drop_reason": "echo",
+                        "asr_ms": asr_result.asr_ms,
+                        "decode_ms": round(decode_ms, 2),
+                        "audio_seconds": decoded.duration_s,
+                    },
+                )
+
             if asr_result.hollow:
                 total_ms = (time.perf_counter() - wall_start) * 1000.0
                 self.metrics.incr("hollow_results")
@@ -374,7 +405,9 @@ class Pipeline:
                     },
                 )
 
-            mt_result, mt_timing = await self._mt_sched.submit((asr_result.text, detected, dst))
+            mt_result, mt_timing = await self._mt_sched.submit(
+                (asr_result.text, detected, dst, source_variant, target_variant, context_prefix)
+            )
             total_ms = (time.perf_counter() - wall_start) * 1000.0
 
             queue_ms = asr_timing["queue_wait_ms"] + mt_timing["queue_wait_ms"]
@@ -511,26 +544,15 @@ class Pipeline:
         *,
         source: str | None,
         target: str,
+        source_variant: str = "",
+        target_variant: str = "",
+        context_prefix: str = "",
+        is_echo: Any = None,
         declared_format: str | None = None,
         input_sample_rate: int | None = None,
         channels: int = 1,
     ) -> AsyncIterator[dict[str, Any]]:
-        """Yield one frame per sentence, then a final summary frame.
-
-        WHY: MEASURED in the existing app, waiting for the whole utterance
-        before any audio plays costs ~595 ms before the first audible word.
-        Emitting sentence 1 as soon as it is translated lets the earbuds start
-        speaking while sentences 2..n are still in flight.
-
-        WHAT THIS DOES NOT DO: it does not reduce `total_server_ms`. More,
-        smaller MT calls carry slightly MORE total overhead than one large
-        call. The gain is entirely in time-to-first-word, so that is reported
-        separately as `first_sentence_ms` and never folded into the total --
-        one figure covering both would hide which of them actually improved.
-
-        Single-sentence utterances take the unsplit path: there is nothing to
-        overlap, and splitting would add overhead for no benefit.
-        """
+        """Yield one frame per sentence, then a final summary frame."""
         wall_start = time.perf_counter()
         self.metrics.enter()
         try:
@@ -546,6 +568,16 @@ class Pipeline:
                 {"samples": decoded.samples, "language": None if src == "auto" else src}
             )
             detected = self._resolve_detected(src, asr_result)
+
+            if is_echo is not None and not asr_result.hollow and is_echo(asr_result.text):
+                self.metrics.incr("echo_dropped")
+                yield {
+                    "type": "dropped",
+                    "reason": "echo",
+                    "original_text": asr_result.text,
+                    "asr_ms": asr_result.asr_ms,
+                }
+                return
 
             # Hollow ASR: no transcript, so there is nothing to stream. Emit a
             # final frame saying so rather than an empty stream, which a client
@@ -563,6 +595,8 @@ class Pipeline:
                     "translated_text": "",
                     "source_lang": detected,
                     "target_lang": dst,
+                    "source_variant": source_variant or None,
+                    "target_variant": target_variant or None,
                     "asr_ms": asr_result.asr_ms,
                     "mt_ms": 0.0,
                     "total_server_ms": round(total_ms, 2),
@@ -605,7 +639,7 @@ class Pipeline:
                         # Sentence 0 is submitted and awaited immediately so Early Dispatch
                         # delivers the first speakable word without waiting for sentences 1..n!
                         mt_result, mt_timing = await self._mt_sched.submit(
-                            (sentence, detected, dst)
+                            (sentence, detected, dst, source_variant, target_variant, context_prefix)
                         )
                         piece, piece_ms = mt_result.text, mt_result.mt_ms
                         piece_hollow, piece_reason = mt_result.hollow, mt_result.hollow_reason
@@ -621,7 +655,11 @@ class Pipeline:
                         if len(sentences) > 1:
                             for s in sentences[1:]:
                                 mt_tasks.append(
-                                    asyncio.create_task(self._mt_sched.submit((s, detected, dst)))
+                                    asyncio.create_task(
+                                        self._mt_sched.submit(
+                                            (s, detected, dst, source_variant, target_variant, "")
+                                        )
+                                    )
                                 )
                     else:
                         task_idx = index - 1
@@ -664,6 +702,8 @@ class Pipeline:
                         "hollow_reason": piece_reason,
                         "retried": piece_retried,
                         "rtl": lang_mod.is_rtl(dst),
+                        "source_variant": source_variant or None,
+                        "target_variant": target_variant or None,
                     }
             finally:
                 # Task leak guard: cancel any remaining MT tasks if an exception or disconnect occurs
@@ -693,6 +733,8 @@ class Pipeline:
                 "translated_text": " ".join(t for t in translated if t).strip(),
                 "source_lang": detected,
                 "target_lang": dst,
+                "source_variant": source_variant or None,
+                "target_variant": target_variant or None,
                 "asr_ms": asr_result.asr_ms,
                 "mt_ms": round(mt_total_ms, 2),
                 "total_server_ms": round(total_ms, 2),

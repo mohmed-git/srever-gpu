@@ -12,7 +12,7 @@ NOT verified here — that needs a GPU and per-language test corpora.
 
 from __future__ import annotations
 
-from typing import Final
+from typing import Any, Final
 
 try:
     from faster_whisper.tokenizer import _LANGUAGE_CODES as _WHISPER_CODES
@@ -93,19 +93,53 @@ def is_rtl(code: str) -> bool:
     return code in RTL_CODES
 
 
+AR_VARIANTS: Final[list[dict[str, Any]]] = [
+    {"tag": "EG", "name": "مصري (Egyptian)", "native": "مصري", "asr": False, "mt": True, "tts_locales": ["ar-EG", "ar-XA", "ar"]},
+    {"tag": "SA", "name": "سعودي / خليجي (Saudi / Gulf)", "native": "سعودي", "asr": False, "mt": True, "tts_locales": ["ar-SA", "ar-XA", "ar"]},
+    {"tag": "AE", "name": "إماراتي (Emirati)", "native": "إماراتي", "asr": False, "mt": True, "tts_locales": ["ar-AE", "ar-XA", "ar"]},
+    {"tag": "LB", "name": "لبناني (Lebanese)", "native": "لبناني", "asr": False, "mt": True, "tts_locales": ["ar-LB", "ar-XA", "ar"]},
+    {"tag": "SY", "name": "سوري (Syrian)", "native": "سوري", "asr": False, "mt": True, "tts_locales": ["ar-SY", "ar-XA", "ar"]},
+    {"tag": "JO", "name": "أردني (Jordanian)", "native": "أردني", "asr": False, "mt": True, "tts_locales": ["ar-JO", "ar-XA", "ar"]},
+    {"tag": "PS", "name": "فلسطيني (Palestinian)", "native": "فلسطيني", "asr": False, "mt": True, "tts_locales": ["ar-PS", "ar-XA", "ar"]},
+    {"tag": "IQ", "name": "عراقي (Iraqi)", "native": "عراقي", "asr": False, "mt": True, "tts_locales": ["ar-IQ", "ar-XA", "ar"]},
+    {"tag": "MA", "name": "مغربي (Moroccan)", "native": "مغربي", "asr": False, "mt": True, "tts_locales": ["ar-MA", "ar-XA", "ar"]},
+    {"tag": "DZ", "name": "جزائري (Algerian)", "native": "جزائري", "asr": False, "mt": True, "tts_locales": ["ar-DZ", "ar-XA", "ar"]},
+    {"tag": "TN", "name": "تونسي (Tunisian)", "native": "تونسي", "asr": False, "mt": True, "tts_locales": ["ar-TN", "ar-XA", "ar"]},
+    {"tag": "YE", "name": "يمني (Yemeni)", "native": "يمني", "asr": False, "mt": True, "tts_locales": ["ar-YE", "ar-XA", "ar"]},
+    {"tag": "SD", "name": "سوداني (Sudanese)", "native": "سوداني", "asr": False, "mt": True, "tts_locales": ["ar-SD", "ar-XA", "ar"]},
+]
+
+
 def catalogue() -> list[dict[str, object]]:
     codes = sorted(MT_TARGET_CODES)
-    return [
-        {
+    out: list[dict[str, object]] = []
+    for c in codes:
+        entry: dict[str, object] = {
             "code": c,
             "name": name_of(c),
             "rtl": is_rtl(c),
             "asr": c in ASR_CODES,
             "mt_target": True,
         }
-        for c in codes
-    ]
+        if c == "ar":
+            entry["variants"] = AR_VARIANTS
+        out.append(entry)
+    return out
 
 
 ASR_LANGUAGE_COUNT: Final[int] = len(ASR_CODES)
 MT_LANGUAGE_COUNT: Final[int] = len(MT_TARGET_CODES)
+
+KNOWN_VARIANTS: Final[frozenset[str]] = frozenset({v["tag"] for v in AR_VARIANTS} | {"GB", "US", "419", "ES"})
+
+
+def normalise_variant(variant: str | None) -> str | None:
+    """Normalise BCP-47 variant/region subtag.
+    Returns uppercase tag if known; if unknown, returns None (logs handled at caller).
+    """
+    if not variant:
+        return None
+    v = str(variant).strip().upper()
+    if v in KNOWN_VARIANTS:
+        return v
+    return None
