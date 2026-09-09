@@ -112,6 +112,7 @@ def catalogue() -> list[dict[str, object]]:
         }
         if c == "ar":
             entry["variants"] = list(AR_VARIANTS)
+            entry["variant_role"] = "source"
         out.append(entry)
     return out
 

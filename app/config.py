@@ -166,6 +166,7 @@ class Settings:
     metrics_window: int = field(default_factory=lambda: _env_int("METRICS_WINDOW", 2048))
     log_level: str = field(default_factory=lambda: _env("LOG_LEVEL", "INFO"))
     warmup: bool = field(default_factory=lambda: _env_bool("WARMUP", True))
+    auth_token: str | None = field(default_factory=lambda: os.environ.get("AUTH_TOKEN") or None)
 
     # ------------------------------------------------------------------
     @property

@@ -102,10 +102,7 @@ def _build_variant_hints(
         var_tag = source_variant.strip().upper()
         name = _DIALECT_NAMES.get(var_tag, var_tag)
         hints.append(f"- The speaker uses {name} colloquial Arabic; interpret idioms accordingly.")
-    if (target_variant or "").strip() and dst_norm == "ar":
-        var_tag = target_variant.strip().upper()
-        name = _DIALECT_NAMES.get(var_tag, var_tag)
-        hints.append(f"- The listener prefers {name} colloquial Arabic; adapt the translation style accordingly.")
+    # Target Arabic is strictly Modern Standard Arabic (MSA). No listener colloquial hints are emitted.
     if hints:
         return "\n" + "\n".join(hints)
     return ""
@@ -154,24 +151,8 @@ def make_translation_messages(
             {"role": "assistant", "content": "أين محطة القطار؟"},
             {"role": "user", "content": "How are you?"},
             {"role": "assistant", "content": "كيف حالك؟"},
-            {"role": "user", "content": "The weather is nice today."},
-            {"role": "assistant", "content": "الطقس جميل اليوم."},
-            {"role": "user", "content": "I would like to order coffee please."},
-            {"role": "assistant", "content": "أود طلب قهوة من فضلك."},
-            {"role": "user", "content": "I am fine, thank you."},
-            {"role": "assistant", "content": "أنا بخير، شكراً لك."},
             {"role": "user", "content": "I am good, and you?"},
             {"role": "assistant", "content": "أنا بخير، وأنت؟"},
-            {"role": "user", "content": "and I am good and you"},
-            {"role": "assistant", "content": "وأنا بخير، وأنت؟"},
-            {"role": "user", "content": "I don't eat beef."},
-            {"role": "assistant", "content": "لا آكل لحم البقر."},
-            {"role": "user", "content": "I eat breakfast in the morning."},
-            {"role": "assistant", "content": "أتناول الفطور في الصباح."},
-            {"role": "user", "content": "Don't wait for tomorrow, start today."},
-            {"role": "assistant", "content": "لا تنتظر الغد، بل ابدأ اليوم."},
-            {"role": "user", "content": "Work hard, and stay humble."},
-            {"role": "assistant", "content": "اعمل بجد، وابقَ متواضعاً."},
             {"role": "user", "content": user_content},
         ]
     elif (src_norm == "ar") and (dst_norm == "en"):
@@ -195,16 +176,6 @@ def make_translation_messages(
             {"role": "assistant", "content": "How are you?"},
             {"role": "user", "content": "أنا بخير، وأنت؟"},
             {"role": "assistant", "content": "I am fine, and you?"},
-            {"role": "user", "content": "أنا بخير أنت؟"},
-            {"role": "assistant", "content": "I am fine, and you?"},
-            {"role": "user", "content": "الحمد لله، وأنت؟"},
-            {"role": "assistant", "content": "Praise be to God, and you?"},
-            {"role": "user", "content": "تمام، وإنت؟"},
-            {"role": "assistant", "content": "Great, and you?"},
-            {"role": "user", "content": "زين، وانت؟"},
-            {"role": "assistant", "content": "Good, and you?"},
-            {"role": "user", "content": "الطقس جميل اليوم."},
-            {"role": "assistant", "content": "The weather is nice today."},
             {"role": "user", "content": user_content},
         ]
     elif dst_norm == "ar":
@@ -940,6 +911,10 @@ class QwenCt2Engine(MtEngine):
         probe_res2 = self.translate_batch(probes)
         self.warmup_second_call_ms = round((time.perf_counter() - t1) * 1000.0, 2)
 
+        # Architectural decision: CTranslate2 generator does not maintain cross-request KV prefix cache
+        # in the Python Generator API. Static token prefix caching is implemented via _static_tokens
+        # (avoiding re-tokenization per request), while few-shot prompts are trimmed to 3 pairs to
+        # minimize prefill compute overhead.
         self.static_prompt_cached = False
         log.info(
             "QwenCt2Engine warmup: first=%.1fms, second=%.1fms",
@@ -1017,8 +992,10 @@ class QwenCt2Engine(MtEngine):
             dyn_tokens = _estimate_dynamic_tokens(group_items, self.settings.mt_max_new_tokens, tokenizer=self._tokenizer)
 
             # End tokens: <|im_end|> and <|endoftext|>.
-            # Note: "Ċ" (newline token) is deliberately omitted so multi-sentence continuations
-            # are not prematurely cut off during generation; first-line selection is done in post-decode.
+            # Architectural decision: "Ċ" (newline token) is deliberately omitted from end_token
+            # because with CT2 sequences_ids decoding, stopping on newline prematurely truncates
+            # multi-clause spoken sentences. Candidate line selection is handled cleanly post-decode,
+            # while <|im_end|> and <|endoftext|> indicate true turn completion.
             outputs = self._generator.generate_batch(
                 full_tokens_batch,
                 include_prompt_in_result=False,
@@ -1066,6 +1043,10 @@ class QwenCt2Engine(MtEngine):
             if not_translatable or low_script or leak or chatter:
                 retried = True
                 self._metrics_incr("mt_retry")
+                if chatter:
+                    global CHAT_LEAK_SUSPECTED_COUNT
+                    CHAT_LEAK_SUSPECTED_COUNT += 1
+                    self._metrics_incr("chat_leak_suspected")
                 if leak:
                     self._metrics_incr("mt_english_leak")
                 decoded = self._translate_single_retry(
@@ -1093,7 +1074,11 @@ class QwenCt2Engine(MtEngine):
                     backend=self.name,
                     model=self.model_path,
                     input_tokens=len(full_prompt_tokens),
-                    output_tokens=len(output.sequences[0]) if output.sequences else 0,
+                    output_tokens=(
+                        len(output.sequences_ids[0])
+                        if getattr(output, "sequences_ids", None)
+                        else (len(output.sequences[0]) if getattr(output, "sequences", None) else 0)
+                    ),
                     batch_size=len(items),
                     hollow=hollow,
                     hollow_reason=reason,
@@ -1131,6 +1116,7 @@ class QwenCt2Engine(MtEngine):
             max_length=dyn_tokens,
             sampling_topk=1,
             repetition_penalty=1.0,
+            # Architectural decision: "Ċ" omitted to avoid truncating multi-clause speech; handled post-decode.
             end_token=["<|im_end|>", "<|endoftext|>"],
         )
         if not outputs:

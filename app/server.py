@@ -125,7 +125,17 @@ class TranslateRequest(BaseModel):
 
 
 @app.post("/translate")
-async def translate(req: TranslateRequest) -> JSONResponse:
+async def translate(req: TranslateRequest, request: Request) -> JSONResponse:
+    if SETTINGS.auth_token:
+        auth_header = request.headers.get("authorization", "")
+        token = ""
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
+        if token != SETTINGS.auth_token:
+            return JSONResponse(
+                status_code=401,
+                content={"error": "unauthorized", "detail": "invalid or missing bearer token"},
+            )
     if PIPELINE is None or not PIPELINE.ready:
         return JSONResponse(
             status_code=503,
@@ -332,6 +342,16 @@ class _StreamState:
     def record_committed(self, utt_id: int) -> None:
         self.committed_utts.append(utt_id)
 
+    def append_tts_output(self, text: str | None) -> None:
+        if not text:
+            return
+        t = str(text).strip()
+        if not t:
+            return
+        if self.recent_tts_outputs and self.recent_tts_outputs[-1] == t:
+            return
+        self.recent_tts_outputs.append(t)
+
     async def send_json(self, data: dict[str, Any]) -> None:
         if self.closed:
             return
@@ -362,11 +382,10 @@ class _StreamState:
                 log.info("variant_unknown: %s", raw_v)
             self.source_variant = norm_v
         if "target_variant" in message:
-            raw_v = message["target_variant"]
-            norm_v = lang_mod.normalise_variant(raw_v)
-            if raw_v and not norm_v:
-                log.info("variant_unknown: %s", raw_v)
-            self.target_variant = norm_v
+            raw_v = (message.get("target_variant") or "").strip()
+            if raw_v:
+                log.warning("target_variant_ignored: %s (target Arabic is strictly Modern Standard Arabic)", raw_v)
+            self.target_variant = ""
         if "format" in message and message["format"]:
             self.audio_format = str(message["format"]).strip().lower()
         if "sample_rate" in message and message["sample_rate"]:
@@ -755,7 +774,15 @@ async def _commit_slot(state: _StreamState, slot: _Slot, seq: int) -> None:
         if during_ratio >= 0.5 and is_echo_match(orig_text, state.recent_tts_outputs):
             if pipeline is not None:
                 pipeline.metrics.incr("echo_dropped")
-            await state.send_json({"event": "dropped", "type": "dropped", "utt": utt_id, "reason": "echo"})
+            await state.send_json({
+                "event": "dropped",
+                "type": "dropped",
+                "utt": utt_id,
+                "utterance": utt_id,
+                "reason": "echo",
+                "mode": "HIT",
+                "echo_dropped": True,
+            })
             return
 
         if pipeline is not None:
@@ -903,7 +930,7 @@ async def _on_control_frame(state: _StreamState, control: dict[str, Any]) -> Non
     if action == "played":
         text_val = control.get("text")
         if text_val:
-            state.recent_tts_outputs.append(str(text_val))
+            state.append_tts_output(str(text_val))
         await state.send_json({"event": "played_ack", "utt": control.get("utt")})
         return
 
@@ -995,7 +1022,7 @@ async def _on_control_frame(state: _StreamState, control: dict[str, Any]) -> Non
             "source": state.source,
             "target": state.target,
             "source_variant": state.source_variant,
-            "target_variant": state.target_variant,
+            "target_variant": None,
             "format": state.audio_format,
             "sample_rate": state.sample_rate,
             "channels": state.channels,
@@ -1196,8 +1223,19 @@ async def _on_audio_frame(state: _StreamState, chunk: bytes) -> None:
 
 @app.websocket("/ws/v1/translate-stream")
 async def translate_stream(websocket: WebSocket) -> None:
-    await websocket.accept()
     settings = SETTINGS
+    if settings.auth_token:
+        auth_header = websocket.headers.get("authorization", "")
+        token = ""
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
+        if not token:
+            token = websocket.query_params.get("token", "").strip()
+        if token != settings.auth_token:
+            await websocket.close(code=4001, reason="Unauthorized")
+            return
+
+    await websocket.accept()
 
     if PIPELINE is None or not PIPELINE.ready:
         await websocket.send_json(
@@ -1399,7 +1437,15 @@ async def _utterance_worker(state: _StreamState) -> None:
                 if during_ratio >= 0.5 and is_echo_match(final_frame.get("original_text", ""), state.recent_tts_outputs):
                     if PIPELINE is not None:
                         PIPELINE.metrics.incr("echo_dropped")
-                    await state.send_json({"event": "dropped", "type": "dropped", "utt": utt_id, "utterance": utt_id, "reason": "echo"})
+                    await state.send_json({
+                        "event": "dropped",
+                        "type": "dropped",
+                        "utt": utt_id,
+                        "utterance": utt_id,
+                        "reason": "echo",
+                        "mode": "HIT",
+                        "echo_dropped": True,
+                    })
                     continue
 
                 c2f_ms = (time.perf_counter() - commit_time) * 1000.0
@@ -1411,6 +1457,11 @@ async def _utterance_worker(state: _StreamState) -> None:
                     await state.send_json({**sf, "utterance": utt_id, "utt": utt_id})
 
                 final_copy = dict(final_frame)
+                final_copy["mode"] = "HIT"
+                final_copy["echo_dropped"] = False
+                final_copy["retried"] = final_copy.get("retried", False)
+                final_copy["hollow_reason"] = final_copy.get("hollow_reason", None)
+                final_copy["total_server_ms"] = round(c2f_ms, 2)
                 final_copy["tentative_hit"] = True
                 final_copy["time_saved_ms"] = round(tentative_pass_ms, 2)
                 if PIPELINE is not None:
@@ -1419,7 +1470,7 @@ async def _utterance_worker(state: _StreamState) -> None:
                 await state.send_json({**final_copy, "utterance": utt_id, "utt": utt_id})
 
                 if final_copy.get("translated_text"):
-                    state.recent_tts_outputs.append(final_copy["translated_text"])
+                    state.append_tts_output(final_copy["translated_text"])
                 state.last_commit_time = commit_time
                 src_text = final_copy.get("original_text", "")
                 state.last_committed_src_text = src_text
@@ -1440,7 +1491,15 @@ async def _utterance_worker(state: _StreamState) -> None:
                     if during_ratio >= 0.5 and is_echo_match(final_frame.get("original_text", ""), state.recent_tts_outputs):
                         if PIPELINE is not None:
                             PIPELINE.metrics.incr("echo_dropped")
-                        await state.send_json({"event": "dropped", "type": "dropped", "utt": utt_id, "utterance": utt_id, "reason": "echo"})
+                        await state.send_json({
+                            "event": "dropped",
+                            "type": "dropped",
+                            "utt": utt_id,
+                            "utterance": utt_id,
+                            "reason": "echo",
+                            "mode": "AWAIT",
+                            "echo_dropped": True,
+                        })
                         continue
 
                     c2f_ms = (time.perf_counter() - commit_time) * 1000.0
@@ -1452,6 +1511,11 @@ async def _utterance_worker(state: _StreamState) -> None:
                         await state.send_json({**sf, "utterance": utt_id, "utt": utt_id})
 
                     final_copy = dict(final_frame)
+                    final_copy["mode"] = "AWAIT"
+                    final_copy["echo_dropped"] = False
+                    final_copy["retried"] = final_copy.get("retried", False)
+                    final_copy["hollow_reason"] = final_copy.get("hollow_reason", None)
+                    final_copy["total_server_ms"] = round(c2f_ms, 2)
                     final_copy["tentative_hit"] = True
                     final_copy["time_saved_ms"] = round(tentative_pass_ms, 2)
                     if PIPELINE is not None:
@@ -1460,7 +1524,7 @@ async def _utterance_worker(state: _StreamState) -> None:
                     await state.send_json({**final_copy, "utterance": utt_id, "utt": utt_id})
 
                     if final_copy.get("translated_text"):
-                        state.recent_tts_outputs.append(final_copy["translated_text"])
+                        state.append_tts_output(final_copy["translated_text"])
                     state.last_commit_time = commit_time
                     src_text = final_copy.get("original_text", "")
                     state.last_committed_src_text = src_text
@@ -1588,10 +1652,16 @@ async def _handle_utterance_payload(
             "reason": outcome.detail.get("drop_reason", "echo"),
             "original_text": outcome.original_text,
             "asr_ms": outcome.asr_ms,
+            "mode": "MISS",
+            "echo_dropped": True,
         })
         return
 
     out_payload = outcome.to_json()
+    out_payload["mode"] = "MISS"
+    out_payload["echo_dropped"] = False
+    out_payload["retried"] = outcome.detail.get("retried", False) if outcome.detail else False
+    out_payload["hollow_reason"] = outcome.detail.get("hollow_reason", None) if outcome.detail else None
     if effective_src_var:
         out_payload["source_variant"] = effective_src_var
     if effective_tgt_var:
@@ -1601,7 +1671,7 @@ async def _handle_utterance_payload(
     await state.send_json({**out_payload, "utterance": utt_tag, "utt": utt_tag})
 
     if out_payload.get("translated_text"):
-        state.recent_tts_outputs.append(out_payload["translated_text"])
+        state.append_tts_output(out_payload["translated_text"])
     state.last_commit_time = time.perf_counter()
     src_text = out_payload.get("original_text", "")
     state.last_committed_src_text = src_text
@@ -1652,17 +1722,25 @@ async def _stream_utterance(
                     "reason": frame.get("reason", "echo"),
                     "original_text": frame.get("original_text", ""),
                     "asr_ms": frame.get("asr_ms", 0.0),
+                    "mode": "MISS",
+                    "echo_dropped": True,
                 })
                 return
 
             if frame.get("type") == "sentence" and frame.get("translated_text"):
-                state.recent_tts_outputs.append(frame["translated_text"])
+                state.append_tts_output(frame["translated_text"])
 
             if frame.get("type") == "final":
                 if ver_fields:
                     frame = {**frame, **ver_fields}
+                frame["mode"] = "MISS"
+                frame["echo_dropped"] = False
+                if "retried" not in frame:
+                    frame["retried"] = False
+                if "hollow_reason" not in frame:
+                    frame["hollow_reason"] = None
                 if frame.get("translated_text"):
-                    state.recent_tts_outputs.append(frame["translated_text"])
+                    state.append_tts_output(frame["translated_text"])
                 state.last_commit_time = time.perf_counter()
                 src_text = frame.get("original_text", "")
                 state.last_committed_src_text = src_text

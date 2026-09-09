@@ -784,6 +784,264 @@ class TestIncidentFixesAsync(unittest.IsolatedAsyncioTestCase):
         state.apply({"target": "en"})
         self.assertEqual(len(state.mt_cache), 0, "mt_cache must be cleared when target language changes")
 
+    # ---- T13b: HIT path echo dropped ---------------------------------------
+    async def test_t13b_s8_hit_path_echo_dropped(self):
+        """T13b: HIT path must drop tentative result if text matches recent TTS and during_ratio >= 0.5."""
+        settings = Settings(sample_rate=16000)
+        ws = DummyWebSocket()
+        state = _StreamState(settings, ws)
+        state.protocol_version = 2
+        state.target = "en"
+        state.append_tts_output("Bonjour tout le monde")
+
+        metrics = Metrics()
+        pipeline = SimpleNamespace(metrics=metrics, ready=True)
+        app.server.PIPELINE = pipeline
+
+        try:
+            slot = _Slot(utt_id=1, source="fr", target="en")
+            slot.during_playback_frames = 4
+            slot.total_frames = 4
+            slot.tentative_seq = 1
+            slot.tentative_result = (
+                [],
+                {"original_text": "Bonjour tout le monde", "translated_text": "Hello world", "asr_ms": 12.0, "mt_ms": 8.0},
+                20.0,
+            )
+            state.slots[1] = slot
+
+            from app.server import _commit_slot
+            await _commit_slot(state, slot, seq=1)
+
+            self.assertEqual(metrics.counter("echo_dropped"), 1, "echo_dropped must increment on HIT path echo match")
+            self.assertTrue(state.utterance_queue.empty(), "utterance_queue must be empty (dropped before queuing)")
+            dropped = [m for m in ws.sent_json if m.get("event") == "dropped"]
+            self.assertEqual(len(dropped), 1)
+            self.assertEqual(dropped[0]["mode"], "HIT")
+            self.assertTrue(dropped[0]["echo_dropped"])
+        finally:
+            app.server.PIPELINE = None
+
+    # ---- T14b: HIT path barge-in passes and ratio gate verification --------
+    async def test_t14b_s8_hit_path_barge_in_passes_and_ratio_gate(self):
+        """T14b: HIT path human barge-in must pass when text differs, and during_ratio < 0.5 must NOT drop."""
+        settings = Settings(sample_rate=16000)
+        ws = DummyWebSocket()
+        state = _StreamState(settings, ws)
+        state.protocol_version = 2
+        state.target = "en"
+        state.append_tts_output("Bonjour tout le monde")
+
+        metrics = Metrics()
+        pipeline = SimpleNamespace(metrics=metrics, ready=True)
+        app.server.PIPELINE = pipeline
+
+        try:
+            # Case 1: text differs (human barge-in), during_ratio = 1.0 (>= 0.5)
+            slot = _Slot(utt_id=1, source="fr", target="en")
+            slot.during_playback_frames = 4
+            slot.total_frames = 4
+            slot.tentative_seq = 1
+            slot.tentative_result = (
+                [],
+                {"original_text": "Quelle heure est-il?", "translated_text": "What time is it?", "asr_ms": 12.0, "mt_ms": 8.0},
+                20.0,
+            )
+            state.slots[1] = slot
+
+            from app.server import _commit_slot
+            await _commit_slot(state, slot, seq=1)
+
+            self.assertEqual(metrics.counter("echo_dropped"), 0, "Human barge-in must NOT be dropped")
+            self.assertEqual(metrics.counter("tentative_hit"), 1)
+            item = await state.utterance_queue.get()
+            self.assertEqual(item[0], "serve_cached")
+
+            # Case 2: text matches echo, BUT during_ratio < 0.5 (1 frame out of 4 = 0.25 < 0.5)
+            # Gate assertion: if during_ratio gate is sabotaged to 0.0, this case would erroneously drop!
+            slot2 = _Slot(utt_id=2, source="fr", target="en")
+            slot2.during_playback_frames = 1
+            slot2.total_frames = 4
+            slot2.tentative_seq = 1
+            slot2.tentative_result = (
+                [],
+                {"original_text": "Bonjour tout le monde", "translated_text": "Hello world", "asr_ms": 12.0, "mt_ms": 8.0},
+                20.0,
+            )
+            state.slots[2] = slot2
+            await _commit_slot(state, slot2, seq=1)
+
+            self.assertEqual(metrics.counter("echo_dropped"), 0, "during_ratio < 0.5 must NOT be dropped by echo filter")
+            self.assertEqual(metrics.counter("tentative_hit"), 2)
+            item2 = await state.utterance_queue.get()
+            self.assertEqual(item2[0], "serve_cached")
+        finally:
+            app.server.PIPELINE = None
+
+    # ---- T13c: AWAIT path echo dropped -------------------------------------
+    async def test_t13c_s8_await_path_echo_dropped(self):
+        """T13c: AWAIT path must drop completed tentative result if text matches echo and during_ratio >= 0.5."""
+        settings = Settings(sample_rate=16000)
+        ws = DummyWebSocket()
+        state = _StreamState(settings, ws)
+        state.protocol_version = 2
+        state.target = "en"
+        state.append_tts_output("Bonjour tout le monde")
+
+        metrics = Metrics()
+        pipeline = SimpleNamespace(metrics=metrics, ready=True)
+        app.server.PIPELINE = pipeline
+
+        try:
+            slot = _Slot(utt_id=1, source="fr", target="en")
+            slot.during_playback_frames = 4
+            slot.total_frames = 4
+            slot.tentative_seq = 1
+
+            async def mock_tentative():
+                await asyncio.sleep(0.01)
+                slot.tentative_result = (
+                    [],
+                    {"original_text": "Bonjour tout le monde", "translated_text": "Hello world", "asr_ms": 12.0, "mt_ms": 8.0},
+                    20.0,
+                )
+
+            slot.tentative_task = asyncio.create_task(mock_tentative())
+            state.slots[1] = slot
+
+            from app.server import _commit_slot
+            await _commit_slot(state, slot, seq=1)
+
+            self.assertEqual(metrics.counter("tentative_await"), 1)
+            item = await state.utterance_queue.get()
+            self.assertEqual(item[0], "await_then_serve")
+
+            # Run worker on await_then_serve
+            state.utterance_queue.put_nowait(item)
+            state.worker_task = asyncio.create_task(app.server._utterance_worker(state))
+            await asyncio.sleep(0.05)
+            state.worker_task.cancel()
+            try:
+                await state.worker_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+            self.assertEqual(metrics.counter("echo_dropped"), 1, "AWAIT path must drop echo when completed")
+            dropped = [m for m in ws.sent_json if m.get("event") == "dropped"]
+            self.assertEqual(len(dropped), 1)
+            self.assertEqual(dropped[0]["mode"], "AWAIT")
+            self.assertTrue(dropped[0]["echo_dropped"])
+        finally:
+            app.server.PIPELINE = None
+
+    # ---- T15: Target Arabic strictly Modern Standard Arabic (MSA) ----------
+    def test_t15_target_arabic_locked_to_msa(self):
+        """T15: Target Arabic must strictly be Modern Standard Arabic (MSA).
+        make_translation_messages must never emit listener colloquial hints for Arabic targets."""
+        for src in ["en", "fr", "es"]:
+            for variant in ["EG", "SA", "SY", "DZ", "MA", "AE", "KW", "QA", "OM", "BH", "IQ", "YE", "SD"]:
+                msgs = make_translation_messages("Hello", src, "ar", target_variant=variant)
+                sys_content = msgs[0]["content"]
+                self.assertNotIn("colloquial", sys_content.lower())
+                self.assertNotIn("prefers", sys_content.lower())
+                self.assertNotIn("listener", sys_content.lower())
+                self.assertIn("Modern Standard Arabic", sys_content)
+
+    # ---- T16: Wire config target_variant ignored & ack null ----------------
+    async def test_t16_wire_target_variant_ignored(self):
+        """T16: Wire config with target_variant must ignore it, store '', and ack target_variant as None (null in JSON)."""
+        ws = DummyWebSocket()
+        settings = Settings()
+        state = _StreamState(settings, ws)
+        await _on_control_frame(state, {"action": "config", "source": "en", "target": "ar", "target_variant": "EG"})
+        self.assertEqual(state.target_variant, "")
+        config_acks = [m for m in ws.sent_json if m.get("event") == "config"]
+        self.assertGreater(len(config_acks), 0)
+        self.assertIsNone(config_acks[-1]["target_variant"], "config ack must echo target_variant: None (null in JSON)")
+
+    # ---- T-chatter-integration: Chatter refusal triggers retry in translate_batch
+    def test_chatter_integration_retry(self):
+        """Integration test: conversational chatter in generate_batch triggers retry in translate_batch."""
+        from app.mt import QwenCt2Engine
+        import app.mt as mt_mod
+        settings = Settings()
+        engine = QwenCt2Engine(settings)
+        engine._tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct")
+        engine._generator = MagicMock()
+        engine._generator.generate_batch = MagicMock()
+
+        # First call: chatter refusal. Second call: valid translation.
+        chatty_seq = [SimpleNamespace(sequences_ids=[engine._tokenizer.encode("I'm sorry, but I cannot translate that without more context.")])]
+        valid_seq = [SimpleNamespace(sequences_ids=[engine._tokenizer.encode("Where is the train station?")])]
+
+        engine._generator.generate_batch.side_effect = [chatty_seq, valid_seq]
+
+        initial_count = mt_mod.CHAT_LEAK_SUSPECTED_COUNT
+        # ar -> en: target is English, so english_leak and low_script are FALSE; ONLY chatter triggers retry!
+        results = engine.translate_batch([("أين محطة القطار؟", "ar", "en")])
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].text, "Where is the train station?")
+        self.assertTrue(results[0].retried, "Must mark retried=True on chatter recovery")
+        self.assertGreater(mt_mod.CHAT_LEAK_SUSPECTED_COUNT, initial_count, "Chatter count must increment")
+
+    # ---- Deduplicate recent_tts_outputs ------------------------------------
+    def test_deduplicate_recent_tts_outputs(self):
+        """_StreamState.append_tts_output must deduplicate repeated identical consecutive phrases."""
+        ws = DummyWebSocket()
+        settings = Settings()
+        state = _StreamState(settings, ws)
+        state.append_tts_output("Hello world")
+        state.append_tts_output("Hello world")
+        state.append_tts_output("  Hello world  ")
+        state.append_tts_output("How are you?")
+        state.append_tts_output("How are you?")
+        self.assertEqual(list(state.recent_tts_outputs), ["Hello world", "How are you?"])
+
+    # ---- Bearer Token Authentication ---------------------------------------
+    async def test_bearer_token_auth(self):
+        """When auth_token is set, WebSocket and REST /translate require valid bearer or query token."""
+        from fastapi.testclient import TestClient
+        import app.server as server_mod
+
+        orig_token = server_mod.SETTINGS.auth_token
+        orig_pipe = server_mod.PIPELINE
+        try:
+            object.__setattr__(server_mod.SETTINGS, "auth_token", "secret-token-123")
+            server_mod.PIPELINE = SimpleNamespace(ready=True, metrics=Metrics())
+            client = TestClient(server_mod.app)
+
+            # REST /translate without auth -> 401
+            res = client.post("/translate", json={"text": "hi", "source": "en", "target": "ar"})
+            self.assertEqual(res.status_code, 401)
+            self.assertIn("unauthorized", res.json()["error"])
+
+            # REST /translate with invalid auth -> 401
+            res = client.post(
+                "/translate",
+                json={"text": "hi", "source": "en", "target": "ar"},
+                headers={"Authorization": "Bearer wrong-token"},
+            )
+            self.assertEqual(res.status_code, 401)
+
+            # WebSocket without auth -> rejected
+            with self.assertRaises(Exception):
+                with client.websocket_connect("/ws/v1/translate-stream") as ws:
+                    pass
+
+            # WebSocket with valid query token -> connects
+            with client.websocket_connect("/ws/v1/translate-stream?token=secret-token-123") as ws:
+                msg = ws.receive_json()
+                self.assertEqual(msg.get("event"), "ready")
+
+            # WebSocket with valid header -> connects
+            with client.websocket_connect("/ws/v1/translate-stream", headers={"Authorization": "Bearer secret-token-123"}) as ws:
+                msg = ws.receive_json()
+                self.assertEqual(msg.get("event"), "ready")
+        finally:
+            object.__setattr__(server_mod.SETTINGS, "auth_token", orig_token)
+            server_mod.PIPELINE = orig_pipe
+
 
 if __name__ == "__main__":
     unittest.main()
+
