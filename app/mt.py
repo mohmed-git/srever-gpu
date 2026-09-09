@@ -180,6 +180,7 @@ def make_translation_messages(
             "CRITICAL RULES:\n"
             "- You are a TRANSLATION ENGINE, NOT a conversational partner.\n"
             "- NEVER answer questions or converse with the user.\n"
+            "- NEVER say 'I am sorry', 'please provide context', or apologize. If an input word is incomplete or fragmented, translate it literally or output nothing.\n"
             "- NEVER omit, drop, or summarize any part of the spoken Arabic sentence.\n"
             "- If the input contains a compound statement and question (e.g. 'أنا بخير، وأنت؟'), translate BOTH parts fully: 'I am fine, and you?'. NEVER drop the statement!\n"
             "- If the input is a question ('كيف حالك؟'), translate the question itself ('How are you?'). NEVER answer it!\n"
@@ -489,6 +490,19 @@ def _low_target_script(text: str, target_lang: str) -> bool:
     return _script_ratio(text, target_lang) < _LOW_SCRIPT_RATIO
 
 
+_CHATTER_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
+    re.compile(r"^\s*(?:i['’]?m\s+sorry|sorry|as\s+an\s+ai|i\s+cannot\s+translate|please\s+provide|could\s+you\s+please)\b", re.IGNORECASE),
+    re.compile(r"\b(?:input\s+is\s+incomplete|provide\s+more\s+context|what\s+you\s+would\s+like\s+me\s+to\s+translate)\b", re.IGNORECASE),
+)
+
+
+def _is_conversational_chatter(text: str) -> bool:
+    """True when the model outputs conversational meta-talk or apologies instead of translating."""
+    if not text:
+        return False
+    return any(bool(p.search(text)) for p in _CHATTER_PATTERNS)
+
+
 def _hollow_check(text: str, source_text: str, target_lang: str = "") -> tuple[bool, str | None]:
     """An empty translation is a failure, not a fast success."""
     if not is_translatable(source_text):
@@ -498,6 +512,8 @@ def _hollow_check(text: str, source_text: str, target_lang: str = "") -> tuple[b
         )
     if not is_translatable(text):
         return True, f"translation contains no word characters: {text!r}"
+    if _is_conversational_chatter(text):
+        return True, f"conversational chatter detected: {text!r}"
     return False, None
 
 
@@ -1046,7 +1062,8 @@ class QwenCt2Engine(MtEngine):
             leak = _english_leak(decoded, _d)
             low_script = _low_target_script(decoded, _d)
             not_translatable = not is_translatable(decoded)
-            if not_translatable or low_script or leak:
+            chatter = _is_conversational_chatter(decoded)
+            if not_translatable or low_script or leak or chatter:
                 retried = True
                 self._metrics_incr("mt_retry")
                 if leak:

@@ -192,10 +192,17 @@ _CONTROL_KEYS = {
 }
 
 
-def norm_hash(text: str) -> str:
-    """Normalized hash for sentence caching in mt_cache."""
+def norm_hash(
+    text: str,
+    source: str = "",
+    target: str = "",
+    source_variant: str = "",
+    target_variant: str = "",
+) -> str:
+    """Normalized hash for sentence caching in mt_cache, scoped to translation pair."""
     cleaned = " ".join(text.strip().lower().split())
-    return hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:16]
+    key = f"{source}:{target}:{source_variant}:{target_variant}:{cleaned}"
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
 
 
 def is_echo_match(asr_text: str, recent_tts_outputs: deque[str] | list[str]) -> bool:
@@ -342,6 +349,8 @@ class _StreamState:
     def apply(self, message: dict[str, Any]) -> None:
         if "source" in message or "target" in message:
             self.verify_lang_next = True
+        if any(k in message for k in ("source", "target", "source_variant", "target_variant")):
+            self.mt_cache.clear()
         if "source" in message:
             self.source = str(message["source"]) if message["source"] is not None else None
         if "target" in message:
@@ -486,8 +495,10 @@ async def _run_tentative(state: _StreamState, slot: _Slot, seq: int) -> None:
 
         uncached: list[str] = []
         presplit_hits = 0
+        s_var = slot.source_variant or state.source_variant or ""
+        t_var = slot.target_variant or state.target_variant or ""
         for s in sentences:
-            h = norm_hash(s)
+            h = norm_hash(s, detected, dst, s_var, t_var)
             if state.cache_get(h) is not None:
                 presplit_hits += 1
             else:
@@ -503,14 +514,14 @@ async def _run_tentative(state: _StreamState, slot: _Slot, seq: int) -> None:
         if uncached and not passthrough:
             mt_jobs = [
                 pipeline._mt_sched.submit(
-                    (s, detected, dst, slot.source_variant or "", slot.target_variant or "", ""),
+                    (s, detected, dst, s_var, t_var, ""),
                     priority=1,
                 )
                 for s in uncached
             ]
             mt_outcomes = await asyncio.gather(*mt_jobs)
             for s, (res, _) in zip(uncached, mt_outcomes):
-                state.cache_put(norm_hash(s), res)
+                state.cache_put(norm_hash(s, detected, dst, s_var, t_var), res)
 
         sentence_frames: list[dict[str, Any]] = []
         translated_pieces: list[str] = []
@@ -524,7 +535,7 @@ async def _run_tentative(state: _StreamState, slot: _Slot, seq: int) -> None:
                 piece_hollow, piece_reason = False, None
                 mt_backend, out_tokens = None, None
             else:
-                mt_res = state.cache_get(norm_hash(s))
+                mt_res = state.cache_get(norm_hash(s, detected, dst, s_var, t_var))
                 if mt_res:
                     piece = mt_res.text
                     piece_ms = mt_res.mt_ms
@@ -677,8 +688,10 @@ async def _run_partial(state: _StreamState, slot: _Slot, seq: int) -> None:
             candidate_sents = list(split.sentences)
             if len(candidate_sents) > 1:
                 closed = candidate_sents[:-1]
+                cs_s_var = slot.source_variant or state.source_variant or ""
+                cs_t_var = slot.target_variant or state.target_variant or ""
                 for cs in closed:
-                    h = norm_hash(cs)
+                    h = norm_hash(cs, detected, tgt, cs_s_var, cs_t_var)
                     if state.cache_get(h) is None:
                         try:
                             mt_res, _ = await pipeline._mt_sched.submit(
@@ -686,8 +699,8 @@ async def _run_partial(state: _StreamState, slot: _Slot, seq: int) -> None:
                                     cs,
                                     detected,
                                     tgt,
-                                    slot.source_variant or state.source_variant or "",
-                                    slot.target_variant or state.target_variant or "",
+                                    cs_s_var,
+                                    cs_t_var,
                                     "",
                                 ),
                                 priority=2,

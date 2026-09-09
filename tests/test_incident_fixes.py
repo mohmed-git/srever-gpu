@@ -753,6 +753,37 @@ class TestIncidentFixesAsync(unittest.IsolatedAsyncioTestCase):
         finally:
             app.server.PIPELINE = None
 
+    # ---- Chatter refusal detection & hollow suppression -------------------
+    def test_conversational_chatter_detection(self):
+        from app.mt import _is_conversational_chatter, _hollow_check
+        chatty = "I'm sorry, but your input is incomplete. Could you please provide more context or finish the"
+        self.assertTrue(_is_conversational_chatter(chatty))
+        self.assertTrue(_is_conversational_chatter("As an AI, I cannot translate this."))
+        self.assertTrue(_is_conversational_chatter("Sorry, please provide more context"))
+        self.assertFalse(_is_conversational_chatter("Hello, how are you?"))
+        self.assertFalse(_is_conversational_chatter("Where is the train station?"))
+
+        hollow, reason = _hollow_check(chatty, "مرحمن", target_lang="en")
+        self.assertTrue(hollow, "Conversational chatter must be marked hollow")
+        self.assertIn("conversational chatter", reason)
+
+    # ---- Sentence cache language & variant isolation ----------------------
+    def test_norm_hash_language_isolation(self):
+        from app.server import norm_hash, _StreamState
+        h_es = norm_hash("مرحبا كيف حالك؟", source="ar", target="es")
+        h_en = norm_hash("مرحبا كيف حالك؟", source="ar", target="en")
+        h_ca = norm_hash("مرحبا كيف حالك؟", source="ar", target="ca")
+        self.assertNotEqual(h_es, h_en, "Hashes for different target languages must differ")
+        self.assertNotEqual(h_es, h_ca, "Hashes for different target languages must differ")
+
+        # Test cache clearance on apply()
+        ws = DummyWebSocket()
+        settings = Settings()
+        state = _StreamState(settings, ws)
+        state.mt_cache["key1"] = "val1"
+        state.apply({"target": "en"})
+        self.assertEqual(len(state.mt_cache), 0, "mt_cache must be cleared when target language changes")
+
 
 if __name__ == "__main__":
     unittest.main()
