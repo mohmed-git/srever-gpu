@@ -1041,6 +1041,48 @@ class TestIncidentFixesAsync(unittest.IsolatedAsyncioTestCase):
             object.__setattr__(server_mod.SETTINGS, "auth_token", orig_token)
             server_mod.PIPELINE = orig_pipe
 
+    # ---- Multi-dialect: all 13 dialects prompt and invariants test --------
+    def test_all_13_dialects_prompt_and_invariants(self):
+        """Verify prompt construction, few-shot conditioning, and MSA invariants
+        across all 13 regional Arabic dialects."""
+        from app.languages import AR_VARIANTS
+        from app.mt import _DIALECT_NAMES, _DIALECT_FAMILIES, _DIALECT_FEW_SHOTS
+
+        self.assertEqual(len(AR_VARIANTS), 13)
+        for code in AR_VARIANTS:
+            self.assertIn(code, _DIALECT_NAMES)
+            self.assertIn(code, _DIALECT_FAMILIES)
+            name, family = _DIALECT_FAMILIES[code]
+            self.assertIn(family, _DIALECT_FEW_SHOTS)
+
+            # 1. ar -> en dialect prompt & few-shots
+            msgs_en = make_translation_messages("جملة عامية", "ar", "en", source_variant=code)
+            sys_en = msgs_en[0]["content"]
+            self.assertIn(f"The speaker uses {name} colloquial Arabic; interpret idioms accordingly.", sys_en)
+            self.assertIn("specialized in regional colloquial dialects", sys_en)
+            self.assertIn("بدري", sys_en)
+            self.assertNotIn("strict, literal", sys_en)
+
+            expected_shots = _DIALECT_FEW_SHOTS[family]
+            user_shots = [m["content"] for m in msgs_en if m["role"] == "user"]
+            self.assertIn(expected_shots[0][0], user_shots)
+
+            # 2. ar -> fr dialect prompt
+            msgs_fr = make_translation_messages("جملة عامية", "ar", "fr", source_variant=code)
+            sys_fr = msgs_fr[0]["content"]
+            self.assertIn(f"The speaker uses {name} colloquial Arabic; interpret idioms accordingly.", sys_fr)
+            self.assertIn("specialized in regional colloquial dialects", sys_fr)
+
+            # 3. target Arabic strictly MSA
+            msgs_tgt = make_translation_messages("Hello", "en", "ar", target_variant=code)
+            sys_tgt = msgs_tgt[0]["content"]
+            self.assertIn("Modern Standard Arabic", sys_tgt)
+            self.assertNotIn("colloquial", sys_tgt.lower())
+
+        # Empty variant -> MSA default
+        msgs_msa = make_translation_messages("كيف حالك", "ar", "en", source_variant="")
+        self.assertIn("strict, literal", msgs_msa[0]["content"])
+
 
 if __name__ == "__main__":
     unittest.main()

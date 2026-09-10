@@ -90,6 +90,55 @@ _DIALECT_NAMES: Final[dict[str, str]] = {
     "SD": "Sudanese",
 }
 
+_DIALECT_FAMILIES: Final[dict[str, tuple[str, str]]] = {
+    "EG": ("Egyptian", "egyptian"),
+    "SA": ("Saudi / Gulf", "gulf"),
+    "AE": ("Emirati", "gulf"),
+    "LB": ("Levantine (Lebanese)", "levantine"),
+    "SY": ("Levantine (Syrian)", "levantine"),
+    "JO": ("Levantine (Jordanian)", "levantine"),
+    "PS": ("Levantine (Palestinian)", "levantine"),
+    "IQ": ("Iraqi", "iraqi"),
+    "MA": ("Moroccan (Darija)", "maghrebi"),
+    "DZ": ("Algerian", "maghrebi"),
+    "TN": ("Tunisian", "maghrebi"),
+    "YE": ("Yemeni", "gulf"),
+    "SD": ("Sudanese", "sudanese"),
+}
+
+_DIALECT_FEW_SHOTS: Final[dict[str, list[tuple[str, str]]]] = {
+    "gulf": [
+        ("أبشرك كل الأمور تمام ومخلصين بدري.", "Good news: everything is great and we finished early."),
+        ("وين رايح الحين؟", "Where are you going right now?"),
+        ("تخيل نحاول نخلص الشغل قبل الظهر.", "Just imagine, we are trying to finish work before noon."),
+    ],
+    "egyptian": [
+        ("عامل إيه يا فندم؟ إحنا مخلصين الشغل بدري النهاردة.", "How are you doing sir? We finished work early today."),
+        ("أنت رايح فين دلوقتي؟", "Where are you going right now?"),
+        ("عايزين نخلص الموضوع ده بسرعة.", "We want to finish this matter quickly."),
+    ],
+    "levantine": [
+        ("كيفك اليوم؟ بدي قلك إنو مخلصين بكير وهلأ رايحين.", "How are you today? I want to tell you we finished early and now we are leaving."),
+        ("وين رايح هلأ؟", "Where are you going right now?"),
+        ("عم نجرب نخلص الشغل بسرعة.", "We are trying to finish the work quickly."),
+    ],
+    "iraqi": [
+        ("شلونك عيوني؟ أبشرك كملنا شغلنا بدري وهسه طالعين.", "How are you my dear? Good news: we finished our work early and now we are leaving."),
+        ("وين رايح هسه؟", "Where are you going right now?"),
+        ("نريد نخلص الشغل هواية بسرعة.", "We want to finish the work very quickly."),
+    ],
+    "maghrebi": [
+        ("لاباس عليك؟ راه سالينا الخدمة بدري ودابا غاديين.", "How are you doing? We finished work early and now we are leaving."),
+        ("فين غادي دابا؟", "Where are you going right now?"),
+        ("بخينا نكملو هاد الشي بزاف مزيان.", "We want to complete this thing very well."),
+    ],
+    "sudanese": [
+        ("كيفنك يا غالي؟ أبشرك خلصنا بدري وهسع ماشين.", "How are you my dear? Good news: we finished early and now we are leaving."),
+        ("ماشي وين هسع؟", "Where are you going right now?"),
+        ("دايرين نخلص الشغل ده سريع شديد.", "We want to finish this work very quickly."),
+    ],
+}
+
 
 def _build_variant_hints(
     src_norm: str,
@@ -156,28 +205,52 @@ def make_translation_messages(
             {"role": "user", "content": user_content},
         ]
     elif (src_norm == "ar") and (dst_norm == "en"):
-        system_content = (
-            f"You are a strict, literal real-time Arabic-to-English translation engine for live spoken conversation.\n"
-            "CRITICAL RULES:\n"
-            "- You are a TRANSLATION ENGINE, NOT a conversational partner.\n"
-            "- NEVER answer questions or converse with the user.\n"
-            "- NEVER say 'I am sorry', 'please provide context', or apologize. If an input word is incomplete or fragmented, translate it literally or output nothing.\n"
-            "- NEVER omit, drop, or summarize any part of the spoken Arabic sentence.\n"
-            "- If the input contains a compound statement and question (e.g. 'أنا بخير، وأنت؟'), translate BOTH parts fully: 'I am fine, and you?'. NEVER drop the statement!\n"
-            "- If the input is a question ('كيف حالك؟'), translate the question itself ('How are you?'). NEVER answer it!\n"
-            "- Output ONLY the direct English translation with no notes, explanations, or quotes."
-            f"{extra_hints}"
-        )
-        return [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": "أين محطة القطار؟"},
-            {"role": "assistant", "content": "Where is the train station?"},
-            {"role": "user", "content": "كيف حالك؟"},
-            {"role": "assistant", "content": "How are you?"},
-            {"role": "user", "content": "أنا بخير، وأنت؟"},
-            {"role": "assistant", "content": "I am fine, and you?"},
-            {"role": "user", "content": user_content},
-        ]
+        var_tag = (source_variant or "").strip().upper()
+        if var_tag and var_tag in _DIALECT_NAMES:
+            name, family = _DIALECT_FAMILIES.get(var_tag, (_DIALECT_NAMES[var_tag], "gulf"))
+            system_content = (
+                f"You are an expert real-time spoken Arabic-to-English translation engine specialized in regional colloquial dialects.\n"
+                "CRITICAL RULES:\n"
+                "- You are a TRANSLATION ENGINE, NOT a conversational partner.\n"
+                "- NEVER answer questions or converse with the user.\n"
+                "- NEVER say 'I am sorry', 'please provide context', or apologize. If an input word is incomplete or fragmented, translate it as accurately as possible.\n"
+                "- NEVER omit, drop, or summarize any part of the spoken Arabic sentence.\n"
+                f"- The speaker uses {name} colloquial Arabic; interpret idioms accordingly.\n"
+                f"- Interpret spoken colloquial idioms, regional vocabulary, and conversational discourse markers naturally according to their communicative intent in spoken dialog, rather than literal word-for-word root substitution.\n"
+                "- Translate regional adverbs and time words accurately: never drop or omit words such as 'بدري' (early), 'الحين / دلوقتي / هلأ / هسه / دابا' (now), 'وايد / كتير / أوي / بزاف' (a lot / very).\n"
+                "- Conversational discourse markers express pragmatic intent: 'أبشرك' means reassurance ('Good news:' / 'I'm pleased to tell you'); 'أبشر / سم' mean willing agreement ('with pleasure' / 'gladly' / 'consider it done'); 'ما عليك' means 'don't worry'; 'تخيل' means 'Just imagine'.\n"
+                "- Output ONLY the direct English translation with no notes, explanations, or quotes."
+            )
+            shots = _DIALECT_FEW_SHOTS.get(family, _DIALECT_FEW_SHOTS["gulf"])
+            messages = [{"role": "system", "content": system_content}]
+            for u, a in shots:
+                messages.append({"role": "user", "content": u})
+                messages.append({"role": "assistant", "content": a})
+            messages.append({"role": "user", "content": user_content})
+            return messages
+        else:
+            system_content = (
+                f"You are a strict, literal real-time Arabic-to-English translation engine for live spoken conversation.\n"
+                "CRITICAL RULES:\n"
+                "- You are a TRANSLATION ENGINE, NOT a conversational partner.\n"
+                "- NEVER answer questions or converse with the user.\n"
+                "- NEVER say 'I am sorry', 'please provide context', or apologize. If an input word is incomplete or fragmented, translate it literally or output nothing.\n"
+                "- NEVER omit, drop, or summarize any part of the spoken Arabic sentence.\n"
+                "- If the input contains a compound statement and question (e.g. 'أنا بخير، وأنت؟'), translate BOTH parts fully: 'I am fine, and you?'. NEVER drop the statement!\n"
+                "- If the input is a question ('كيف حالك؟'), translate the question itself ('How are you?'). NEVER answer it!\n"
+                "- Output ONLY the direct English translation with no notes, explanations, or quotes."
+                f"{extra_hints}"
+            )
+            return [
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": "أين محطة القطار؟"},
+                {"role": "assistant", "content": "Where is the train station?"},
+                {"role": "user", "content": "كيف حالك؟"},
+                {"role": "assistant", "content": "How are you?"},
+                {"role": "user", "content": "أنا بخير، وأنت؟"},
+                {"role": "assistant", "content": "I am fine, and you?"},
+                {"role": "user", "content": user_content},
+            ]
     elif dst_norm == "ar":
         system_content = (
             f"You are a strict, literal real-time {src_name}-to-Arabic translation engine for live spoken conversation.\n"
@@ -194,16 +267,31 @@ def make_translation_messages(
             {"role": "user", "content": user_content},
         ]
     elif src_norm == "ar":
-        system_content = (
-            f"You are a strict, literal real-time Arabic-to-{dst_name} translation engine for live spoken conversation.\n"
-            "CRITICAL RULES:\n"
-            "- You are a TRANSLATION ENGINE, NOT a conversational partner.\n"
-            "- NEVER answer questions or converse with the user.\n"
-            "- NEVER omit, drop, or summarize any part of the spoken sentence.\n"
-            f"- Output MUST be entirely in {dst_name}.\n"
-            f"- Output ONLY the direct {dst_name} translation without preamble, notes, or quotes."
-            f"{extra_hints}"
-        )
+        var_tag = (source_variant or "").strip().upper()
+        if var_tag and var_tag in _DIALECT_NAMES:
+            name, _ = _DIALECT_FAMILIES.get(var_tag, (_DIALECT_NAMES[var_tag], "gulf"))
+            system_content = (
+                f"You are an expert real-time spoken Arabic-to-{dst_name} translation engine specialized in regional colloquial dialects.\n"
+                "CRITICAL RULES:\n"
+                "- You are a TRANSLATION ENGINE, NOT a conversational partner.\n"
+                "- NEVER answer questions or converse with the user.\n"
+                "- NEVER omit, drop, or summarize any part of the spoken sentence.\n"
+                f"- The speaker uses {name} colloquial Arabic; interpret idioms accordingly.\n"
+                f"- Interpret spoken colloquial idioms and regional vocabulary naturally according to communicative intent in spoken conversation.\n"
+                f"- Output MUST be entirely in {dst_name}.\n"
+                f"- Output ONLY the direct {dst_name} translation without preamble, notes, or quotes."
+            )
+        else:
+            system_content = (
+                f"You are a strict, literal real-time Arabic-to-{dst_name} translation engine for live spoken conversation.\n"
+                "CRITICAL RULES:\n"
+                "- You are a TRANSLATION ENGINE, NOT a conversational partner.\n"
+                "- NEVER answer questions or converse with the user.\n"
+                "- NEVER omit, drop, or summarize any part of the spoken sentence.\n"
+                f"- Output MUST be entirely in {dst_name}.\n"
+                f"- Output ONLY the direct {dst_name} translation without preamble, notes, or quotes."
+                f"{extra_hints}"
+            )
         return [
             {"role": "system", "content": system_content},
             {"role": "user", "content": user_content},

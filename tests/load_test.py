@@ -18,6 +18,7 @@ missing it.
 from __future__ import annotations
 
 import asyncio
+import os
 import statistics as stats
 import sys
 import time
@@ -27,6 +28,7 @@ import httpx
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8080"
 CONCURRENCY = int(sys.argv[2]) if len(sys.argv) > 2 else 16
 TOTAL = int(sys.argv[3]) if len(sys.argv) > 3 else 64
+AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "")
 
 PHRASES = [
     ("Where is the nearest pharmacy?", "en", "ar"),
@@ -104,7 +106,8 @@ async def main() -> int:
     print(f"requests    : {TOTAL}\n")
 
     sem = asyncio.Semaphore(CONCURRENCY)
-    async with httpx.AsyncClient() as client:
+    default_headers = {"Authorization": f"Bearer {AUTH_TOKEN}"} if AUTH_TOKEN else {}
+    async with httpx.AsyncClient(headers=default_headers) as client:
         wall_start = time.perf_counter()
         results = await asyncio.gather(*(one(client, i, sem) for i in range(TOTAL)))
         wall_s = time.perf_counter() - wall_start

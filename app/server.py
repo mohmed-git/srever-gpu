@@ -30,6 +30,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 from . import languages as lang_mod
+from . import mt as mt_mod
 from .config import SETTINGS, Settings
 from .metrics import resource_report
 from .pipeline import Pipeline, RequestError
@@ -378,7 +379,10 @@ class _StreamState:
         if "source_variant" in message:
             raw_v = message["source_variant"]
             norm_v = lang_mod.normalise_variant(raw_v)
-            if raw_v and not norm_v:
+            if norm_v:
+                dialect_name = mt_mod._DIALECT_NAMES.get(norm_v, norm_v)
+                log.info("Dialect configured: code=%s, name=%s (raw=%r)", norm_v, dialect_name, raw_v)
+            elif raw_v:
                 log.info("variant_unknown: %s", raw_v)
             self.source_variant = norm_v
         if "target_variant" in message:
@@ -1230,6 +1234,7 @@ async def translate_stream(websocket: WebSocket) -> None:
         if auth_header.lower().startswith("bearer "):
             token = auth_header[7:].strip()
         if not token:
+            # TODO(prod): header-only (query params appear in access/proxy logs)
             token = websocket.query_params.get("token", "").strip()
         if token != settings.auth_token:
             await websocket.close(code=4001, reason="Unauthorized")
@@ -1669,11 +1674,22 @@ async def _handle_utterance_payload(
     ver_fields = await _verify_pinned_language(PIPELINE, state, raw, effective_src)
     out_payload.update(ver_fields)
     await state.send_json({**out_payload, "utterance": utt_tag, "utt": utt_tag})
+    src_text = out_payload.get("original_text", "")
+    mt_text = out_payload.get("translated_text", "")
+    log.info(
+        "Utterance committed [utt=%s]: %s[%s] -> %s | src=%r -> mt=%r | server_ms=%.1f",
+        utt_tag,
+        out_payload.get("source_lang"),
+        out_payload.get("source_variant") or "none",
+        out_payload.get("target_lang"),
+        src_text,
+        mt_text,
+        out_payload.get("total_server_ms", 0.0),
+    )
 
     if out_payload.get("translated_text"):
         state.append_tts_output(out_payload["translated_text"])
     state.last_commit_time = time.perf_counter()
-    src_text = out_payload.get("original_text", "")
     state.last_committed_src_text = src_text
     state.last_has_terminal_punct = bool(src_text.rstrip() and src_text.rstrip()[-1] in _TERMINATORS)
 
@@ -1747,6 +1763,17 @@ async def _stream_utterance(
                 state.last_has_terminal_punct = bool(src_text.rstrip() and src_text.rstrip()[-1] in _TERMINATORS)
 
             await state.send_json({**frame, "utterance": utt_tag, "utt": utt_tag})
+            if frame.get("type") == "final":
+                log.info(
+                    "Utterance streamed final [utt=%s]: %s[%s] -> %s | src=%r -> mt=%r | server_ms=%.1f",
+                    utt_tag,
+                    frame.get("source_lang"),
+                    frame.get("source_variant") or "none",
+                    frame.get("target_lang"),
+                    src_text,
+                    frame.get("translated_text", ""),
+                    frame.get("total_server_ms", 0.0),
+                )
             frames += 1
         return
     except Overloaded as exc:
