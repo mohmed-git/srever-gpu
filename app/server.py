@@ -503,6 +503,8 @@ async def _run_tentative(state: _StreamState, slot: _Slot, seq: int) -> None:
                 "seq": seq,
                 "terminal": False,
                 "hollow": True,
+                "hollow_reason": asr_result.hollow_reason,
+                "rms_dbfs": asr_result.rms_dbfs,
             })
             return
 
@@ -514,6 +516,7 @@ async def _run_tentative(state: _StreamState, slot: _Slot, seq: int) -> None:
             "terminal": terminal,
             "original_text": asr_result.text,
             "asr_ms": asr_result.asr_ms,
+            "rms_dbfs": asr_result.rms_dbfs,
         })
 
         if not dst:
@@ -646,6 +649,7 @@ async def _run_tentative(state: _StreamState, slot: _Slot, seq: int) -> None:
             "first_sentence_within_budget": (first_sent_elapsed is not None and first_sent_elapsed <= state.settings.latency_budget_ms),
             "latency_budget_ms": state.settings.latency_budget_ms,
             "rtl": lang_mod.is_rtl(dst),
+            "rms_dbfs": asr_result.rms_dbfs,
             "tentative_hit": None,
             "time_saved_ms": None,
             "presplit_hits": presplit_hits,
@@ -1478,6 +1482,7 @@ async def _utterance_worker(state: _StreamState) -> None:
                 final_copy["echo_dropped"] = False
                 final_copy["retried"] = final_copy.get("retried", False)
                 final_copy["hollow_reason"] = final_copy.get("hollow_reason", None)
+                final_copy["rms_dbfs"] = final_copy.get("rms_dbfs", None)
                 final_copy["total_server_ms"] = round(c2f_ms, 2)
                 final_copy["tentative_hit"] = True
                 final_copy["time_saved_ms"] = round(tentative_pass_ms, 2)
@@ -1532,6 +1537,7 @@ async def _utterance_worker(state: _StreamState) -> None:
                     final_copy["echo_dropped"] = False
                     final_copy["retried"] = final_copy.get("retried", False)
                     final_copy["hollow_reason"] = final_copy.get("hollow_reason", None)
+                    final_copy["rms_dbfs"] = final_copy.get("rms_dbfs", None)
                     final_copy["total_server_ms"] = round(c2f_ms, 2)
                     final_copy["tentative_hit"] = True
                     final_copy["time_saved_ms"] = round(tentative_pass_ms, 2)
@@ -1669,6 +1675,7 @@ async def _handle_utterance_payload(
             "reason": outcome.detail.get("drop_reason", "echo"),
             "original_text": outcome.original_text,
             "asr_ms": outcome.asr_ms,
+            "rms_dbfs": outcome.detail.get("rms_dbfs", None) if outcome.detail else None,
             "mode": "MISS",
             "echo_dropped": True,
         })
@@ -1679,6 +1686,7 @@ async def _handle_utterance_payload(
     out_payload["echo_dropped"] = False
     out_payload["retried"] = outcome.detail.get("retried", False) if outcome.detail else False
     out_payload["hollow_reason"] = outcome.detail.get("hollow_reason", None) if outcome.detail else None
+    out_payload["rms_dbfs"] = outcome.detail.get("rms_dbfs", None) if outcome.detail else None
     if effective_src_var:
         out_payload["source_variant"] = effective_src_var
     if effective_tgt_var:
@@ -1689,13 +1697,14 @@ async def _handle_utterance_payload(
     src_text = out_payload.get("original_text", "")
     mt_text = out_payload.get("translated_text", "")
     log.info(
-        "Utterance committed [utt=%s]: %s[%s] -> %s | src=%r -> mt=%r | server_ms=%.1f",
+        "Utterance committed [utt=%s]: %s[%s] -> %s | src=%r -> mt=%r | rms_dbfs=%s | server_ms=%.1f",
         utt_tag,
         out_payload.get("source_lang"),
         out_payload.get("source_variant") or "none",
         out_payload.get("target_lang"),
         src_text,
         mt_text,
+        out_payload.get("rms_dbfs"),
         out_payload.get("total_server_ms", 0.0),
     )
 
@@ -1767,6 +1776,8 @@ async def _stream_utterance(
                     frame["retried"] = False
                 if "hollow_reason" not in frame:
                     frame["hollow_reason"] = None
+                if "rms_dbfs" not in frame:
+                    frame["rms_dbfs"] = None
                 if frame.get("translated_text"):
                     state.append_tts_output(frame["translated_text"])
                 state.last_commit_time = time.perf_counter()
@@ -1777,13 +1788,14 @@ async def _stream_utterance(
             await state.send_json({**frame, "utterance": utt_tag, "utt": utt_tag})
             if frame.get("type") == "final":
                 log.info(
-                    "Utterance streamed final [utt=%s]: %s[%s] -> %s | src=%r -> mt=%r | server_ms=%.1f",
+                    "Utterance streamed final [utt=%s]: %s[%s] -> %s | src=%r -> mt=%r | rms_dbfs=%s | server_ms=%.1f",
                     utt_tag,
                     frame.get("source_lang"),
                     frame.get("source_variant") or "none",
                     frame.get("target_lang"),
                     src_text,
                     frame.get("translated_text", ""),
+                    frame.get("rms_dbfs"),
                     frame.get("total_server_ms", 0.0),
                 )
             frames += 1

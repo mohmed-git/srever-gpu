@@ -1063,7 +1063,7 @@ class TestIncidentFixesAsync(unittest.IsolatedAsyncioTestCase):
             if code in {"YE", "SD"}:
                 # Unvalidated families fall back to plain hint line without few-shots
                 self.assertIn("strict, literal", sys_en)
-                self.assertEqual(len(msgs_en), 8)
+                self.assertEqual(len(msgs_en), 2)
             else:
                 self.assertIn("specialized in regional colloquial dialects", sys_en)
                 self.assertIn("بدري", sys_en)
@@ -1132,6 +1132,56 @@ class TestIncidentFixesAsync(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res.text, "Thank you", "T19: legitimate 'Thank you' with no_speech_prob=0.1 must be kept")
         self.assertFalse(res.hollow)
 
+    def test_t18b_rule1_isolated(self):
+        """T18b: Isolating Rule 1 (nsp > 0.85).
+        4 words ('here are four words'), duration 2.5s (> 1.5s), logprob -0.3 (> -1.0).
+        Rule 2 does NOT trigger (duration >= 1.5 and words > 2).
+        Rule 3 does NOT trigger (logprob > -1.0).
+        Only Rule 1 can drop it. Removing Rule 1 (mutation n) must cause this test to fail."""
+        settings = Settings()
+        engine = AsrEngine(settings)
+        engine._model = MagicMock()
+
+        audible_audio = np.ones(int(16000 * 2.5), dtype=np.float32) * 0.05
+        seg = SimpleNamespace(
+            text="here are four words",
+            start=0.0,
+            end=2.5,
+            no_speech_prob=0.90,
+            avg_logprob=-0.3,
+            compression_ratio=1.0,
+        )
+        engine._model.transcribe.return_value = ([seg], SimpleNamespace(language="en", language_probability=0.95))
+        res = engine.transcribe(audible_audio, language="en")
+        self.assertEqual(res.text, "", "T18b: Rule 1 must drop nsp=0.90 even on multi-word 2.5s segment")
+        self.assertTrue(res.hollow)
+        self.assertIn("hallucination guard", res.hollow_reason)
+
+    def test_t18c_rule2_isolated(self):
+        """T18c: Isolating Rule 2 (nsp > 0.5 and duration < 1.5 and word_count <= 2).
+        1 word ('you'), duration 0.8s (< 1.5s), nsp=0.60 (<= 0.85), logprob -0.3 (> -1.0).
+        Rule 1 does NOT trigger (nsp <= 0.85).
+        Rule 3 does NOT trigger (logprob > -1.0).
+        Only Rule 2 can drop it. Removing Rule 2 (mutation o) must cause this test to fail."""
+        settings = Settings()
+        engine = AsrEngine(settings)
+        engine._model = MagicMock()
+
+        audible_audio = np.ones(int(16000 * 0.8), dtype=np.float32) * 0.05
+        seg = SimpleNamespace(
+            text="you",
+            start=0.0,
+            end=0.8,
+            no_speech_prob=0.60,
+            avg_logprob=-0.3,
+            compression_ratio=1.0,
+        )
+        engine._model.transcribe.return_value = ([seg], SimpleNamespace(language="en", language_probability=0.95))
+        res = engine.transcribe(audible_audio, language="en")
+        self.assertEqual(res.text, "", "T18c: Rule 2 must drop short low-word segment with nsp=0.60")
+        self.assertTrue(res.hollow)
+        self.assertIn("hallucination guard", res.hollow_reason)
+
     def test_silence_energy_gate_catches_silence_before_whisper(self):
         """RMS energy gate catches dead mic / room silence (rms_dbfs < -45) at 0ms before Whisper."""
         settings = Settings()
@@ -1146,23 +1196,74 @@ class TestIncidentFixesAsync(unittest.IsolatedAsyncioTestCase):
         # Whisper model must NOT have been called at all!
         engine._model.transcribe.assert_not_called()
 
-    def test_sabotage_remove_no_speech_prob_rule_fails_t18(self):
-        """Sabotage 1: Removing no_speech_prob > 0.85 rule would allow confident 'you' to leak."""
+    def test_rms_dbfs_in_asr_result_and_gate(self):
+        """Verify rms_dbfs is computed and returned on both silent and audible audio."""
+        settings = Settings()
+        engine = AsrEngine(settings)
+        engine._model = MagicMock()
+
+        # Silence: rms_dbfs < -45
+        silent_pcm = np.zeros(16000, dtype=np.float32)
+        res_silent = engine.transcribe(silent_pcm, language="en")
+        self.assertIsNotNone(res_silent.rms_dbfs)
+        self.assertLess(res_silent.rms_dbfs, -45.0)
+
+        # Audible: rms_dbfs >= -45
+        audible_pcm = np.ones(16000, dtype=np.float32) * 0.05
+        engine._model.transcribe.return_value = ([], SimpleNamespace(language="en", language_probability=0.98))
+        res_audible = engine.transcribe(audible_pcm, language="en")
+        self.assertIsNotNone(res_audible.rms_dbfs)
+        self.assertGreater(res_audible.rms_dbfs, -45.0)
+
+    def test_silero_vad_parameters_pinned(self):
+        """Pin the 4 Silero VAD parameters to prevent regression (mutation q)."""
+        from app.asr import SILERO_VAD_PARAMETERS
+        self.assertEqual(SILERO_VAD_PARAMETERS["threshold"], 0.5)
+        self.assertEqual(SILERO_VAD_PARAMETERS["min_speech_duration_ms"], 150)
+        self.assertEqual(SILERO_VAD_PARAMETERS["min_silence_duration_ms"], 300)
+        self.assertEqual(SILERO_VAD_PARAMETERS["speech_pad_ms"], 100)
+
+        # Also verify that transcribe passes these exact parameters to Whisper
+        settings = Settings()
+        engine = AsrEngine(settings)
+        engine._model = MagicMock()
+        audible_audio = np.ones(16000, dtype=np.float32) * 0.05
+        engine._model.transcribe.return_value = ([], SimpleNamespace(language="en", language_probability=0.98))
+        engine.transcribe(audible_audio, language="en")
+        call_kwargs = engine._model.transcribe.call_args.kwargs
+        self.assertEqual(call_kwargs.get("vad_parameters"), {
+            "threshold": 0.5,
+            "min_speech_duration_ms": 150,
+            "min_silence_duration_ms": 300,
+            "speech_pad_ms": 100,
+        })
+
+    def test_ye_sd_variant_message_count_pinned(self):
+        """YE and SD must return exactly 2 messages (system prompt with hint line, user text)."""
+        for variant in ["YE", "SD"]:
+            messages = make_translation_messages("أين محطة القطار؟", "ar", "en", source_variant=variant)
+            self.assertEqual(len(messages), 2, f"Variant {variant} must have exactly 2 messages (no few-shots)")
+            self.assertEqual(messages[0]["role"], "system")
+            self.assertEqual(messages[1]["role"], "user")
+            self.assertIn("colloquial Arabic", messages[0]["content"])
+
+    def test_guard_regression_no_speech_prob_arithmetic(self):
+        """Guard regression: Old AND condition fails to catch T18."""
         no_speech_prob = 0.90
         avg_logprob = -0.3  # > -1.0
         # The old AND condition: (no_speech_prob > 0.6 and avg_logprob < -1.0)
         old_condition_would_drop = (no_speech_prob > 0.6 and avg_logprob < -1.0)
-        self.assertFalse(old_condition_would_drop, "Sabotage: old AND condition fails to catch T18!")
+        self.assertFalse(old_condition_would_drop, "Regression: old AND condition fails to catch T18!")
 
-    def test_sabotage_word_blocklist_fails_t19(self):
-        """Sabotage 2: Adding 'thank you' to a static word blocklist would drop legitimate speech."""
+    def test_guard_regression_no_common_words_in_blocklists(self):
+        """Guard regression: Common conversational words must NOT be in any static word blocklist."""
         from app.asr import _EN_HALLUCINATION_BLOCKLIST, _AR_HALLUCINATION_BLOCKLIST
         lower_en = {x.lower() for x in _EN_HALLUCINATION_BLOCKLIST}
-        self.assertNotIn("thank you", lower_en, "Sabotage: 'thank you' must NOT be in blocklist")
-        self.assertNotIn("thanks", lower_en, "Sabotage: 'thanks' must NOT be in blocklist")
-        self.assertNotIn("you", lower_en, "Sabotage: 'you' must NOT be in blocklist")
-        self.assertNotIn("شكرا", _AR_HALLUCINATION_BLOCKLIST, "Sabotage: 'شكرا' must NOT be in blocklist")
-        self.assertNotIn("أنت", _AR_HALLUCINATION_BLOCKLIST, "Sabotage: 'أنت' must NOT be in blocklist")
+        self.assertNotIn("thank you", lower_en, "Regression: 'thank you' must NOT be in blocklist")
+        self.assertNotIn("thanks", lower_en, "Regression: 'thanks' must NOT be in blocklist")
+        self.assertNotIn("you", lower_en, "Regression: 'you' must NOT be in blocklist")
+        self.assertNotIn("شكرا", _AR_HALLUCINATION_BLOCKLIST, "Regression: 'شكرا' must NOT be in blocklist")
+        self.assertNotIn("أنت", _AR_HALLUCINATION_BLOCKLIST, "Regression: 'أنت' must NOT be in blocklist")
 
     def test_cache_clearing_idempotent_on_repeated_config(self):
         """Repeated config frames with same dialect/languages must NOT flush mt_cache."""

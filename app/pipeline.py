@@ -344,6 +344,7 @@ class Pipeline:
                         "asr_ms": asr_result.asr_ms,
                         "decode_ms": round(decode_ms, 2),
                         "audio_seconds": decoded.duration_s,
+                        "rms_dbfs": asr_result.rms_dbfs,
                     },
                 )
 
@@ -378,6 +379,7 @@ class Pipeline:
                         "queue_ms": asr_timing["queue_wait_ms"],
                         "within_budget": total_ms <= self.settings.latency_budget_ms,
                         "latency_budget_ms": self.settings.latency_budget_ms,
+                        "rms_dbfs": asr_result.rms_dbfs,
                     },
                 )
 
@@ -408,6 +410,7 @@ class Pipeline:
                         "within_budget": total_ms <= self.settings.latency_budget_ms,
                         "latency_budget_ms": self.settings.latency_budget_ms,
                         "rtl": lang_mod.is_rtl(dst),
+                        "rms_dbfs": asr_result.rms_dbfs,
                     },
                 )
 
@@ -470,6 +473,7 @@ class Pipeline:
                     "within_budget": total_ms <= self.settings.latency_budget_ms,
                     "latency_budget_ms": self.settings.latency_budget_ms,
                     "rtl": lang_mod.is_rtl(dst),
+                    "rms_dbfs": asr_result.rms_dbfs,
                 },
             )
         except Overloaded:
@@ -614,6 +618,7 @@ class Pipeline:
                     ),
                     "hollow": True,
                     "hollow_reason": asr_result.hollow_reason,
+                    "rms_dbfs": asr_result.rms_dbfs,
                 }
                 return
 
@@ -787,6 +792,7 @@ class Pipeline:
                 ),
                 "latency_budget_ms": self.settings.latency_budget_ms,
                 "rtl": lang_mod.is_rtl(dst),
+                "rms_dbfs": asr_result.rms_dbfs,
             }
         except Overloaded:
             self.metrics.incr("rejected_overload")

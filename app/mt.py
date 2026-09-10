@@ -223,12 +223,6 @@ def make_translation_messages(
                 )
                 return [
                     {"role": "system", "content": system_content},
-                    {"role": "user", "content": "أين محطة القطار؟"},
-                    {"role": "assistant", "content": "Where is the train station?"},
-                    {"role": "user", "content": "كيف حالك؟"},
-                    {"role": "assistant", "content": "How are you?"},
-                    {"role": "user", "content": "أنا بخير، وأنت؟"},
-                    {"role": "assistant", "content": "I am fine, and you?"},
                     {"role": "user", "content": user_content},
                 ]
             system_content = (

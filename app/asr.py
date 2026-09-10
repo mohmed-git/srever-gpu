@@ -50,6 +50,13 @@ _EN_HALLUCINATION_BLOCKLIST: set[str] = {
     "Thank you for watching",
 }
 
+SILERO_VAD_PARAMETERS: dict[str, Any] = {
+    "threshold": 0.5,
+    "min_speech_duration_ms": 150,
+    "min_silence_duration_ms": 300,
+    "speech_pad_ms": 100,
+}
+
 
 @dataclass(frozen=True)
 class AsrResult:
@@ -65,6 +72,7 @@ class AsrResult:
     compute_type: str
     batch_size: int
     dropped_segments: int = 0
+    rms_dbfs: float | None = None
 
 
 class AsrEngine:
@@ -152,6 +160,7 @@ class AsrEngine:
         # if rms_dbfs < -45 -> hollow, hollow_reason="silence_energy", cost ~0 ms.
         rms = float(np.sqrt(np.mean(samples**2) + 1e-12))
         rms_dbfs = 20.0 * np.log10(rms + 1e-12)
+        rms_val = round(float(rms_dbfs), 2)
         if rms_dbfs < -45.0:
             return AsrResult(
                 text="",
@@ -166,14 +175,10 @@ class AsrEngine:
                 model=self.model_name,
                 compute_type=self.compute_type,
                 batch_size=effective_batch,
+                rms_dbfs=rms_val,
             )
 
-        vad_params = {
-            "threshold": 0.5,
-            "min_speech_duration_ms": 150,
-            "min_silence_duration_ms": 300,
-            "speech_pad_ms": 100,
-        }
+        vad_params = dict(SILERO_VAD_PARAMETERS)
         options: dict[str, Any] = {
             "language": lang_arg,
             "beam_size": self.settings.asr_beam_size,
@@ -258,6 +263,7 @@ class AsrEngine:
             model=self.model_name,
             compute_type=self.compute_type,
             batch_size=effective_batch,
+            rms_dbfs=rms_val,
         )
 
     def detect_language(self, samples: np.ndarray) -> tuple[str, float] | None:
