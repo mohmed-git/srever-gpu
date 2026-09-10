@@ -130,7 +130,7 @@ _DIALECT_FEW_SHOTS: Final[dict[str, list[tuple[str, str]]]] = {
     "maghrebi": [
         ("لاباس عليك؟ راه سالينا الخدمة بدري ودابا غاديين.", "How are you doing? We finished work early and now we are leaving."),
         ("فين غادي دابا؟", "Where are you going right now?"),
-        ("بخينا نكملو هاد الشي بزاف مزيان.", "We want to complete this thing very well."),
+        ("بغينا نساليو هاد الخدمة مزيان.", "We want to finish this work well."),
     ],
     "sudanese": [
         ("كيفنك يا غالي؟ أبشرك خلصنا بدري وهسع ماشين.", "How are you my dear? Good news: we finished early and now we are leaving."),
@@ -208,6 +208,29 @@ def make_translation_messages(
         var_tag = (source_variant or "").strip().upper()
         if var_tag and var_tag in _DIALECT_NAMES:
             name, family = _DIALECT_FAMILIES.get(var_tag, (_DIALECT_NAMES[var_tag], "gulf"))
+            # Unvalidated families (YE, SD) fall back to plain hint line without few-shots until native sign-off
+            if var_tag in {"YE", "SD"}:
+                system_content = (
+                    f"You are a strict, literal real-time Arabic-to-English translation engine for live spoken conversation.\n"
+                    "CRITICAL RULES:\n"
+                    "- You are a TRANSLATION ENGINE, NOT a conversational partner.\n"
+                    "- NEVER answer questions or converse with the user.\n"
+                    "- NEVER say 'I am sorry', 'please provide context', or apologize. If an input word is incomplete or fragmented, translate it literally or output nothing.\n"
+                    "- NEVER omit, drop, or summarize any part of the spoken Arabic sentence.\n"
+                    f"- The speaker uses {name} colloquial Arabic; interpret idioms accordingly.\n"
+                    "- Output ONLY the direct English translation with no notes, explanations, or quotes."
+                    f"{extra_hints}"
+                )
+                return [
+                    {"role": "system", "content": system_content},
+                    {"role": "user", "content": "أين محطة القطار؟"},
+                    {"role": "assistant", "content": "Where is the train station?"},
+                    {"role": "user", "content": "كيف حالك؟"},
+                    {"role": "assistant", "content": "How are you?"},
+                    {"role": "user", "content": "أنا بخير، وأنت؟"},
+                    {"role": "assistant", "content": "I am fine, and you?"},
+                    {"role": "user", "content": user_content},
+                ]
             system_content = (
                 f"You are an expert real-time spoken Arabic-to-English translation engine specialized in regional colloquial dialects.\n"
                 "CRITICAL RULES:\n"

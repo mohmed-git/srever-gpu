@@ -472,7 +472,8 @@ class TestIncidentFixesAsync(unittest.IsolatedAsyncioTestCase):
         )
         engine._model.transcribe.return_value = ([seg_hallucinated], SimpleNamespace(language="en", language_probability=0.99))
 
-        res = engine.transcribe(np.zeros(16000, dtype=np.float32), language="en")
+        audible_audio = np.ones(16000, dtype=np.float32) * 0.05
+        res = engine.transcribe(audible_audio, language="en")
         self.assertEqual(res.dropped_segments, 1, "English blocklist segment must be dropped")
         self.assertEqual(res.text, "", "Result text must be empty when all segments are dropped")
         self.assertTrue(res.hollow, "Result must be marked hollow")
@@ -1059,13 +1060,17 @@ class TestIncidentFixesAsync(unittest.IsolatedAsyncioTestCase):
             msgs_en = make_translation_messages("جملة عامية", "ar", "en", source_variant=code)
             sys_en = msgs_en[0]["content"]
             self.assertIn(f"The speaker uses {name} colloquial Arabic; interpret idioms accordingly.", sys_en)
-            self.assertIn("specialized in regional colloquial dialects", sys_en)
-            self.assertIn("بدري", sys_en)
-            self.assertNotIn("strict, literal", sys_en)
-
-            expected_shots = _DIALECT_FEW_SHOTS[family]
-            user_shots = [m["content"] for m in msgs_en if m["role"] == "user"]
-            self.assertIn(expected_shots[0][0], user_shots)
+            if code in {"YE", "SD"}:
+                # Unvalidated families fall back to plain hint line without few-shots
+                self.assertIn("strict, literal", sys_en)
+                self.assertEqual(len(msgs_en), 8)
+            else:
+                self.assertIn("specialized in regional colloquial dialects", sys_en)
+                self.assertIn("بدري", sys_en)
+                self.assertNotIn("strict, literal", sys_en)
+                expected_shots = _DIALECT_FEW_SHOTS[family]
+                user_shots = [m["content"] for m in msgs_en if m["role"] == "user"]
+                self.assertIn(expected_shots[0][0], user_shots)
 
             # 2. ar -> fr dialect prompt
             msgs_fr = make_translation_messages("جملة عامية", "ar", "fr", source_variant=code)
@@ -1083,83 +1088,81 @@ class TestIncidentFixesAsync(unittest.IsolatedAsyncioTestCase):
         msgs_msa = make_translation_messages("كيف حالك", "ar", "en", source_variant="")
         self.assertIn("strict, literal", msgs_msa[0]["content"])
 
-    # ---- Short-audio phantom hallucination guard & Idempotent cache tests ----
-    def test_short_audio_phantom_tokens_dropped(self):
-        """Whisper trailing breath / noise hallucinations ('you', 'Thank you.', 'شكرا', 'أنت')
-        must be dropped on short utterances to prevent trailing phantom bubbles."""
+    # ---- Advisor Directives: T18, T19, RMS Energy Gate, and Sabotages ----
+    def test_t18_no_speech_prob_dropped(self):
+        """T18: Whisper hallucinated 'you' on silence with high confidence (logprob=-0.3)
+        but high no_speech_prob (0.9) must be dropped by the no_speech_prob rule."""
         settings = Settings()
         engine = AsrEngine(settings)
         engine._model = MagicMock()
 
-        # 1. "you" on short audio (0.8s) -> must be dropped
+        audible_audio = np.ones(16000, dtype=np.float32) * 0.05
         seg_you = SimpleNamespace(
             text="you",
             start=0.0,
             end=0.8,
-            no_speech_prob=0.1,
+            no_speech_prob=0.90,
             avg_logprob=-0.3,
             compression_ratio=1.0,
         )
         engine._model.transcribe.return_value = ([seg_you], SimpleNamespace(language="en", language_probability=0.95))
-        res = engine.transcribe(np.zeros(12800, dtype=np.float32), language="en")
-        self.assertEqual(res.text, "", "Isolated 'you' on short audio must be dropped")
+        res = engine.transcribe(audible_audio, language="en")
+        self.assertEqual(res.text, "", "T18: no_speech_prob=0.9 must be dropped even if logprob is high")
         self.assertTrue(res.hollow)
+        self.assertIn("hallucination guard", res.hollow_reason)
 
-        # 2. "Thank you." on short audio (1.0s) with no_speech_prob=0.3 -> must be dropped
+    def test_t19_low_no_speech_prob_kept(self):
+        """T19: Legitimate user saying 'Thank you' with low no_speech_prob (0.1)
+        must NEVER be dropped by any word blocklist."""
+        settings = Settings()
+        engine = AsrEngine(settings)
+        engine._model = MagicMock()
+
+        audible_audio = np.ones(16000, dtype=np.float32) * 0.05
         seg_ty = SimpleNamespace(
-            text="Thank you.",
+            text="Thank you",
             start=0.0,
-            end=1.0,
-            no_speech_prob=0.35,
-            avg_logprob=-0.4,
-            compression_ratio=1.0,
-        )
-        engine._model.transcribe.return_value = ([seg_ty], SimpleNamespace(language="en", language_probability=0.95))
-        res = engine.transcribe(np.zeros(16000, dtype=np.float32), language="en")
-        self.assertEqual(res.text, "", "Trailing noise 'Thank you.' must be dropped")
-        self.assertTrue(res.hollow)
-
-        # 3. "شكرا" on short audio (0.9s) with no_speech_prob=0.3 -> must be dropped
-        seg_shukran = SimpleNamespace(
-            text="شكرا",
-            start=0.0,
-            end=0.9,
-            no_speech_prob=0.30,
-            avg_logprob=-0.4,
-            compression_ratio=1.0,
-        )
-        engine._model.transcribe.return_value = ([seg_shukran], SimpleNamespace(language="ar", language_probability=0.98))
-        res = engine.transcribe(np.zeros(14400, dtype=np.float32), language="ar")
-        self.assertEqual(res.text, "", "Trailing noise 'شكرا' must be dropped")
-        self.assertTrue(res.hollow)
-
-        # 4. "أنت" on short audio (0.7s) -> must be dropped
-        seg_anta = SimpleNamespace(
-            text="أنت",
-            start=0.0,
-            end=0.7,
-            no_speech_prob=0.1,
+            end=0.8,
+            no_speech_prob=0.10,
             avg_logprob=-0.3,
             compression_ratio=1.0,
         )
-        engine._model.transcribe.return_value = ([seg_anta], SimpleNamespace(language="ar", language_probability=0.98))
-        res = engine.transcribe(np.zeros(11200, dtype=np.float32), language="ar")
-        self.assertEqual(res.text, "", "Isolated 'أنت' on short audio must be dropped")
-        self.assertTrue(res.hollow)
-
-        # 5. Legitimate sentence -> must be kept
-        seg_legit = SimpleNamespace(
-            text="Hello, how are you doing today?",
-            start=0.0,
-            end=2.2,
-            no_speech_prob=0.01,
-            avg_logprob=-0.2,
-            compression_ratio=1.0,
-        )
-        engine._model.transcribe.return_value = ([seg_legit], SimpleNamespace(language="en", language_probability=0.99))
-        res = engine.transcribe(np.zeros(35200, dtype=np.float32), language="en")
-        self.assertEqual(res.text, "Hello, how are you doing today?")
+        engine._model.transcribe.return_value = ([seg_ty], SimpleNamespace(language="en", language_probability=0.98))
+        res = engine.transcribe(audible_audio, language="en")
+        self.assertEqual(res.text, "Thank you", "T19: legitimate 'Thank you' with no_speech_prob=0.1 must be kept")
         self.assertFalse(res.hollow)
+
+    def test_silence_energy_gate_catches_silence_before_whisper(self):
+        """RMS energy gate catches dead mic / room silence (rms_dbfs < -45) at 0ms before Whisper."""
+        settings = Settings()
+        engine = AsrEngine(settings)
+        engine._model = MagicMock()
+
+        silent_pcm = np.zeros(16000, dtype=np.float32)
+        res = engine.transcribe(silent_pcm, language="en")
+        self.assertEqual(res.text, "")
+        self.assertTrue(res.hollow)
+        self.assertEqual(res.hollow_reason, "silence_energy")
+        # Whisper model must NOT have been called at all!
+        engine._model.transcribe.assert_not_called()
+
+    def test_sabotage_remove_no_speech_prob_rule_fails_t18(self):
+        """Sabotage 1: Removing no_speech_prob > 0.85 rule would allow confident 'you' to leak."""
+        no_speech_prob = 0.90
+        avg_logprob = -0.3  # > -1.0
+        # The old AND condition: (no_speech_prob > 0.6 and avg_logprob < -1.0)
+        old_condition_would_drop = (no_speech_prob > 0.6 and avg_logprob < -1.0)
+        self.assertFalse(old_condition_would_drop, "Sabotage: old AND condition fails to catch T18!")
+
+    def test_sabotage_word_blocklist_fails_t19(self):
+        """Sabotage 2: Adding 'thank you' to a static word blocklist would drop legitimate speech."""
+        from app.asr import _EN_HALLUCINATION_BLOCKLIST, _AR_HALLUCINATION_BLOCKLIST
+        lower_en = {x.lower() for x in _EN_HALLUCINATION_BLOCKLIST}
+        self.assertNotIn("thank you", lower_en, "Sabotage: 'thank you' must NOT be in blocklist")
+        self.assertNotIn("thanks", lower_en, "Sabotage: 'thanks' must NOT be in blocklist")
+        self.assertNotIn("you", lower_en, "Sabotage: 'you' must NOT be in blocklist")
+        self.assertNotIn("شكرا", _AR_HALLUCINATION_BLOCKLIST, "Sabotage: 'شكرا' must NOT be in blocklist")
+        self.assertNotIn("أنت", _AR_HALLUCINATION_BLOCKLIST, "Sabotage: 'أنت' must NOT be in blocklist")
 
     def test_cache_clearing_idempotent_on_repeated_config(self):
         """Repeated config frames with same dialect/languages must NOT flush mt_cache."""

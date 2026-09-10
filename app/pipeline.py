@@ -350,6 +350,12 @@ class Pipeline:
             if asr_result.hollow:
                 total_ms = (time.perf_counter() - wall_start) * 1000.0
                 self.metrics.incr("hollow_results")
+                if asr_result.hollow_reason == "vad_no_speech":
+                    self.metrics.incr("vad_dropped_utts")
+                elif asr_result.hollow_reason == "silence_energy":
+                    self.metrics.incr("silence_energy_dropped")
+                elif asr_result.hollow_reason and "hallucination guard" in asr_result.hollow_reason:
+                    self.metrics.incr("hallucination_dropped")
                 self.metrics.observe("asr_ms", asr_result.asr_ms)
                 self.metrics.observe("total_server_ms", total_ms)
                 self.metrics.incr("requests_completed")

@@ -50,36 +50,6 @@ _EN_HALLUCINATION_BLOCKLIST: set[str] = {
     "Thank you for watching",
 }
 
-# Single-token / short-utterance phantom hallucinations commonly produced by Whisper
-# on ambient breath / room noise / trailing silence:
-_SHORT_PHANTOM_EN: set[str] = {
-    "you",
-    "thank you",
-    "thanks",
-    "bye",
-    "bye bye",
-    "goodbye",
-    "yeah",
-    "so",
-    "oh",
-    "ah",
-    "the end",
-}
-
-_SHORT_PHANTOM_AR: set[str] = {
-    "شكرا",
-    "شكراً",
-    "شكرا لك",
-    "شكراً لك",
-    "شكرا جزيلا",
-    "شكراً جزيلاً",
-    "أنت",
-    "انت",
-    "مع السلامة",
-    "إلى اللقاء",
-    "الى اللقاء",
-}
-
 
 @dataclass(frozen=True)
 class AsrResult:
@@ -176,18 +146,45 @@ class AsrEngine:
         duration_s = samples.size / float(self.settings.sample_rate)
         effective_batch = batch_size if batch_size and batch_size > 1 else 1
         lang_arg = None if (language in (None, "auto")) else language
+        started = time.perf_counter()
 
+        # RMS energy gate: compute RMS of the slot's PCM before Whisper or Silero;
+        # if rms_dbfs < -45 -> hollow, hollow_reason="silence_energy", cost ~0 ms.
+        rms = float(np.sqrt(np.mean(samples**2) + 1e-12))
+        rms_dbfs = 20.0 * np.log10(rms + 1e-12)
+        if rms_dbfs < -45.0:
+            return AsrResult(
+                text="",
+                language=lang_arg or "unknown",
+                language_probability=None,
+                duration_s=round(duration_s, 3),
+                asr_ms=round((time.perf_counter() - started) * 1000.0, 2),
+                segments=0,
+                dropped_segments=0,
+                hollow=True,
+                hollow_reason="silence_energy",
+                model=self.model_name,
+                compute_type=self.compute_type,
+                batch_size=effective_batch,
+            )
+
+        vad_params = {
+            "threshold": 0.5,
+            "min_speech_duration_ms": 150,
+            "min_silence_duration_ms": 300,
+            "speech_pad_ms": 100,
+        }
         options: dict[str, Any] = {
             "language": lang_arg,
             "beam_size": self.settings.asr_beam_size,
             "vad_filter": self.settings.asr_vad_filter,
+            "vad_parameters": vad_params if self.settings.asr_vad_filter else None,
             # Conversation turns are independent; carrying previous text across
             # turns is a known source of hallucinated repeats in short audio.
             "condition_on_previous_text": False,
             "without_timestamps": True,
         }
 
-        started = time.perf_counter()
         if self._batched is not None and effective_batch > 1 and duration_s >= 30.0:
             segments, info = self._batched.transcribe(
                 samples, batch_size=effective_batch, **options
@@ -203,23 +200,18 @@ class AsrEngine:
         hollow_reason: str | None = None
         dropped_count = 0
         if not seg_list:
-            hollow_reason = (
-                "whisper returned 0 segments: the audio was rejected (silence/VAD/noise), "
-                "so this timing measures rejection, not transcription"
-            )
+            hollow_reason = "vad_no_speech"
             text = ""
         else:
-            # Hallucination guard: filter per-segment using compression_ratio, blocklists, and short-audio phantom guards
+            # Hallucination guard: filter per-segment using compression_ratio, full blocklists, and no_speech_prob rules
             _en_block_lower = {x.lower() for x in _EN_HALLUCINATION_BLOCKLIST}
-            _short_en_lower = {x.lower() for x in _SHORT_PHANTOM_EN}
-            _short_ar = set(_SHORT_PHANTOM_AR)
 
             def _is_hallucination_seg(s: Any) -> bool:
                 raw_text = getattr(s, "text", "") or ""
                 cleaned = raw_text.strip().rstrip(".!؟،, ")
                 cleaned_lower = cleaned.lower()
 
-                # Always drop full blocklist phrases
+                # Full YouTube blocklist phrases only
                 if cleaned in _AR_HALLUCINATION_BLOCKLIST:
                     return True
                 if cleaned_lower in _en_block_lower:
@@ -227,34 +219,19 @@ class AsrEngine:
 
                 s_nsp = float(getattr(s, "no_speech_prob", 0.0) or 0.0)
                 s_alp = float(getattr(s, "avg_logprob", 0.0) or 0.0)
-                seg_start = getattr(s, "start", None)
-                seg_end = getattr(s, "end", None)
-                if seg_start is not None and seg_end is not None:
-                    seg_dur = float(seg_end) - float(seg_start)
-                else:
-                    seg_dur = duration_s
-                effective_dur = seg_dur if seg_dur > 0 else duration_s
 
-                # High no_speech_prob is always silence/noise regardless of avg_logprob
-                if s_nsp > 0.75:
-                    return True
-                if s_nsp > 0.50 and s_alp < -0.8:
-                    return True
-                if s_nsp > 0.30 and s_alp < -1.2:
+                # Rule 1: drop if no_speech_prob > 0.85 (regardless of logprob)
+                if s_nsp > 0.85:
                     return True
 
-                # Trailing breath / room noise phantom tokens
-                is_short_phantom = (cleaned_lower in _short_en_lower) or (cleaned in _short_ar)
-                if is_short_phantom:
-                    # Isolated pronouns "you" or "أنت" are never solo conversation turns on short audio
-                    if cleaned_lower == "you" or cleaned in {"أنت", "انت"}:
-                        if effective_dur < 2.0:
-                            return True
-                    # Short phantom tokens on short audio with non-trivial no_speech_prob
-                    if effective_dur < 1.8 and s_nsp > 0.20:
-                        return True
-                    if s_nsp > 0.40:
-                        return True
+                # Rule 2: drop if no_speech_prob > 0.5 and duration_s < 1.5 and word_count <= 2
+                word_count = len(cleaned.split())
+                if s_nsp > 0.5 and duration_s < 1.5 and word_count <= 2:
+                    return True
+
+                # Rule 3: keep existing AND clause and compression check
+                if s_nsp > 0.6 and s_alp < -1.0:
+                    return True
 
                 return False
 
