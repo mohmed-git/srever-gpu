@@ -1083,6 +1083,107 @@ class TestIncidentFixesAsync(unittest.IsolatedAsyncioTestCase):
         msgs_msa = make_translation_messages("كيف حالك", "ar", "en", source_variant="")
         self.assertIn("strict, literal", msgs_msa[0]["content"])
 
+    # ---- Short-audio phantom hallucination guard & Idempotent cache tests ----
+    def test_short_audio_phantom_tokens_dropped(self):
+        """Whisper trailing breath / noise hallucinations ('you', 'Thank you.', 'شكرا', 'أنت')
+        must be dropped on short utterances to prevent trailing phantom bubbles."""
+        settings = Settings()
+        engine = AsrEngine(settings)
+        engine._model = MagicMock()
+
+        # 1. "you" on short audio (0.8s) -> must be dropped
+        seg_you = SimpleNamespace(
+            text="you",
+            start=0.0,
+            end=0.8,
+            no_speech_prob=0.1,
+            avg_logprob=-0.3,
+            compression_ratio=1.0,
+        )
+        engine._model.transcribe.return_value = ([seg_you], SimpleNamespace(language="en", language_probability=0.95))
+        res = engine.transcribe(np.zeros(12800, dtype=np.float32), language="en")
+        self.assertEqual(res.text, "", "Isolated 'you' on short audio must be dropped")
+        self.assertTrue(res.hollow)
+
+        # 2. "Thank you." on short audio (1.0s) with no_speech_prob=0.3 -> must be dropped
+        seg_ty = SimpleNamespace(
+            text="Thank you.",
+            start=0.0,
+            end=1.0,
+            no_speech_prob=0.35,
+            avg_logprob=-0.4,
+            compression_ratio=1.0,
+        )
+        engine._model.transcribe.return_value = ([seg_ty], SimpleNamespace(language="en", language_probability=0.95))
+        res = engine.transcribe(np.zeros(16000, dtype=np.float32), language="en")
+        self.assertEqual(res.text, "", "Trailing noise 'Thank you.' must be dropped")
+        self.assertTrue(res.hollow)
+
+        # 3. "شكرا" on short audio (0.9s) with no_speech_prob=0.3 -> must be dropped
+        seg_shukran = SimpleNamespace(
+            text="شكرا",
+            start=0.0,
+            end=0.9,
+            no_speech_prob=0.30,
+            avg_logprob=-0.4,
+            compression_ratio=1.0,
+        )
+        engine._model.transcribe.return_value = ([seg_shukran], SimpleNamespace(language="ar", language_probability=0.98))
+        res = engine.transcribe(np.zeros(14400, dtype=np.float32), language="ar")
+        self.assertEqual(res.text, "", "Trailing noise 'شكرا' must be dropped")
+        self.assertTrue(res.hollow)
+
+        # 4. "أنت" on short audio (0.7s) -> must be dropped
+        seg_anta = SimpleNamespace(
+            text="أنت",
+            start=0.0,
+            end=0.7,
+            no_speech_prob=0.1,
+            avg_logprob=-0.3,
+            compression_ratio=1.0,
+        )
+        engine._model.transcribe.return_value = ([seg_anta], SimpleNamespace(language="ar", language_probability=0.98))
+        res = engine.transcribe(np.zeros(11200, dtype=np.float32), language="ar")
+        self.assertEqual(res.text, "", "Isolated 'أنت' on short audio must be dropped")
+        self.assertTrue(res.hollow)
+
+        # 5. Legitimate sentence -> must be kept
+        seg_legit = SimpleNamespace(
+            text="Hello, how are you doing today?",
+            start=0.0,
+            end=2.2,
+            no_speech_prob=0.01,
+            avg_logprob=-0.2,
+            compression_ratio=1.0,
+        )
+        engine._model.transcribe.return_value = ([seg_legit], SimpleNamespace(language="en", language_probability=0.99))
+        res = engine.transcribe(np.zeros(35200, dtype=np.float32), language="en")
+        self.assertEqual(res.text, "Hello, how are you doing today?")
+        self.assertFalse(res.hollow)
+
+    def test_cache_clearing_idempotent_on_repeated_config(self):
+        """Repeated config frames with same dialect/languages must NOT flush mt_cache."""
+        settings = Settings()
+        ws = DummyWebSocket()
+        state = _StreamState(settings, ws)
+
+        # First config sets source_variant
+        state.apply({"source_variant": "SY"})
+        self.assertEqual(state.source_variant, "SY")
+
+        # Seed cache
+        state.mt_cache["key1"] = "cached_val"
+        self.assertIn("key1", state.mt_cache)
+
+        # Identical config frame re-sent by client -> cache must be preserved!
+        state.apply({"source_variant": "SY"})
+        self.assertIn("key1", state.mt_cache, "Identical config must not clear mt_cache")
+
+        # Config with DIFFERENT dialect -> cache must be cleared
+        state.apply({"source_variant": "EG"})
+        self.assertEqual(state.source_variant, "EG")
+        self.assertNotIn("key1", state.mt_cache, "Changed dialect must clear mt_cache")
+
 
 if __name__ == "__main__":
     unittest.main()

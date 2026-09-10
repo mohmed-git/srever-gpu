@@ -368,28 +368,40 @@ class _StreamState:
         return int(self.settings.max_utterance_seconds * self.sample_rate * 2 * self.channels)
 
     def apply(self, message: dict[str, Any]) -> None:
-        if "source" in message or "target" in message:
-            self.verify_lang_next = True
-        if any(k in message for k in ("source", "target", "source_variant", "target_variant")):
-            self.mt_cache.clear()
+        changed = False
         if "source" in message:
-            self.source = str(message["source"]) if message["source"] is not None else None
+            new_source = str(message["source"]) if message["source"] is not None else None
+            if new_source != self.source:
+                self.source = new_source
+                self.verify_lang_next = True
+                changed = True
         if "target" in message:
-            self.target = str(message["target"]) if message["target"] is not None else None
+            new_target = str(message["target"]) if message["target"] is not None else None
+            if new_target != self.target:
+                self.target = new_target
+                self.verify_lang_next = True
+                changed = True
         if "source_variant" in message:
             raw_v = message["source_variant"]
             norm_v = lang_mod.normalise_variant(raw_v)
-            if norm_v:
-                dialect_name = mt_mod._DIALECT_NAMES.get(norm_v, norm_v)
-                log.info("Dialect configured: code=%s, name=%s (raw=%r)", norm_v, dialect_name, raw_v)
-            elif raw_v:
-                log.info("variant_unknown: %s", raw_v)
-            self.source_variant = norm_v
+            if norm_v != self.source_variant:
+                if norm_v:
+                    dialect_name = mt_mod._DIALECT_NAMES.get(norm_v, norm_v)
+                    log.info("Dialect configured: code=%s, name=%s (raw=%r)", norm_v, dialect_name, raw_v)
+                elif raw_v:
+                    log.info("variant_unknown: %s", raw_v)
+                self.source_variant = norm_v
+                changed = True
         if "target_variant" in message:
             raw_v = (message.get("target_variant") or "").strip()
             if raw_v:
                 log.warning("target_variant_ignored: %s (target Arabic is strictly Modern Standard Arabic)", raw_v)
-            self.target_variant = ""
+            if self.target_variant != "":
+                self.target_variant = ""
+                changed = True
+
+        if changed:
+            self.mt_cache.clear()
         if "format" in message and message["format"]:
             self.audio_format = str(message["format"]).strip().lower()
         if "sample_rate" in message and message["sample_rate"]:

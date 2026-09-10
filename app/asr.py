@@ -50,6 +50,36 @@ _EN_HALLUCINATION_BLOCKLIST: set[str] = {
     "Thank you for watching",
 }
 
+# Single-token / short-utterance phantom hallucinations commonly produced by Whisper
+# on ambient breath / room noise / trailing silence:
+_SHORT_PHANTOM_EN: set[str] = {
+    "you",
+    "thank you",
+    "thanks",
+    "bye",
+    "bye bye",
+    "goodbye",
+    "yeah",
+    "so",
+    "oh",
+    "ah",
+    "the end",
+}
+
+_SHORT_PHANTOM_AR: set[str] = {
+    "شكرا",
+    "شكراً",
+    "شكرا لك",
+    "شكراً لك",
+    "شكرا جزيلا",
+    "شكراً جزيلاً",
+    "أنت",
+    "انت",
+    "مع السلامة",
+    "إلى اللقاء",
+    "الى اللقاء",
+}
+
 
 @dataclass(frozen=True)
 class AsrResult:
@@ -179,22 +209,59 @@ class AsrEngine:
             )
             text = ""
         else:
-            # Hallucination guard: filter per-segment using AND + compression_ratio + blocklist
+            # Hallucination guard: filter per-segment using compression_ratio, blocklists, and short-audio phantom guards
             _en_block_lower = {x.lower() for x in _EN_HALLUCINATION_BLOCKLIST}
+            _short_en_lower = {x.lower() for x in _SHORT_PHANTOM_EN}
+            _short_ar = set(_SHORT_PHANTOM_AR)
 
-            def _is_hallucination_seg(txt: str) -> bool:
-                cleaned = txt.strip().rstrip(".!؟،, ")
+            def _is_hallucination_seg(s: Any) -> bool:
+                raw_text = getattr(s, "text", "") or ""
+                cleaned = raw_text.strip().rstrip(".!؟،, ")
+                cleaned_lower = cleaned.lower()
+
+                # Always drop full blocklist phrases
                 if cleaned in _AR_HALLUCINATION_BLOCKLIST:
                     return True
-                if cleaned.lower() in _en_block_lower:
+                if cleaned_lower in _en_block_lower:
                     return True
+
+                s_nsp = float(getattr(s, "no_speech_prob", 0.0) or 0.0)
+                s_alp = float(getattr(s, "avg_logprob", 0.0) or 0.0)
+                seg_start = getattr(s, "start", None)
+                seg_end = getattr(s, "end", None)
+                if seg_start is not None and seg_end is not None:
+                    seg_dur = float(seg_end) - float(seg_start)
+                else:
+                    seg_dur = duration_s
+                effective_dur = seg_dur if seg_dur > 0 else duration_s
+
+                # High no_speech_prob is always silence/noise regardless of avg_logprob
+                if s_nsp > 0.75:
+                    return True
+                if s_nsp > 0.50 and s_alp < -0.8:
+                    return True
+                if s_nsp > 0.30 and s_alp < -1.2:
+                    return True
+
+                # Trailing breath / room noise phantom tokens
+                is_short_phantom = (cleaned_lower in _short_en_lower) or (cleaned in _short_ar)
+                if is_short_phantom:
+                    # Isolated pronouns "you" or "أنت" are never solo conversation turns on short audio
+                    if cleaned_lower == "you" or cleaned in {"أنت", "انت"}:
+                        if effective_dur < 2.0:
+                            return True
+                    # Short phantom tokens on short audio with non-trivial no_speech_prob
+                    if effective_dur < 1.8 and s_nsp > 0.20:
+                        return True
+                    if s_nsp > 0.40:
+                        return True
+
                 return False
 
             kept = [
                 s for s in seg_list
-                if not (getattr(s, "no_speech_prob", 0.0) > 0.6 and getattr(s, "avg_logprob", 0.0) < -1.0)
-                and getattr(s, "compression_ratio", 0.0) <= 2.4
-                and not _is_hallucination_seg(s.text)
+                if getattr(s, "compression_ratio", 0.0) <= 2.4
+                and not _is_hallucination_seg(s)
             ]
             dropped_count = len(seg_list) - len(kept)
             text = " ".join(s.text.strip() for s in kept if s.text).strip()

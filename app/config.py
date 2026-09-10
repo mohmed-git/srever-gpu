@@ -100,7 +100,7 @@ class Settings:
     asr_model: str = field(default_factory=lambda: _env("ASR_MODEL", ""))
     asr_compute_type: str = field(default_factory=lambda: _env("ASR_COMPUTE_TYPE", ""))
     asr_beam_size: int = field(default_factory=lambda: _env_int("ASR_BEAM_SIZE", 1))
-    asr_vad_filter: bool = field(default_factory=lambda: _env_bool("ASR_VAD_FILTER", False))
+    asr_vad_filter: bool = field(default_factory=lambda: _env_bool("ASR_VAD_FILTER", True))
     asr_cpu_threads: int = field(default_factory=lambda: _env_int("ASR_CPU_THREADS", 0))
     asr_batch_size: int = field(default_factory=lambda: _env_int("ASR_BATCH_SIZE", 1))
     asr_batch_wait_ms: float = field(default_factory=lambda: _env_float("ASR_BATCH_WAIT_MS", 0.0))
