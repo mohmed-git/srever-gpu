@@ -560,7 +560,7 @@ async def _run_tentative(state: _StreamState, slot: _Slot, seq: int) -> None:
 
         # Adaptive SNR Floor check (Directives §1 & §4):
         if state.floor_dbfs is not None and asr_result.rms_dbfs is not None:
-            if asr_result.rms_dbfs < (state.floor_dbfs + 6.0):
+            if asr_result.rms_dbfs < state.floor_dbfs:
                 asr_result = AsrResult(
                     text="",
                     language=asr_result.language,

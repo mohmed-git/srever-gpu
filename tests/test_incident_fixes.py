@@ -1354,23 +1354,23 @@ class TestIncidentFixesAsync(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(low_conf_flag)
 
     def test_adaptive_snr_floor_gate_and_sabotage(self):
-        """Adaptive SNR floor: drop if rms_dbfs < floor_dbfs + 6.0 dB.
-        Sabotage: if floor+6 check is removed, -49 dBFS would erroneously pass."""
+        """Adaptive SNR floor: drop if rms_dbfs < floor_dbfs (0 dB margin).
+        Sabotage: if floor+0 check is removed, -55 dBFS would erroneously pass."""
         settings = Settings()
         engine = AsrEngine(settings)
         engine._model = MagicMock()
 
-        # Floor is set to -54 dBFS -> Threshold is -48 dBFS
+        # Floor is set to -54 dBFS -> Threshold is -54.0 dBFS
         floor_dbfs = -54.0
-        threshold_dbfs = floor_dbfs + 6.0  # -48.0 dBFS
+        threshold_dbfs = floor_dbfs  # -54.0 dBFS
 
-        # Audio 1: RMS ~ -46 dBFS (10^(-46/20) ~ 0.00501) -> Above threshold -> Passes
-        audio_pass = np.ones(16000, dtype=np.float32) * 0.005012
+        # Audio 1: RMS ~ -53 dBFS (10^(-53/20) ~ 0.002238) -> floor + 1 -> Passes
+        audio_pass = np.ones(16000, dtype=np.float32) * 0.002238
         rms_pass = 20.0 * np.log10(np.sqrt(np.mean(audio_pass**2)) + 1e-12)
         self.assertGreater(rms_pass, threshold_dbfs)
 
-        # Audio 2: RMS ~ -49 dBFS (10^(-49/20) ~ 0.003548) -> Below threshold -> Hollow snr_floor
-        audio_drop = np.ones(16000, dtype=np.float32) * 0.003548
+        # Audio 2: RMS ~ -55 dBFS (10^(-55/20) ~ 0.001778) -> floor - 1 -> Hollow snr_floor
+        audio_drop = np.ones(16000, dtype=np.float32) * 0.001778
         rms_drop = 20.0 * np.log10(np.sqrt(np.mean(audio_drop**2)) + 1e-12)
         self.assertLess(rms_drop, threshold_dbfs)
 
