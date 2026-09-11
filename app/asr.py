@@ -157,11 +157,15 @@ class AsrEngine:
         started = time.perf_counter()
 
         # RMS energy gate: compute RMS of the slot's PCM before Whisper or Silero;
-        # if rms_dbfs < -45 -> hollow, hollow_reason="silence_energy", cost ~0 ms.
+        # if rms_dbfs < gate_dbfs -> hollow, hollow_reason="silence_energy", cost ~0 ms.
+        # Empirically calibrated: with client AGC disabled, natural conversational speech
+        # lands at -45.5 to -49 dBFS while ambient room silence sits at -52 to -56 dBFS.
+        # Gate threshold is configured via settings (default -50.0 dBFS).
+        gate_dbfs = getattr(self.settings, "asr_energy_gate_dbfs", -50.0)
         rms = float(np.sqrt(np.mean(samples**2) + 1e-12))
         rms_dbfs = 20.0 * np.log10(rms + 1e-12)
         rms_val = round(float(rms_dbfs), 2)
-        if rms_dbfs < -45.0:
+        if rms_dbfs < gate_dbfs:
             return AsrResult(
                 text="",
                 language=lang_arg or "unknown",

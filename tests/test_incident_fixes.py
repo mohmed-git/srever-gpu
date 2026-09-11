@@ -1183,7 +1183,7 @@ class TestIncidentFixesAsync(unittest.IsolatedAsyncioTestCase):
         self.assertIn("hallucination guard", res.hollow_reason)
 
     def test_silence_energy_gate_catches_silence_before_whisper(self):
-        """RMS energy gate catches dead mic / room silence (rms_dbfs < -45) at 0ms before Whisper."""
+        """RMS energy gate catches dead mic / room silence (rms_dbfs < -50) at 0ms before Whisper."""
         settings = Settings()
         engine = AsrEngine(settings)
         engine._model = MagicMock()
@@ -1196,24 +1196,39 @@ class TestIncidentFixesAsync(unittest.IsolatedAsyncioTestCase):
         # Whisper model must NOT have been called at all!
         engine._model.transcribe.assert_not_called()
 
+    def test_soft_speech_preservation_around_minus_47_dbfs(self):
+        """Soft conversational speech around -47 dBFS must NOT be dropped by the energy gate."""
+        settings = Settings()
+        engine = AsrEngine(settings)
+        engine._model = MagicMock()
+
+        # Generate audio with RMS ~ -47 dBFS: 10^(-47/20) ~ 0.004467
+        soft_pcm = np.ones(16000, dtype=np.float32) * 0.004467
+        seg = SimpleNamespace(text="مرحبا", start=0.0, end=1.0, no_speech_prob=0.1, avg_logprob=-0.2, compression_ratio=1.0)
+        engine._model.transcribe.return_value = ([seg], SimpleNamespace(language="ar", language_probability=0.95))
+        res = engine.transcribe(soft_pcm, language="ar")
+        self.assertEqual(res.text, "مرحبا")
+        self.assertFalse(res.hollow)
+        engine._model.transcribe.assert_called_once()
+
     def test_rms_dbfs_in_asr_result_and_gate(self):
         """Verify rms_dbfs is computed and returned on both silent and audible audio."""
         settings = Settings()
         engine = AsrEngine(settings)
         engine._model = MagicMock()
 
-        # Silence: rms_dbfs < -45
+        # Silence: rms_dbfs < -50
         silent_pcm = np.zeros(16000, dtype=np.float32)
         res_silent = engine.transcribe(silent_pcm, language="en")
         self.assertIsNotNone(res_silent.rms_dbfs)
-        self.assertLess(res_silent.rms_dbfs, -45.0)
+        self.assertLess(res_silent.rms_dbfs, -50.0)
 
-        # Audible: rms_dbfs >= -45
+        # Audible: rms_dbfs >= -50
         audible_pcm = np.ones(16000, dtype=np.float32) * 0.05
         engine._model.transcribe.return_value = ([], SimpleNamespace(language="en", language_probability=0.98))
         res_audible = engine.transcribe(audible_pcm, language="en")
         self.assertIsNotNone(res_audible.rms_dbfs)
-        self.assertGreater(res_audible.rms_dbfs, -45.0)
+        self.assertGreater(res_audible.rms_dbfs, -50.0)
 
     def test_silero_vad_parameters_pinned(self):
         """Pin the 4 Silero VAD parameters to prevent regression (mutation q)."""
