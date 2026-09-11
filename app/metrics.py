@@ -130,6 +130,13 @@ class Metrics:
             "asr_pinned_lang_mismatch": 0,
             "echo_dropped": 0,
             "split_repair_count": 0,
+            "lid_low_confidence": 0,
+        }
+        self._rms_by_outcome: dict[str, deque[float]] = {
+            "silence_energy": deque(maxlen=window),
+            "vad_no_speech": deque(maxlen=window),
+            "hollow_hallucination": deque(maxlen=window),
+            "rendered": deque(maxlen=window),
         }
         self._started_at = time.time()
         self._inflight = 0
@@ -199,6 +206,37 @@ class Metrics:
             "worst_ms": round(vals[-1], 2),
         }
 
+    # ---- rms histogram -------------------------------------------------
+    def observe_rms(self, outcome: str, rms_dbfs: float | None) -> None:
+        if rms_dbfs is None:
+            return
+        with self._lock:
+            q = self._rms_by_outcome.get(outcome)
+            if q is not None:
+                q.append(round(float(rms_dbfs), 2))
+
+    def rms_histogram_report(self) -> dict[str, Any]:
+        with self._lock:
+            out: dict[str, Any] = {}
+            for outcome, vals_dq in self._rms_by_outcome.items():
+                vals = sorted(vals_dq)
+                n = len(vals)
+                if n == 0:
+                    out[outcome] = {
+                        "count": 0,
+                        "p50_dbfs": None,
+                        "min_dbfs": None,
+                        "max_dbfs": None,
+                    }
+                else:
+                    out[outcome] = {
+                        "count": n,
+                        "p50_dbfs": round(percentile(vals, 0.50), 2),
+                        "min_dbfs": round(vals[0], 2),
+                        "max_dbfs": round(vals[-1], 2),
+                    }
+            return out
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             names = list(self._series)
@@ -215,6 +253,7 @@ class Metrics:
             "counters": counters,
             "latency": latencies,
             "budget": self.budget_report(),
+            "rms_dbfs_by_outcome": self.rms_histogram_report(),
             "throughput_rps_since_start": (
                 round(completed / uptime, 3) if uptime > 0 and completed else 0.0
             ),

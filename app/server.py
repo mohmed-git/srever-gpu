@@ -200,6 +200,10 @@ _CONTROL_KEYS = {
     "utt",
     "seq",
     "text",
+    "mode",
+    "languages",
+    "channel_map",
+    "floor_dbfs",
 }
 
 
@@ -291,6 +295,12 @@ class _Slot:
         self.partial_prev_words: list[str] = []
         self.last_partial_started: float = 0.0
 
+        # Bidirectional pair_auto (Phase 3)
+        self.speaker_id: int | None = None
+        self.direction: str | None = None
+        self.channel: str | None = None
+        self.lid_low_confidence: bool = False
+
     @property
     def buf_ms(self) -> int:
         return len(self.buffer) // 32
@@ -302,6 +312,10 @@ class _StreamState:
     def __init__(self, settings: Settings, websocket: WebSocket) -> None:
         self.settings = settings
         self.websocket = websocket
+        self.mode: str = "single"
+        self.languages: list[str] = ["ar", "en"]
+        self.channel_map: dict[str, str] = {"0": "L", "1": "R"}
+        self.floor_dbfs: float | None = None
         self.source: str | None = None
         self.target: str | None = None
         self.source_variant: str | None = None
@@ -435,6 +449,23 @@ class _StreamState:
                     self.stream = True
                 elif lowered in {"0", "false", "no", "off"}:
                     self.stream = False
+        if "mode" in message and message["mode"]:
+            m_val = str(message["mode"]).strip().lower()
+            if m_val != self.mode:
+                self.mode = m_val
+                changed = True
+        if "languages" in message and isinstance(message["languages"], list):
+            langs = [str(l).strip().lower() for l in message["languages"] if str(l).strip()]
+            if langs and langs != self.languages:
+                self.languages = langs
+                changed = True
+        if "channel_map" in message and isinstance(message["channel_map"], dict):
+            self.channel_map = {str(k): str(v) for k, v in message["channel_map"].items()}
+        if "floor_dbfs" in message and message["floor_dbfs"] is not None:
+            try:
+                self.floor_dbfs = float(message["floor_dbfs"])
+            except (TypeError, ValueError):
+                pass
 
 
 async def _verify_pinned_language(
@@ -486,15 +517,86 @@ async def _run_tentative(state: _StreamState, slot: _Slot, seq: int) -> None:
             channels=state.channels,
         )
 
-        src = slot.source or "auto"
-        dst = slot.target or ""
-        pinned_src = None if src == "auto" else src
+        is_pair_auto = (state.mode == "pair_auto" and len(state.languages) >= 2)
+        if is_pair_auto:
+            if slot.speaker_id is None:
+                winner, conf, low_conf = await asyncio.to_thread(
+                    pipeline.asr.detect_language_constrained,
+                    decoded.samples,
+                    state.languages,
+                )
+                cand0, cand1 = state.languages[0], state.languages[1]
+                slot.source = winner
+                slot.target = cand1 if winner == cand0 else cand0
+                slot.speaker_id = 0 if winner == cand0 else 1
+                slot.direction = f"{slot.source}->{slot.target}"
+                slot.channel = state.channel_map.get(
+                    str(slot.speaker_id), "L" if slot.speaker_id == 0 else "R"
+                )
+                slot.lid_low_confidence = low_conf
+                if low_conf and pipeline is not None:
+                    pipeline.metrics.incr("lid_low_confidence")
+
+                # Invariant: Modern Standard Arabic (MSA) locked for Arabic target
+                if slot.target == "ar":
+                    slot.target_variant = None
+                if slot.source == "ar":
+                    slot.source_variant = state.source_variant
+                else:
+                    slot.source_variant = None
+
+            src = slot.source
+            dst = slot.target
+            pinned_src = src
+        else:
+            src = slot.source or "auto"
+            dst = slot.target or ""
+            pinned_src = None if src == "auto" else src
 
         asr_result, asr_timing = await pipeline._asr_sched.submit(
             {"samples": decoded.samples, "language": pinned_src},
             priority=1,
         )
+
+        # Adaptive SNR Floor check (Directives §1 & §4):
+        if state.floor_dbfs is not None and asr_result.rms_dbfs is not None:
+            if asr_result.rms_dbfs < (state.floor_dbfs + 6.0):
+                asr_result = AsrResult(
+                    text="",
+                    language=asr_result.language,
+                    language_probability=asr_result.language_probability,
+                    duration_s=asr_result.duration_s,
+                    asr_ms=asr_result.asr_ms,
+                    segments=0,
+                    dropped_segments=0,
+                    hollow=True,
+                    hollow_reason="snr_floor",
+                    model=asr_result.model,
+                    compute_type=asr_result.compute_type,
+                    batch_size=asr_result.batch_size,
+                    rms_dbfs=asr_result.rms_dbfs,
+                )
+
         detected = pipeline._resolve_detected(src, asr_result)
+
+        # Record RMS in metrics by outcome
+        if pipeline is not None and asr_result.rms_dbfs is not None:
+            if asr_result.hollow:
+                if asr_result.hollow_reason == "silence_energy":
+                    pipeline.metrics.observe_rms("silence_energy", asr_result.rms_dbfs)
+                elif asr_result.hollow_reason == "vad_no_speech":
+                    pipeline.metrics.observe_rms("vad_no_speech", asr_result.rms_dbfs)
+                else:
+                    pipeline.metrics.observe_rms("hollow_hallucination", asr_result.rms_dbfs)
+
+        extra_pair_fields: dict[str, Any] = {}
+        if is_pair_auto:
+            extra_pair_fields = {
+                "speaker_id": slot.speaker_id,
+                "direction": slot.direction,
+                "channel": slot.channel,
+                "lid_low_confidence": slot.lid_low_confidence,
+            }
 
         if asr_result.hollow or not asr_result.text.strip():
             await state.send_json({
@@ -505,6 +607,7 @@ async def _run_tentative(state: _StreamState, slot: _Slot, seq: int) -> None:
                 "hollow": True,
                 "hollow_reason": asr_result.hollow_reason,
                 "rms_dbfs": asr_result.rms_dbfs,
+                **extra_pair_fields,
             })
             return
 
@@ -517,6 +620,7 @@ async def _run_tentative(state: _StreamState, slot: _Slot, seq: int) -> None:
             "original_text": asr_result.text,
             "asr_ms": asr_result.asr_ms,
             "rms_dbfs": asr_result.rms_dbfs,
+            **extra_pair_fields,
         })
 
         if not dst:
@@ -616,6 +720,7 @@ async def _run_tentative(state: _StreamState, slot: _Slot, seq: int) -> None:
                 "rtl": lang_mod.is_rtl(dst),
                 "from_tentative": True,
                 "tentative_seq": seq,
+                **extra_pair_fields,
             })
 
         tentative_pass_ms = (time.perf_counter() - started) * 1000.0
@@ -653,6 +758,7 @@ async def _run_tentative(state: _StreamState, slot: _Slot, seq: int) -> None:
             "tentative_hit": None,
             "time_saved_ms": None,
             "presplit_hits": presplit_hits,
+            **extra_pair_fields,
         }
 
         slot.tentative_result = (sentence_frames, final_frame, tentative_pass_ms)
@@ -834,8 +940,25 @@ async def _commit_slot(state: _StreamState, slot: _Slot, seq: int) -> None:
         slot.tentative_task.cancel()
     raw = bytes(slot.buffer)
     if not state.utterance_queue.full():
-        await state.utterance_queue.put(
-            (
+        if state.mode == "pair_auto":
+            queue_item = (
+                "fresh",
+                raw,
+                utt_id,
+                commit_time,
+                slot.source,
+                slot.target,
+                slot.source_variant,
+                slot.target_variant,
+                during_ratio,
+                context_prefix,
+                slot.speaker_id,
+                slot.direction,
+                slot.channel,
+                slot.lid_low_confidence,
+            )
+        else:
+            queue_item = (
                 "fresh",
                 raw,
                 utt_id,
@@ -847,7 +970,7 @@ async def _commit_slot(state: _StreamState, slot: _Slot, seq: int) -> None:
                 during_ratio,
                 context_prefix,
             )
-        )
+        await state.utterance_queue.put(queue_item)
     else:
         await state.send_json({"error": "overloaded", "retry_after_ms": 250, "detail": "utterance queue full", "utterance": utt_id})
 
@@ -876,7 +999,7 @@ async def _on_control_frame(state: _StreamState, control: dict[str, Any]) -> Non
 
             if target_slot is not None:
                 slot_id = target_slot.utt_id
-                if not state.target:
+                if not state.target and not (state.mode == "pair_auto" and len(state.languages) >= 2):
                     await state.send_json({
                         "error": "missing_target",
                         "detail": "target language not set",
@@ -955,6 +1078,11 @@ async def _on_control_frame(state: _StreamState, control: dict[str, Any]) -> Non
         return
 
     if action == "tentative":
+        if "floor_dbfs" in control and control["floor_dbfs"] is not None:
+            try:
+                state.floor_dbfs = float(control["floor_dbfs"])
+            except (TypeError, ValueError):
+                pass
         utt_val = control.get("utt")
         seq_val = control.get("seq")
         try:
@@ -1039,6 +1167,9 @@ async def _on_control_frame(state: _StreamState, control: dict[str, Any]) -> Non
     await state.send_json(
         {
             "event": "config",
+            "mode": state.mode,
+            "languages": state.languages,
+            "channel_map": state.channel_map,
             "source": state.source,
             "target": state.target,
             "source_variant": state.source_variant,
@@ -1047,6 +1178,7 @@ async def _on_control_frame(state: _StreamState, control: dict[str, Any]) -> Non
             "sample_rate": state.sample_rate,
             "channels": state.channels,
             "protocol": state.protocol_version,
+            "floor_dbfs": state.floor_dbfs,
             "applies_from_utt": applies_from_utt,
             "ignored_keys": sorted(unknown) or None,
         }
@@ -1574,6 +1706,10 @@ async def _utterance_worker(state: _StreamState) -> None:
                 slot_tgt_var = extra[3] if len(extra) > 3 else None
                 during_ratio = extra[4] if len(extra) > 4 else 0.0
                 context_prefix = extra[5] if len(extra) > 5 else ""
+                slot_spk = extra[6] if len(extra) > 6 else None
+                slot_dir = extra[7] if len(extra) > 7 else None
+                slot_chan = extra[8] if len(extra) > 8 else None
+                slot_low_conf = extra[9] if len(extra) > 9 else False
                 await _handle_utterance_payload(
                     state,
                     raw,
@@ -1584,6 +1720,10 @@ async def _utterance_worker(state: _StreamState) -> None:
                     target_variant=slot_tgt_var,
                     during_ratio=during_ratio,
                     context_prefix=context_prefix,
+                    speaker_id=slot_spk,
+                    direction=slot_dir,
+                    channel=slot_chan,
+                    lid_low_confidence=slot_low_conf,
                 )
 
             elif isinstance(item, tuple) and len(item) == 2:
@@ -1606,11 +1746,47 @@ async def _handle_utterance_payload(
     target_variant: str | None = None,
     during_ratio: float = 0.0,
     context_prefix: str = "",
+    speaker_id: int | None = None,
+    direction: str | None = None,
+    channel: str | None = None,
+    lid_low_confidence: bool = False,
 ) -> None:
     state.utterances += 1
     utt_tag = utt_id if utt_id is not None else state.utterances
 
     assert PIPELINE is not None
+
+    if state.mode == "pair_auto" and len(state.languages) >= 2:
+        if speaker_id is None or source is None:
+            try:
+                decoded, _ = await PIPELINE._decode_checked(
+                    raw,
+                    declared_format=state.audio_format,
+                    input_sample_rate=state.sample_rate,
+                    channels=state.channels,
+                )
+                winner, conf, low_conf = await asyncio.to_thread(
+                    PIPELINE.asr.detect_language_constrained,
+                    decoded.samples,
+                    state.languages,
+                )
+                cand0, cand1 = state.languages[0], state.languages[1]
+                source = winner
+                target = cand1 if winner == cand0 else cand0
+                speaker_id = 0 if winner == cand0 else 1
+                direction = f"{source}->{target}"
+                channel = state.channel_map.get(str(speaker_id), "L" if speaker_id == 0 else "R")
+                lid_low_confidence = low_conf
+                if low_conf and PIPELINE is not None:
+                    PIPELINE.metrics.incr("lid_low_confidence")
+                if target == "ar":
+                    target_variant = None
+                if source == "ar":
+                    source_variant = state.source_variant
+                else:
+                    source_variant = None
+            except Exception as exc:
+                log.warning("pair_auto LID failed in _handle_utterance_payload: %s", exc)
 
     if state.stream:
         await _stream_utterance(
@@ -1623,6 +1799,10 @@ async def _handle_utterance_payload(
             target_variant=target_variant,
             during_ratio=during_ratio,
             context_prefix=context_prefix,
+            speaker_id=speaker_id,
+            direction=direction,
+            channel=channel,
+            lid_low_confidence=lid_low_confidence,
         )
         return
 
@@ -1687,6 +1867,11 @@ async def _handle_utterance_payload(
     out_payload["retried"] = outcome.detail.get("retried", False) if outcome.detail else False
     out_payload["hollow_reason"] = outcome.detail.get("hollow_reason", None) if outcome.detail else None
     out_payload["rms_dbfs"] = outcome.detail.get("rms_dbfs", None) if outcome.detail else None
+    if state.mode == "pair_auto":
+        out_payload["speaker_id"] = speaker_id
+        out_payload["direction"] = direction
+        out_payload["channel"] = channel
+        out_payload["lid_low_confidence"] = lid_low_confidence
     if effective_src_var:
         out_payload["source_variant"] = effective_src_var
     if effective_tgt_var:
@@ -1696,6 +1881,8 @@ async def _handle_utterance_payload(
     await state.send_json({**out_payload, "utterance": utt_tag, "utt": utt_tag})
     src_text = out_payload.get("original_text", "")
     mt_text = out_payload.get("translated_text", "")
+    if PIPELINE is not None and out_payload.get("rms_dbfs") is not None:
+        PIPELINE.metrics.observe_rms("rendered", out_payload.get("rms_dbfs"))
     log.info(
         "Utterance committed [utt=%s]: %s[%s] -> %s | src=%r -> mt=%r | rms_dbfs=%s | server_ms=%.1f",
         utt_tag,
@@ -1725,6 +1912,10 @@ async def _stream_utterance(
     target_variant: str | None = None,
     during_ratio: float = 0.0,
     context_prefix: str = "",
+    speaker_id: int | None = None,
+    direction: str | None = None,
+    channel: str | None = None,
+    lid_low_confidence: bool = False,
 ) -> None:
     """Relay the pipeline's per-sentence frames to the client."""
     assert PIPELINE is not None
@@ -1785,8 +1976,16 @@ async def _stream_utterance(
                 state.last_committed_src_text = src_text
                 state.last_has_terminal_punct = bool(src_text.rstrip() and src_text.rstrip()[-1] in _TERMINATORS)
 
-            await state.send_json({**frame, "utterance": utt_tag, "utt": utt_tag})
+            frame_payload = {**frame, "utterance": utt_tag, "utt": utt_tag}
+            if state.mode == "pair_auto":
+                frame_payload["speaker_id"] = speaker_id
+                frame_payload["direction"] = direction
+                frame_payload["channel"] = channel
+                frame_payload["lid_low_confidence"] = lid_low_confidence
+            await state.send_json(frame_payload)
             if frame.get("type") == "final":
+                if PIPELINE is not None and frame.get("rms_dbfs") is not None:
+                    PIPELINE.metrics.observe_rms("rendered", frame.get("rms_dbfs"))
                 log.info(
                     "Utterance streamed final [utt=%s]: %s[%s] -> %s | src=%r -> mt=%r | rms_dbfs=%s | server_ms=%.1f",
                     utt_tag,

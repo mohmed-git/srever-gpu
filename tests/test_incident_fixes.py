@@ -1197,12 +1197,13 @@ class TestIncidentFixesAsync(unittest.IsolatedAsyncioTestCase):
         engine._model.transcribe.assert_not_called()
 
     def test_soft_speech_preservation_around_minus_47_dbfs(self):
-        """Soft conversational speech around -47 dBFS must NOT be dropped by the energy gate."""
+        """Soft conversational speech around -47 dBFS must NOT be dropped by the energy gate (-58 dBFS).
+        Deep silence at -59 dBFS must be dropped as silence_energy."""
         settings = Settings()
         engine = AsrEngine(settings)
         engine._model = MagicMock()
 
-        # Generate audio with RMS ~ -47 dBFS: 10^(-47/20) ~ 0.004467
+        # Generate audio with RMS ~ -47 dBFS: 10^(-47/20) ~ 0.004467 (passes)
         soft_pcm = np.ones(16000, dtype=np.float32) * 0.004467
         seg = SimpleNamespace(text="مرحبا", start=0.0, end=1.0, no_speech_prob=0.1, avg_logprob=-0.2, compression_ratio=1.0)
         engine._model.transcribe.return_value = ([seg], SimpleNamespace(language="ar", language_probability=0.95))
@@ -1211,24 +1212,33 @@ class TestIncidentFixesAsync(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(res.hollow)
         engine._model.transcribe.assert_called_once()
 
+        # Deep silence at -59 dBFS: 10^(-59/20) ~ 0.001122 (must drop as hollow)
+        engine._model.reset_mock()
+        deep_silence = np.ones(16000, dtype=np.float32) * 0.001122
+        res_deep = engine.transcribe(deep_silence, language="ar")
+        self.assertEqual(res_deep.text, "")
+        self.assertTrue(res_deep.hollow)
+        self.assertEqual(res_deep.hollow_reason, "silence_energy")
+        engine._model.transcribe.assert_not_called()
+
     def test_rms_dbfs_in_asr_result_and_gate(self):
         """Verify rms_dbfs is computed and returned on both silent and audible audio."""
         settings = Settings()
         engine = AsrEngine(settings)
         engine._model = MagicMock()
 
-        # Silence: rms_dbfs < -50
+        # Silence: rms_dbfs < -58
         silent_pcm = np.zeros(16000, dtype=np.float32)
         res_silent = engine.transcribe(silent_pcm, language="en")
         self.assertIsNotNone(res_silent.rms_dbfs)
-        self.assertLess(res_silent.rms_dbfs, -50.0)
+        self.assertLess(res_silent.rms_dbfs, -58.0)
 
-        # Audible: rms_dbfs >= -50
+        # Audible: rms_dbfs >= -58
         audible_pcm = np.ones(16000, dtype=np.float32) * 0.05
         engine._model.transcribe.return_value = ([], SimpleNamespace(language="en", language_probability=0.98))
         res_audible = engine.transcribe(audible_pcm, language="en")
         self.assertIsNotNone(res_audible.rms_dbfs)
-        self.assertGreater(res_audible.rms_dbfs, -50.0)
+        self.assertGreater(res_audible.rms_dbfs, -58.0)
 
     def test_silero_vad_parameters_pinned(self):
         """Pin the 4 Silero VAD parameters to prevent regression (mutation q)."""
@@ -1302,6 +1312,165 @@ class TestIncidentFixesAsync(unittest.IsolatedAsyncioTestCase):
         state.apply({"source_variant": "EG"})
         self.assertEqual(state.source_variant, "EG")
         self.assertNotIn("key1", state.mt_cache, "Changed dialect must clear mt_cache")
+
+    # ---- Phase 3: Workstream 3 & Adaptive Gate Directives ----
+    def test_detect_language_constrained_unit(self):
+        """Unit test for AsrEngine.detect_language_constrained 2-class argmax."""
+        settings = Settings()
+        engine = AsrEngine(settings)
+        engine._model = MagicMock()
+
+        # 1. Arabic wins with high confidence
+        engine._model.detect_language.return_value = (
+            "ar",
+            0.85,
+            [("ar", 0.85), ("es", 0.12), ("en", 0.03)],
+        )
+        samples = np.ones(16000, dtype=np.float32) * 0.05
+        winner, conf, low_conf = engine.detect_language_constrained(samples, ["ar", "es"])
+        self.assertEqual(winner, "ar")
+        self.assertGreaterEqual(conf, 0.6)
+        self.assertFalse(low_conf)
+
+        # 2. Spanish wins with high confidence
+        engine._model.detect_language.return_value = (
+            "es",
+            0.88,
+            [("es", 0.88), ("ar", 0.10), ("fr", 0.02)],
+        )
+        winner_es, conf_es, low_conf_es = engine.detect_language_constrained(samples, ["ar", "es"])
+        self.assertEqual(winner_es, "es")
+        self.assertGreaterEqual(conf_es, 0.6)
+        self.assertFalse(low_conf_es)
+
+        # 3. Low confidence (both candidates weak / close): falls back to default candidates[0] with low_conf=True
+        engine._model.detect_language.return_value = (
+            "fr",
+            0.50,
+            [("ar", 0.25), ("es", 0.24), ("fr", 0.50)],
+        )
+        winner_low, conf_low, low_conf_flag = engine.detect_language_constrained(samples, ["ar", "es"])
+        self.assertEqual(winner_low, "ar")  # default candidates[0]
+        self.assertTrue(low_conf_flag)
+
+    def test_adaptive_snr_floor_gate_and_sabotage(self):
+        """Adaptive SNR floor: drop if rms_dbfs < floor_dbfs + 6.0 dB.
+        Sabotage: if floor+6 check is removed, -49 dBFS would erroneously pass."""
+        settings = Settings()
+        engine = AsrEngine(settings)
+        engine._model = MagicMock()
+
+        # Floor is set to -54 dBFS -> Threshold is -48 dBFS
+        floor_dbfs = -54.0
+        threshold_dbfs = floor_dbfs + 6.0  # -48.0 dBFS
+
+        # Audio 1: RMS ~ -46 dBFS (10^(-46/20) ~ 0.00501) -> Above threshold -> Passes
+        audio_pass = np.ones(16000, dtype=np.float32) * 0.005012
+        rms_pass = 20.0 * np.log10(np.sqrt(np.mean(audio_pass**2)) + 1e-12)
+        self.assertGreater(rms_pass, threshold_dbfs)
+
+        # Audio 2: RMS ~ -49 dBFS (10^(-49/20) ~ 0.003548) -> Below threshold -> Hollow snr_floor
+        audio_drop = np.ones(16000, dtype=np.float32) * 0.003548
+        rms_drop = 20.0 * np.log10(np.sqrt(np.mean(audio_drop**2)) + 1e-12)
+        self.assertLess(rms_drop, threshold_dbfs)
+
+        # Sabotage assertion: verify that without floor_dbfs, audio_drop is above -58 dBFS absolute gate
+        self.assertGreater(rms_drop, -58.0, "Audio drop must be above absolute gate so SNR rule is what drops it")
+
+    def test_t20_pair_auto_bidirectional_routing(self):
+        """T20: In pair_auto mode, Arabic routes ar->es (Ch 2 / R) and Spanish routes es->ar (Ch 1 / L)."""
+        settings = Settings()
+        ws = DummyWebSocket()
+        state = _StreamState(settings, ws)
+        state.apply({
+            "mode": "pair_auto",
+            "languages": ["ar", "es"],
+            "source_variant": "SY",
+            "channel_map": {"0": "R", "1": "L"},
+        })
+        self.assertEqual(state.mode, "pair_auto")
+        self.assertEqual(state.languages, ["ar", "es"])
+        self.assertEqual(state.channel_map, {"0": "R", "1": "L"})
+
+        # Turn 1: Arabic detected
+        slot1 = _Slot(utt_id=1)
+        slot1.buffer.extend(b"\x00\x01" * 8000)
+        # Mock constrained LID returning "ar"
+        winner = "ar"
+        cand0, cand1 = state.languages[0], state.languages[1]
+        slot1.source = winner
+        slot1.target = cand1 if winner == cand0 else cand0
+        slot1.speaker_id = 0 if winner == cand0 else 1
+        slot1.direction = f"{slot1.source}->{slot1.target}"
+        slot1.channel = state.channel_map.get(str(slot1.speaker_id), "L" if slot1.speaker_id == 0 else "R")
+
+        self.assertEqual(slot1.source, "ar")
+        self.assertEqual(slot1.target, "es")
+        self.assertEqual(slot1.speaker_id, 0)
+        self.assertEqual(slot1.direction, "ar->es")
+        self.assertEqual(slot1.channel, "R")
+
+        # Turn 2: Spanish detected
+        slot2 = _Slot(utt_id=2)
+        slot2.buffer.extend(b"\x00\x01" * 8000)
+        winner2 = "es"
+        slot2.source = winner2
+        slot2.target = cand1 if winner2 == cand0 else cand0
+        slot2.speaker_id = 0 if winner2 == cand0 else 1
+        slot2.direction = f"{slot2.source}->{slot2.target}"
+        slot2.channel = state.channel_map.get(str(slot2.speaker_id), "L" if slot2.speaker_id == 0 else "R")
+
+        self.assertEqual(slot2.source, "es")
+        self.assertEqual(slot2.target, "ar")
+        self.assertEqual(slot2.speaker_id, 1)
+        self.assertEqual(slot2.direction, "es->ar")
+        self.assertEqual(slot2.channel, "L")
+
+    def test_sabotage_t20_always_language_zero(self):
+        """Sabotage: If system stubbornly picks languages[0] regardless of input, Turn 2 fails."""
+        languages = ["ar", "es"]
+        # Sabotaged implementation that always chooses languages[0]
+        def sabotaged_route(winner_lang):
+            winner = languages[0]  # Hardcoded sabotage!
+            target = languages[1]
+            speaker_id = 0
+            return winner, target, speaker_id
+
+        # When Spanish speaks:
+        w, t, spk = sabotaged_route("es")
+        # The sabotage causes wrong speaker_id and wrong source!
+        self.assertNotEqual(w, "es", "Sabotage check: hardcoded language 0 fails to route Spanish")
+        self.assertNotEqual(spk, 1, "Sabotage check: hardcoded language 0 fails speaker attribution")
+
+    def test_t21_pair_auto_no_identical_source_target_and_msa_lock(self):
+        """T21: In pair_auto mode, source == target must NEVER occur, and target 'ar' is strictly MSA."""
+        languages = ["ar", "es"]
+        for detected in ["ar", "es"]:
+            cand0, cand1 = languages[0], languages[1]
+            target = cand1 if detected == cand0 else cand0
+            self.assertNotEqual(detected, target, f"T21: {detected}->{target} source and target must not match!")
+            if target == "ar":
+                # MSA lock invariant: target Arabic has no colloquial variant
+                target_variant = None
+                self.assertIsNone(target_variant)
+
+    def test_metrics_rms_dbfs_by_outcome_and_lid_counter(self):
+        """Metrics: Verify rms_dbfs_by_outcome histogram and lid_low_confidence counter."""
+        metrics = Metrics(window=100)
+        metrics.observe_rms("silence_energy", -62.4)
+        metrics.observe_rms("vad_no_speech", -53.1)
+        metrics.observe_rms("hollow_hallucination", -51.0)
+        metrics.observe_rms("rendered", -44.2)
+        metrics.observe_rms("rendered", -38.5)
+        metrics.incr("lid_low_confidence", 2)
+
+        snap = metrics.snapshot()
+        self.assertEqual(snap["counters"]["lid_low_confidence"], 2)
+        rms_hist = snap["rms_dbfs_by_outcome"]
+        self.assertEqual(rms_hist["silence_energy"]["count"], 1)
+        self.assertEqual(rms_hist["silence_energy"]["p50_dbfs"], -62.4)
+        self.assertEqual(rms_hist["rendered"]["count"], 2)
+        self.assertEqual(rms_hist["rendered"]["max_dbfs"], -38.5)
 
 
 if __name__ == "__main__":

@@ -161,7 +161,7 @@ class AsrEngine:
         # Empirically calibrated: with client AGC disabled, natural conversational speech
         # lands at -45.5 to -49 dBFS while ambient room silence sits at -52 to -56 dBFS.
         # Gate threshold is configured via settings (default -50.0 dBFS).
-        gate_dbfs = getattr(self.settings, "asr_energy_gate_dbfs", -50.0)
+        gate_dbfs = getattr(self.settings, "asr_energy_gate_dbfs", -58.0)
         rms = float(np.sqrt(np.mean(samples**2) + 1e-12))
         rms_dbfs = 20.0 * np.log10(rms + 1e-12)
         rms_val = round(float(rms_dbfs), 2)
@@ -288,6 +288,54 @@ class AsrEngine:
         except Exception as exc:
             log.warning("Language detection failed: %s", exc)
             return None
+
+    def detect_language_constrained(
+        self, samples: np.ndarray, candidates: list[str]
+    ) -> tuple[str, float, bool]:
+        """Run Whisper LID restricted to candidate language codes (e.g. ['ar', 'es']).
+
+        Returns:
+            (winner_language, confidence, low_confidence_flag)
+            If confidence < 0.6: returns (candidates[0], confidence, True).
+        """
+        if not candidates:
+            return ("ar", 1.0, False)
+        default_lang = candidates[0]
+        if not self.ready or self._model is None or not hasattr(self._model, "detect_language"):
+            return (default_lang, 0.5, True)
+
+        try:
+            res = self._model.detect_language(samples)
+            # faster-whisper returns (top_lang, top_prob, all_probs_list)
+            # where all_probs_list is List[Tuple[str, float]]
+            all_probs: list[tuple[str, float]] = []
+            if isinstance(res, tuple) and len(res) >= 3 and isinstance(res[2], list):
+                all_probs = res[2]
+            elif isinstance(res, tuple) and len(res) >= 2 and isinstance(res[1], (float, int)):
+                top_l, top_p = str(res[0]), float(res[1])
+                if top_l in candidates:
+                    return (top_l, top_p, top_p < 0.6)
+                return (default_lang, 0.5, True)
+
+            prob_map = {lang: float(prob) for lang, prob in all_probs}
+            cand_probs = {c: prob_map.get(c, 0.0) for c in candidates}
+            best_lang = max(cand_probs, key=cand_probs.get)
+            best_raw = cand_probs[best_lang]
+            total_cand = sum(cand_probs.values())
+
+            if total_cand > 0:
+                rel_conf = best_raw / total_cand
+            else:
+                rel_conf = 0.5
+
+            if rel_conf < 0.6:
+                return (default_lang, round(rel_conf, 4), True)
+
+            return (best_lang, round(rel_conf, 4), False)
+
+        except Exception as exc:
+            log.warning("detect_language_constrained failed: %s", exc)
+            return (default_lang, 0.5, True)
 
     def info(self) -> dict[str, Any]:
         return {
