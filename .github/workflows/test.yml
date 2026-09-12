@@ -1,0 +1,35 @@
+﻿name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.10"
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install requests transformers httpx pytest
+    - name: Run local unit tests
+      run: |
+        python -m unittest discover tests -p "test_qwen*.py"
+        python -m unittest discover tests -p "check_*.py"
+    - name: Run Chatbot Leak Test
+      env:
+        LINGUA_MT_URL: $\{{ secrets.LINGUA_MT_URL }}
+        LINGUA_AUTH_TOKEN: $\{{ secrets.LINGUA_AUTH_TOKEN }}
+      run: |
+        if [ -z "$LINGUA_MT_URL" ]; then
+          echo "SKIPPED: no MT endpoint (LINGUA_MT_URL is not set)"
+        else
+          python -m unittest tests.test_chatbot_leak -v
+        fi
