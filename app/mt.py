@@ -282,7 +282,7 @@ def make_translation_messages(
         )
         return [
             {"role": "system", "content": system_content},
-            {"role": "user", "content": user_content},
+            {"role": "user", "content": f"Translate the following text from {src_name} to Arabic:\n\n{user_content}"},
         ]
     elif src_norm == "ar":
         var_tag = (source_variant or "").strip().upper()
@@ -313,7 +313,7 @@ def make_translation_messages(
             )
         return [
             {"role": "system", "content": system_content},
-            {"role": "user", "content": user_content},
+            {"role": "user", "content": f"Translate the following text from Arabic to {dst_name}:\n\n{user_content}"},
         ]
     else:
         system_content = (
@@ -328,7 +328,7 @@ def make_translation_messages(
         )
         return [
             {"role": "system", "content": system_content},
-            {"role": "user", "content": user_content},
+            {"role": "user", "content": f"Translate the following text from {src_name} to {dst_name}:\n\n{user_content}"},
         ]
 
 
