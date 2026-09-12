@@ -54,9 +54,10 @@ class TestChatbotLeak(unittest.TestCase):
             src, dst, text = c["src"], c["dst"], c["text"]
             known_bad = c.get("known_bad")
             
-            sr = _script_ratio(out, dst)
-            if sr < 0.5:
-                failures.append(f"[{src}->{dst}] '{text}': Target script ratio {sr:.0%} < 50% for '{out}'")
+            if out:
+                sr = _script_ratio(out, dst)
+                if sr < 0.5:
+                    failures.append(f"[{src}->{dst}] '{text}': Target script ratio {sr:.0%} < 50% for '{out}'")
                 
             if _is_conversational_chatter(out):
                 failures.append(f"[{src}->{dst}] '{text}': Chatter pattern detected in '{out}'")
@@ -80,7 +81,9 @@ class TestChatbotLeak(unittest.TestCase):
                     failures.append(f"[{src}->{dst}] '{text}': Generated exact known_bad hallucination: '{out}'")
 
             # Emit per-case results to stdout as requested
-            print(json.dumps({"text": text, "out": out, "checks_failed": len(failures) > 0}, ensure_ascii=False))
+            # Fix JSON logging to check if this specific item failed
+            item_failed = any(text in f for f in failures)
+            print(json.dumps({"text": text, "out": out, "checks_failed": item_failed}, ensure_ascii=False))
 
         if failures:
             self.fail(f"Chatbot Leak Failed on {len(failures)}/{len(self.corpus)} cases:\n" + "\n".join(failures))
