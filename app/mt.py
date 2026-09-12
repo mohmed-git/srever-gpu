@@ -351,8 +351,7 @@ _CJK_TARGETS: Final[frozenset[str]] = frozenset(
 _AR_1P = re.compile(
     r"(?:^|[\s،,])(?:و)?(?:أنا|إنني|أنني|إني|نحن|إننا)(?=$|[\s،,؟?.!])"
     r"|(?:^|\s)(?:و|ف)?(?:سأ|سوف\s+أ|أ)[\u0621-\u064A]{2,}"
-    r"|(?:^|\s)(?:و|ف)?(?:سن|سوف\s+ن|ن)[\u0621-\u064A]{2,}(?=$|[\s،,؟?.!])"
-    r"|[\u0621-\u064A]{2,}(?:ني|نا|ي)(?=$|[\s،,؟?.!])",
+    r"|(?:^|\s)(?:و|ف)?(?:سن|سوف\s+ن|ن)[\u0621-\u064A]{2,}(?=$|[\s،,؟?.!])",
     re.UNICODE,
 )
 _AR_1P_STOP = {
@@ -360,6 +359,8 @@ _AR_1P_STOP = {
     "إلى", "أمام", "أكثر", "أول", "أمس", "أحد", "أيضا", "أيضاً",
     "أنك", "إنك", "أنكم", "إنكم", "أنكن", "إنكن", "أنه", "إنه", "أنها", "إنها",
     "أنهم", "إنهم", "أن", "إن", "إذا", "إذن", "ألا", "إلا",
+    "أحمق", "أفضل", "أسوأ", "أكبر", "أصغر", "أقل", "أحسن", "أطول", "أقصر", "أسرع", "أبطأ",
+    "أبيض", "أسود", "أحمر", "أصفر", "أخضر", "أزرق",
 }
 
 _FIRST_PERSON_EN = re.compile(r"\b(i|me|my|mine|myself|we|us|our|ours|ourselves)\b", re.IGNORECASE)
@@ -402,7 +403,7 @@ def detect_person_mismatch(source_text: str, target_text: str, src_lang: str, ds
         tgt_1p = has_1p_ar(target_text)
         if not src_1p and tgt_1p:
             return True
-    elif norm_src == "ar":
+    elif norm_src == "ar" and norm_dst == "en":
         src_1p = has_1p_ar(source_text)
         tgt_1p = has_1p_en(target_text)
         if src_1p and not tgt_1p:

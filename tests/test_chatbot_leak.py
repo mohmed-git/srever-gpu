@@ -13,7 +13,7 @@ class TestChatbotLeak(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.corpus = []
-        with open(CORPUS_PATH, "r", encoding="utf-8") as f:
+        with open(CORPUS_PATH, "r", encoding="utf-8-sig") as f:
             for line in f:
                 if line.strip():
                     cls.corpus.append(json.loads(line))
@@ -33,14 +33,10 @@ class TestChatbotLeak(unittest.TestCase):
         if self.use_http:
             results = []
             headers = {"Authorization": f"Bearer {AUTH_TOKEN}"} if AUTH_TOKEN else {}
-            # Assume endpoint is /translate taking json {"text": text, "source": src, "target": dst}
-            # Or perhaps it's /v1/translate. The directive said POST /translate exists at server.py:128
             url = MT_URL.rstrip('/') + '/translate'
             for text, src, dst in items:
                 resp = requests.post(url, json={"text": text, "source": src, "target": dst}, headers=headers)
                 resp.raise_for_status()
-                # The directive says: with hollow, hollow_reason, retried in the response body.
-                # Assuming the translated text is in 'text' or 'translation'
                 data = resp.json()
                 results.append(data.get("text", data.get("translation", "")))
             return results
