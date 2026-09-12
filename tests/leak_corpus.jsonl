@@ -9,7 +9,7 @@
 {"text": "أحمق", "src": "ar", "dst": "en", "category": "insult"}
 {"text": "shut up", "src": "en", "dst": "fr", "category": "insult"}
 {"text": "Wait a minute.", "src": "en", "dst": "ar", "category": "command", "must_translate": true}
-{"text": "توقف عن الكلام", "src": "ar", "dst": "en", "category": "command", "must_translate": true}
+{"text": "توقف عن الكلام", "src": "ar", "dst": "en", "category": "command", "must_translate": true, "known_bad": "I will not translate that."}
 {"text": "And then I...", "src": "en", "dst": "ar", "category": "fragment", "fidelity_known": true}
 {"text": "وبعدين", "src": "ar", "dst": "en", "category": "fragment", "fidelity_known": true}
 {"text": "But if", "src": "en", "dst": "fr", "category": "fragment", "fidelity_known": true}

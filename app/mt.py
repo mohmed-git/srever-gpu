@@ -564,7 +564,7 @@ def detect_person_mismatch(source_text: str, target_text: str, src_lang: str, ds
     elif norm_src == "ar" and norm_dst == "en":
         src_1p = has_1p_ar(source_text)
         tgt_1p = has_1p_en(target_text)
-        if src_1p and not tgt_1p:
+        if bool(src_1p) != bool(tgt_1p):
             return True
     elif norm_dst == "fr":
         src_1p = has_1p_en(source_text) or has_1p_ar(source_text) or has_1p_fr(source_text)
@@ -626,7 +626,7 @@ def check_needs_retry(text: str, decoded: str, src: str, dst: str) -> tuple[bool
         return True, "length_explosion"
     if in_words == 1 and out_words > 3:
         return True, "single_token_explosion"
-    if detect_person_mismatch(text, decoded, src, dst) and norm_dst == "ar":
+    if detect_person_mismatch(text, decoded, src, dst) and (norm_dst == "ar" or (norm_src == "ar" and norm_dst == "en")):
         return True, "person_mismatch"
     if is_degenerate_short(decoded, dst):
         return True, "degenerate_short"
@@ -658,7 +658,7 @@ def _apply_output_guards(
         out_words = len(decoded.split())
         length_explosion = (in_words > 0 and (out_words / in_words) > 3.0)
         single_token_explosion = (in_words == 1 and out_words > 3)
-        mismatch = detect_person_mismatch(text, decoded, src, dst) and norm_dst == "ar"
+        mismatch = detect_person_mismatch(text, decoded, src, dst) and (norm_dst == "ar" or (norm_src == "ar" and norm_dst == "en"))
 
         if _low_target_script(decoded, dst):
             hollow, reason = True, f"target script ratio {_script_ratio(decoded, dst):.0%} < 50%"
@@ -835,14 +835,17 @@ def _low_target_script(text: str, target_lang: str) -> bool:
 _CHATTER_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
     re.compile(r"^\s*(?:i['’]?m\s+sorry|sorry|as\s+an\s+ai|i\s+cannot\s+translate|please\s+provide|could\s+you\s+please)\b", re.IGNORECASE),
     re.compile(r"\b(?:input\s+is\s+incomplete|provide\s+more\s+context|what\s+you\s+would\s+like\s+me\s+to\s+translate)\b", re.IGNORECASE),
+    re.compile(r"\b(?:i\s+)?(?:will\s+not|won['’]t|cannot|can['’]t|am\s+unable\s+to|refuse\s+to)\s+(?:translate|help|assist|do\s+that)\b", re.IGNORECASE),
     # French
     re.compile(r"^\s*(?:voici|voilà)\s+la\s+traduction", re.IGNORECASE),
     re.compile(r"^\s*je\s+ne\s+peux\s+pas\s+(?:traduire|comprendre)", re.IGNORECASE),
+    re.compile(r"\bje\s+ne\s+(?:peux|vais)\s+pas\s+traduire\b", re.IGNORECASE),
     re.compile(r"^\s*comment\s+puis-je\s+(?:vous\s+)?(?:aider|assister)", re.IGNORECASE),
     re.compile(r"^\s*je\s+suis.*traducteur", re.IGNORECASE),
     # Arabic
     re.compile(r"^\s*(?:إليك|هذه)\s+الترجمة", re.UNICODE),
     re.compile(r"^\s*(?:لا\s+يمكنني|لا\s+أستطيع|عذراً).*ترجم", re.UNICODE),
+    re.compile(r"\b(?:لن\s+أترجم|لا\s+يمكنني\s+ترجمة)\b", re.UNICODE),
     re.compile(r"^\s*كيف\s+(?:يمكنني|أستطيع).*(?:مساعدة|مساعدتك)", re.UNICODE),
     re.compile(r"^\s*أنا.*مترجم", re.UNICODE),
 )
