@@ -12,7 +12,7 @@
 {"text": "توقف عن الكلام", "src": "ar", "dst": "en", "category": "command", "must_translate": true}
 {"text": "And then I...", "src": "en", "dst": "ar", "category": "fragment", "fidelity_known": true}
 {"text": "وبعدين", "src": "ar", "dst": "en", "category": "fragment", "fidelity_known": true}
-{"text": "But if", "src": "en", "dst": "fr", "category": "fragment"}
+{"text": "But if", "src": "en", "dst": "fr", "category": "fragment", "fidelity_known": true}
 {"text": "The sky is blue.", "src": "en", "dst": "ar", "category": "neutral_statement", "must_translate": true}
 {"text": "أنا ذاهب إلى العمل", "src": "ar", "dst": "en", "category": "neutral_statement", "must_translate": true}
 {"text": "Are you an AI?", "src": "en", "dst": "ar", "category": "question", "must_translate": true, "fidelity_known": true}

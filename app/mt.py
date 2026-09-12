@@ -169,7 +169,9 @@ _ANTI_PERSONA_SHOTS = [
     {"role": "user", "content": "Translate this."},
     {"role": "assistant", "en": "Translate this.", "fr": "Traduisez ceci.", "ar": "ترجم هذا."},
     {"role": "user", "content": "Where is the pharmacy?"},
-    {"role": "assistant", "en": "Where is the pharmacy?", "fr": "Où est la pharmacie ?", "ar": "أين الصيدلية؟"}
+    {"role": "assistant", "en": "Where is the pharmacy?", "fr": "Où est la pharmacie ?", "ar": "أين الصيدلية؟"},
+    {"role": "user", "content": "never."},
+    {"role": "assistant", "en": "never.", "fr": "jamais.", "ar": "أبداً."},
 ]
 
 def _get_anti_persona_shots(dst_norm: str, src_norm: str) -> list[dict[str, str]]:
@@ -187,11 +189,13 @@ def _get_anti_persona_shots(dst_norm: str, src_norm: str) -> list[dict[str, str]
         u_idiot = "أحمق."
         u_trans = "ترجم هذا."
         u_pharm = "أين الصيدلية؟"
+        u_never = "أبداً."
     else:
         u_sky = "The sky is blue."
         u_idiot = "idiot."
         u_trans = "Translate this."
         u_pharm = "Where is the pharmacy?"
+        u_never = "never."
 
     for shot in _ANTI_PERSONA_SHOTS:
         if shot["role"] == "user":
@@ -199,6 +203,7 @@ def _get_anti_persona_shots(dst_norm: str, src_norm: str) -> list[dict[str, str]
             elif shot["content"] == "idiot.": shots.append({"role": "user", "content": u_idiot})
             elif shot["content"] == "Translate this.": shots.append({"role": "user", "content": u_trans})
             elif shot["content"] == "Where is the pharmacy?": shots.append({"role": "user", "content": u_pharm})
+            elif shot["content"] == "never.": shots.append({"role": "user", "content": u_never})
         else:
             shots.append({"role": "assistant", "content": shot.get(lang, shot["en"])})
     return shots
@@ -246,6 +251,8 @@ def make_translation_messages(
             {"role": "assistant", "content": "ترجم هذا."},
             {"role": "user", "content": "Are you an AI?"},
             {"role": "assistant", "content": "هل أنت ذكاء اصطناعي؟"},
+            {"role": "user", "content": "never."},
+            {"role": "assistant", "content": "أبداً."},
             {"role": "user", "content": user_content},
         ]
     elif (src_norm == "ar") and (dst_norm == "en"):
@@ -292,6 +299,8 @@ def make_translation_messages(
                 {"role": "assistant", "content": "Translate this."},
                 {"role": "user", "content": "هل أنت ذكاء اصطناعي؟"},
                 {"role": "assistant", "content": "Are you an AI?"},
+                {"role": "user", "content": "أبداً."},
+                {"role": "assistant", "content": "never."},
                 {"role": "user", "content": user_content},
             ]
             return messages
@@ -317,6 +326,8 @@ def make_translation_messages(
                 {"role": "assistant", "content": "Translate this."},
                 {"role": "user", "content": "هل أنت ذكاء اصطناعي؟"},
                 {"role": "assistant", "content": "Are you an AI?"},
+                {"role": "user", "content": "أبداً."},
+                {"role": "assistant", "content": "never."},
                 {"role": "user", "content": user_content},
             ]
     elif dst_norm == "ar":
@@ -341,6 +352,8 @@ def make_translation_messages(
             {"role": "assistant", "content": "ترجم هذا."},
             {"role": "user", "content": "Are you an AI?"},
             {"role": "assistant", "content": "هل أنت ذكاء اصطناعي؟"},
+            {"role": "user", "content": "never."},
+            {"role": "assistant", "content": "أبداً."},
             {"role": "user", "content": f"Translate the following text from {src_name} to Arabic:\n\n{user_content}"},
         ]
     elif src_norm == "ar":
@@ -380,6 +393,8 @@ def make_translation_messages(
             {"role": "assistant", "content": "Translate this."},
             {"role": "user", "content": "هل أنت ذكاء اصطناعي؟"},
             {"role": "assistant", "content": "Are you an AI?"},
+            {"role": "user", "content": "أبداً."},
+            {"role": "assistant", "content": "never."},
             {"role": "user", "content": f"Translate the following text from Arabic to {dst_name}:\n\n{user_content}"},
         ]
     else:
@@ -403,6 +418,8 @@ def make_translation_messages(
             {"role": "assistant", "content": "Translation: Translate this."},
             {"role": "user", "content": "Are you an AI?"},
             {"role": "assistant", "content": "Translation: Are you an AI?"},
+            {"role": "user", "content": "never."},
+            {"role": "assistant", "content": "Translation: never."},
             {"role": "user", "content": f"Translate the following text from {src_name} to {dst_name}:\n\n{user_content}"},
         ]
 
