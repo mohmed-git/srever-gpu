@@ -1987,7 +1987,7 @@ async def _stream_utterance(
                 if PIPELINE is not None and frame.get("rms_dbfs") is not None:
                     PIPELINE.metrics.observe_rms("rendered", frame.get("rms_dbfs"))
                 log.info(
-                    "Utterance streamed final [utt=%s]: %s[%s] -> %s | src=%r -> mt=%r | rms_dbfs=%s | server_ms=%.1f",
+                    "Utterance streamed final [utt=%s]: %s[%s] -> %s | src=%r -> mt=%r | rms_dbfs=%s | server_ms=%.1f | retried=%s hollow_reason=%s input_tokens=%s",
                     utt_tag,
                     frame.get("source_lang"),
                     frame.get("source_variant") or "none",
@@ -1996,6 +1996,9 @@ async def _stream_utterance(
                     frame.get("translated_text", ""),
                     frame.get("rms_dbfs"),
                     frame.get("total_server_ms", 0.0),
+                    frame.get("retried", False),
+                    frame.get("hollow_reason"),
+                    frame.get("input_tokens", 0),
                 )
             frames += 1
         return

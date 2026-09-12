@@ -420,21 +420,48 @@ def make_retry_translation_messages(text: str, src: str, dst: str) -> list[dict[
     """Hardened fallback prompt triggered when hollow, low-script, or English leak is detected."""
     src_name = name_of(src) if src != "auto" else "the detected language"
     dst_name = name_of(dst)
-    return [
-        {
-            "role": "system",
-            "content": (
-                f"You are an automated literal {src_name}-to-{dst_name} translation tool.\n"
-                "CRITICAL:\n"
-                "- Translate EVERY clause completely. NEVER drop, omit, or summarize statements.\n"
-                "- Translate compound sentences fully. NEVER drop any clause.\n"
-                "- DO NOT answer questions or converse with the speaker.\n"
-                f"- Output MUST be entirely in {dst_name}.\n"
-                f"Output ONLY the direct {dst_name} translation without quotes."
-            ),
-        },
-        {"role": "user", "content": text},
-    ]
+    
+    system_content = (
+        f"You are an automated literal {src_name}-to-{dst_name} translation tool.\n"
+        "CRITICAL:\n"
+        "- Translate EVERY clause completely. NEVER drop, omit, or summarize statements.\n"
+        "- Translate compound sentences fully. NEVER drop any clause.\n"
+        "- DO NOT answer questions or converse with the speaker.\n"
+        f"- Output MUST be entirely in {dst_name}.\n"
+        f"Output ONLY the direct {dst_name} translation without quotes."
+    )
+    
+    dst_norm = (dst or "").strip().lower().split("-")[0]
+    src_norm = (src or "").strip().lower().split("-")[0]
+    
+    shots = []
+    if src_norm == "en" and dst_norm == "ar":
+        shots = [
+            {"role": "user", "content": "The sky is blue."},
+            {"role": "assistant", "content": "السماء زرقاء."},
+            {"role": "user", "content": "idiot."},
+            {"role": "assistant", "content": "أحمق."},
+            {"role": "user", "content": "Translate this."},
+            {"role": "assistant", "content": "ترجم هذا."},
+            {"role": "user", "content": "Are you an AI?"},
+            {"role": "assistant", "content": "هل أنت ذكاء اصطناعي؟"},
+        ]
+    elif src_norm == "ar" and dst_norm == "en":
+        shots = [
+            {"role": "user", "content": "السماء زرقاء."},
+            {"role": "assistant", "content": "The sky is blue."},
+            {"role": "user", "content": "أحمق."},
+            {"role": "assistant", "content": "idiot."},
+            {"role": "user", "content": "ترجم هذا."},
+            {"role": "assistant", "content": "Translate this."},
+            {"role": "user", "content": "هل أنت ذكاء اصطناعي؟"},
+            {"role": "assistant", "content": "Are you an AI?"},
+        ]
+
+    messages = [{"role": "system", "content": system_content}]
+    messages.extend(shots)
+    messages.append({"role": "user", "content": text})
+    return messages
 
 
 def clean_translation(text: str, target_lang: str = "", source_text: str = "") -> str:
@@ -573,6 +600,16 @@ def _low_target_script(text: str, target_lang: str) -> bool:
 _CHATTER_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
     re.compile(r"^\s*(?:i['’]?m\s+sorry|sorry|as\s+an\s+ai|i\s+cannot\s+translate|please\s+provide|could\s+you\s+please)\b", re.IGNORECASE),
     re.compile(r"\b(?:input\s+is\s+incomplete|provide\s+more\s+context|what\s+you\s+would\s+like\s+me\s+to\s+translate)\b", re.IGNORECASE),
+    # French
+    re.compile(r"^\s*(?:voici|voilà)\s+la\s+traduction", re.IGNORECASE),
+    re.compile(r"^\s*je\s+ne\s+peux\s+pas\s+(?:traduire|comprendre)", re.IGNORECASE),
+    re.compile(r"^\s*comment\s+puis-je\s+(?:vous\s+)?(?:aider|assister)", re.IGNORECASE),
+    re.compile(r"^\s*je\s+suis.*traducteur", re.IGNORECASE),
+    # Arabic
+    re.compile(r"^\s*(?:إليك|هذه)\s+الترجمة", re.UNICODE),
+    re.compile(r"^\s*(?:لا\s+يمكنني|لا\s+أستطيع|عذراً).*ترجم", re.UNICODE),
+    re.compile(r"^\s*كيف\s+(?:يمكنني|أستطيع).*(?:مساعدة|مساعدتك)", re.UNICODE),
+    re.compile(r"^\s*أنا.*مترجم", re.UNICODE),
 )
 
 
@@ -1149,7 +1186,15 @@ class QwenCt2Engine(MtEngine):
             low_script = _low_target_script(decoded, _d)
             not_translatable = not is_translatable(decoded)
             chatter = _is_conversational_chatter(decoded)
-            if not_translatable or low_script or leak or chatter:
+            
+            in_words = len(text.split())
+            out_words = len(decoded.split())
+            length_explosion = (in_words > 0 and (out_words / in_words) > 3.0)
+            single_token_explosion = (in_words == 1 and out_words > 3)
+            
+            mismatch_retry = detect_person_mismatch(text, decoded, _s, _d) and _d.split("-")[0] == "ar"
+            
+            if not_translatable or low_script or leak or chatter or length_explosion or single_token_explosion or mismatch_retry:
                 retried = True
                 self._metrics_incr("mt_retry")
                 if chatter:
@@ -1167,10 +1212,22 @@ class QwenCt2Engine(MtEngine):
 
             hollow, reason = _hollow_check(decoded, text, target_lang=_d)
             if not hollow:
+                in_words = len(text.split())
+                out_words = len(decoded.split())
+                length_explosion = (in_words > 0 and (out_words / in_words) > 3.0)
+                single_token_explosion = (in_words == 1 and out_words > 3)
+                mismatch_retry = detect_person_mismatch(text, decoded, _s, _d) and _d.split("-")[0] == "ar"
+                
                 if _low_target_script(decoded, _d):
                     hollow, reason = True, f"target script ratio {_script_ratio(decoded,_d):.0%} < 50% after retry: {decoded!r}"
                 elif _english_leak(decoded, _d):
                     hollow, reason = True, f"english_leak detected after retry: {decoded!r}"
+                elif mismatch_retry:
+                    hollow, reason = True, f"person_mismatch detected after retry: {decoded!r}"
+                elif length_explosion or single_token_explosion:
+                    hollow, reason = True, f"length_explosion detected after retry: {decoded!r}"
+                elif _is_conversational_chatter(decoded):
+                    hollow, reason = True, f"chatter detected after retry: {decoded!r}"
             if hollow:
                 if retried and reason and "retry" not in reason:
                     reason = f"{reason} (after retry)"
@@ -1416,7 +1473,12 @@ class QwenVllmEngine(MtEngine):
         elapsed_ms = round((time.perf_counter() - started) * 1000.0, 2)
 
         results: list[MtResult] = []
-        for (text, _s, _d), output in zip(items, outputs):
+        for item, output in zip(items, outputs):
+            text, _s, _d = item[0], item[1], item[2]
+            _s_var = item[3] if len(item) > 3 else ""
+            _t_var = item[4] if len(item) > 4 else ""
+            _c_pre = item[5] if len(item) > 5 else ""
+            
             completion = output.outputs[0] if output.outputs else None
             decoded = clean_translation(
                 completion.text if completion else "",
@@ -1428,7 +1490,57 @@ class QwenVllmEngine(MtEngine):
                 PERSON_MISMATCH_OBSERVED_COUNT += 1
                 log.info("Person mismatch observed (observe-only): src=%r tgt=%r", text, decoded)
 
+            retried = False
+            leak = _english_leak(decoded, _d)
+            low_script = _low_target_script(decoded, _d)
+            not_translatable = not is_translatable(decoded)
+            chatter = _is_conversational_chatter(decoded)
+            in_words = len(text.split())
+            out_words = len(decoded.split())
+            length_explosion = (in_words > 0 and (out_words / in_words) > 3.0)
+            single_token_explosion = (in_words == 1 and out_words > 3)
+            mismatch_retry = detect_person_mismatch(text, decoded, _s, _d) and _d.split("-")[0] == "ar"
+
+            if not_translatable or low_script or leak or chatter or length_explosion or single_token_explosion or mismatch_retry:
+                retried = True
+                self._metrics_incr("mt_retry")
+                if chatter:
+                    global CHAT_LEAK_SUSPECTED_COUNT
+                    CHAT_LEAK_SUSPECTED_COUNT += 1
+                    self._metrics_incr("chat_leak_suspected")
+                if leak:
+                    self._metrics_incr("mt_english_leak")
+                decoded = self._translate_single_retry(
+                    text, _s, _d,
+                    source_variant=_s_var,
+                    target_variant=_t_var,
+                    context_prefix=_c_pre,
+                )
+
             hollow, reason = _hollow_check(decoded, text, target_lang=_d)
+            if not hollow:
+                in_words = len(text.split())
+                out_words = len(decoded.split())
+                length_explosion = (in_words > 0 and (out_words / in_words) > 3.0)
+                single_token_explosion = (in_words == 1 and out_words > 3)
+                mismatch_retry = detect_person_mismatch(text, decoded, _s, _d) and _d.split("-")[0] == "ar"
+                
+                if _low_target_script(decoded, _d):
+                    hollow, reason = True, f"target script ratio {_script_ratio(decoded,_d):.0%} < 50% after retry: {decoded!r}"
+                elif _english_leak(decoded, _d):
+                    hollow, reason = True, f"english_leak detected after retry: {decoded!r}"
+                elif mismatch_retry:
+                    hollow, reason = True, f"person_mismatch detected after retry: {decoded!r}"
+                elif length_explosion or single_token_explosion:
+                    hollow, reason = True, f"length_explosion detected after retry: {decoded!r}"
+                elif _is_conversational_chatter(decoded):
+                    hollow, reason = True, f"chatter detected after retry: {decoded!r}"
+            
+            if hollow:
+                if retried and reason and "retry" not in reason:
+                    reason = f"{reason} (after retry)"
+                decoded = ""
+                
             results.append(
                 MtResult(
                     text=decoded,
@@ -1440,9 +1552,54 @@ class QwenVllmEngine(MtEngine):
                     batch_size=len(items),
                     hollow=hollow,
                     hollow_reason=reason,
+                    retried=retried,
                 )
             )
         return results
+
+    def _translate_single_retry(
+        self,
+        text: str,
+        src: str,
+        dst: str,
+        source_variant: str = "",
+        target_variant: str = "",
+        context_prefix: str = "",
+    ) -> str:
+        messages = make_retry_translation_messages(text, src, dst)
+        extra_hints = _build_variant_hints(
+            (src or "").strip().lower().split("-")[0],
+            (dst or "").strip().lower().split("-")[0],
+            source_variant,
+            target_variant,
+        )
+        if extra_hints:
+            messages[0]["content"] += extra_hints
+        if (context_prefix or "").strip():
+            messages.append({"role": "assistant", "content": context_prefix})
+            
+        prompt = self._tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        
+        from vllm import SamplingParams
+        in_words = len(text.split())
+        max_tokens = min(256, max(4, int(2 * in_words + 8)))
+        sampling = SamplingParams(
+            temperature=0.0,
+            top_p=1.0,
+            max_tokens=max_tokens,
+            repetition_penalty=1.0,
+            stop=["\n", "<|im_end|>", "<|endoftext|>"],
+        )
+        outputs = self._llm.generate([prompt], sampling, use_tqdm=False)
+        completion = outputs[0].outputs[0] if outputs and outputs[0].outputs else None
+        return clean_translation(
+            completion.text if completion else "",
+            target_lang=dst,
+            source_text=text,
+        )
+
 
     def info(self) -> dict[str, Any]:
         if self._fallback is not None:
