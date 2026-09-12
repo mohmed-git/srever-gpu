@@ -175,6 +175,8 @@ async def translate(req: TranslateRequest, request: Request) -> JSONResponse:
             # The two fields the brief asked for, first.
             "translation": outcome.translated_text,
             "latency_ms": round((time.perf_counter() - started) * 1000.0, 2),
+            "input_tokens": outcome.detail.get("input_tokens", 0),
+            "output_tokens": outcome.detail.get("output_tokens", 0),
             # Everything else is diagnostic, and deliberately visible.
             **body,
         }

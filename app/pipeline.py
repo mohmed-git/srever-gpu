@@ -236,6 +236,7 @@ class Pipeline:
                     "mt_batch_size": mt_timing["batch_size"],
                     "mt_backend": mt_result.backend,
                     "mt_model": mt_result.model,
+                    "input_tokens": mt_result.input_tokens,
                     "output_tokens": mt_result.output_tokens,
                     "hollow": mt_result.hollow,
                     "hollow_reason": mt_result.hollow_reason,

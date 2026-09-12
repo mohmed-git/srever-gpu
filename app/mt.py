@@ -447,6 +447,12 @@ PERSON_MISMATCH_RETRY_COUNT: int = 0
 CHAT_LEAK_SUSPECTED_COUNT: int = 0
 
 
+_AR_PAST_1P_STOP = frozenset({
+    "بيت", "وقت", "أنت", "أنتِ", "صوت", "موت", "بنت", "زيت", "تحت", "صمت",
+    "حوت", "سبت", "نبات", "شتات", "ثبت", "قوت", "نعت", "ست", "مات", "فات",
+    "ليت", "ذات", "هيهات", "شتى", "أثاث", "تابوت"
+})
+
 def has_1p_ar(text: str) -> bool:
     if not text:
         return False
@@ -456,6 +462,42 @@ def has_1p_ar(text: str) -> bool:
             base = token.lstrip("وف")
             if token not in _AR_1P_STOP and base not in _AR_1P_STOP:
                 return True
+    # Past-tense 1p suffix conjugation on short verbs (e.g. بكيت, ذهبت, فعلت, قلت)
+    # Gated to tokens <= 5 letters to limit false positives
+    words = re.findall(r"[\u0621-\u064A]+", text)
+    for w in words:
+        base = w.lstrip("وف")
+        if 2 <= len(base) <= 5 and (base.endswith("ت") or base.endswith("تُ")):
+            if base not in _AR_PAST_1P_STOP and w not in _AR_PAST_1P_STOP:
+                return True
+    return False
+
+def is_degenerate_short(text: str, dst: str) -> bool:
+    norm_dst = (dst or "").strip().lower().split("-")[0]
+    if norm_dst != "ar":
+        return False
+    clean = (text or "").strip()
+    if not clean:
+        return False
+    tokens = re.findall(r"[\u0621-\u064Aa-zA-Z]+", clean)
+    if not tokens:
+        return False
+    # If all tokens are single letters, it is degenerate short (e.g. 'أ.', 'و.')
+    if all(len(t) < 2 for t in tokens):
+        return True
+    return False
+
+_ANNOTATION_PATTERN = re.compile(r"\((?:French|Arabic|English|en|fr|ar)\s*:", re.IGNORECASE)
+
+def has_annotation_or_passthrough(source: str, out: str) -> bool:
+    if not out:
+        return False
+    if _ANNOTATION_PATTERN.search(out):
+        return True
+    src_clean = (source or "").strip()
+    out_clean = (out or "").strip()
+    if src_clean and src_clean.lower() in out_clean.lower() and src_clean.lower() != out_clean.lower():
+        return True
     return False
 
 
@@ -540,8 +582,7 @@ def clean_translation(text: str, target_lang: str = "", source_text: str = "") -
         if norm_target == "ar" or base_target == "ar":
             out = re.sub(r"[\u4e00-\u9fff\u3400-\u4dbf]+", "", out).strip()
             out = re.sub(r"^(?:الترجمة|الترجمة إلى العربية|النص المترجم)\s*[:\-]\s*", "", out).strip()
-            # Clean common multilingual LLM greeting leak: 'vous' / 'et vous' -> 'وأنت؟'
-            out = re.sub(r"\b(?:et\s+)?vous\b[?؟]?", "وأنت؟", out, flags=re.IGNORECASE).strip()
+
 
     return out.strip()
 
@@ -1248,8 +1289,10 @@ class QwenCt2Engine(MtEngine):
             single_token_explosion = (in_words == 1 and out_words > 3)
             
             mismatch_retry = detect_person_mismatch(text, decoded, _s, _d) and _d.split("-")[0] == "ar"
+            degenerate_short = is_degenerate_short(decoded, _d)
+            annotation_leak = has_annotation_or_passthrough(text, decoded)
             
-            if not_translatable or low_script or leak or chatter or length_explosion or single_token_explosion or mismatch_retry:
+            if not_translatable or low_script or leak or chatter or length_explosion or single_token_explosion or mismatch_retry or degenerate_short or annotation_leak:
                 retried = True
                 self._metrics_incr("mt_retry")
                 if chatter:
@@ -1528,7 +1571,7 @@ class QwenVllmEngine(MtEngine):
         elapsed_ms = round((time.perf_counter() - started) * 1000.0, 2)
 
         results: list[MtResult] = []
-        for item, output in zip(items, outputs):
+        for idx, (item, output) in enumerate(zip(items, outputs)):
             text, _s, _d = item[0], item[1], item[2]
             _s_var = item[3] if len(item) > 3 else ""
             _t_var = item[4] if len(item) > 4 else ""
@@ -1555,8 +1598,10 @@ class QwenVllmEngine(MtEngine):
             length_explosion = (in_words > 0 and (out_words / in_words) > 3.0)
             single_token_explosion = (in_words == 1 and out_words > 3)
             mismatch_retry = detect_person_mismatch(text, decoded, _s, _d) and _d.split("-")[0] == "ar"
+            degenerate_short = is_degenerate_short(decoded, _d)
+            annotation_leak = has_annotation_or_passthrough(text, decoded)
 
-            if not_translatable or low_script or leak or chatter or length_explosion or single_token_explosion or mismatch_retry:
+            if not_translatable or low_script or leak or chatter or length_explosion or single_token_explosion or mismatch_retry or degenerate_short or annotation_leak:
                 retried = True
                 self._metrics_incr("mt_retry")
                 if chatter:
@@ -1590,6 +1635,15 @@ class QwenVllmEngine(MtEngine):
                     hollow, reason = True, f"length_explosion detected after retry: {decoded!r}"
                 elif _is_conversational_chatter(decoded):
                     hollow, reason = True, f"chatter detected after retry: {decoded!r}"
+                elif is_degenerate_short(decoded, _d):
+                    hollow, reason = True, "degenerate_short"
+                    log.warning("Sabotage guard triggered [degenerate_short]: output=%r, source=%r", decoded, text)
+                elif has_annotation_or_passthrough(text, decoded):
+                    hollow, reason = True, "annotation_leak"
+                    log.warning("Sabotage guard triggered [annotation_leak]: output=%r, source=%r", decoded, text)
+                elif mismatch_retry:
+                    hollow, reason = True, "person_mismatch"
+                    log.warning("Sabotage guard triggered [person_mismatch]: output=%r, source=%r", decoded, text)
             
             if hollow:
                 if retried and reason and "retry" not in reason:
@@ -1602,7 +1656,7 @@ class QwenVllmEngine(MtEngine):
                     mt_ms=elapsed_ms,
                     backend=self.name,
                     model=self.resolved_model,
-                    input_tokens=len(output.prompt_token_ids or []),
+                    input_tokens=(len(output.prompt_token_ids or []) if (hasattr(output, "prompt_token_ids") and output.prompt_token_ids) else (len(self._tokenizer.encode(prompts[idx])) if (self._tokenizer and idx < len(prompts)) else len(prompts[idx].split()))),
                     output_tokens=len(completion.token_ids) if completion else 0,
                     batch_size=len(items),
                     hollow=hollow,

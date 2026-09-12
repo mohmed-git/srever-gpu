@@ -3,7 +3,7 @@ import os
 import unittest
 import requests
 
-from app.mt import _script_ratio, _is_conversational_chatter
+from app.mt import _script_ratio, _is_conversational_chatter, is_degenerate_short, has_annotation_or_passthrough, detect_person_mismatch
 
 CORPUS_PATH = os.path.join(os.path.dirname(__file__), "leak_corpus.jsonl")
 MT_URL = os.environ.get("LINGUA_MT_URL")
@@ -93,7 +93,15 @@ class TestChatbotLeak(unittest.TestCase):
             if _is_conversational_chatter(out):
                 item_failures.append(f"[{src}->{dst}] '{text}': Chatter pattern detected in '{out}'")
                 
-            from app.mt import detect_person_mismatch
+            if in_toks == 0 and len(text.strip()) > 0:
+                item_failures.append(f"[{src}->{dst}] '{text}': input_tokens is 0 for non-empty source")
+
+            if is_degenerate_short(out, dst):
+                item_failures.append(f"[{src}->{dst}] '{text}': Degenerate short output in '{out}'")
+
+            if has_annotation_or_passthrough(text, out):
+                item_failures.append(f"[{src}->{dst}] '{text}': Annotation or passthrough leak in '{out}'")
+
             if detect_person_mismatch(text, out, src, dst):
                 item_failures.append(f"[{src}->{dst}] '{text}': Person mismatch (1st person injected) in '{out}'")
                 
