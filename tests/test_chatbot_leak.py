@@ -38,11 +38,20 @@ class TestChatbotLeak(unittest.TestCase):
                 resp = requests.post(url, json={"text": text, "source": src, "target": dst}, headers=headers)
                 resp.raise_for_status()
                 data = resp.json()
-                results.append(data.get("text", data.get("translation", "")))
+                results.append(data)
             return results
         else:
             res = self.engine.translate_batch(items)
-            return [r.text for r in res]
+            results = []
+            for r in res:
+                results.append({
+                    "text": r.text, 
+                    "hollow_reason": r.hollow_reason,
+                    "mt_ms": getattr(r, "mt_ms", 0),
+                    "input_tokens": getattr(r, "input_tokens", 0),
+                    "output_tokens": getattr(r, "output_tokens", 0)
+                })
+            return results
 
     def test_chatbot_leak_properties(self):
         items = [(c["text"], c["src"], c["dst"]) for c in self.corpus]
@@ -50,43 +59,84 @@ class TestChatbotLeak(unittest.TestCase):
         outputs = self._translate(items)
         
         failures = []
-        for c, out in zip(self.corpus, outputs):
+        hollow_count = 0
+        total_mt_ms = 0
+        total_in_toks = 0
+        total_out_toks = 0
+        
+        for c, output_data in zip(self.corpus, outputs):
             src, dst, text = c["src"], c["dst"], c["text"]
             known_bad = c.get("known_bad")
+            must_translate = c.get("must_translate", False)
+            out = output_data.get("text", output_data.get("translation", ""))
+            hollow_reason = output_data.get("hollow_reason", "")
             
-            if out:
+            mt_ms = output_data.get("mt_ms", 0)
+            in_toks = output_data.get("input_tokens", 0)
+            out_toks = output_data.get("output_tokens", 0)
+            
+            total_mt_ms += mt_ms
+            total_in_toks += in_toks
+            total_out_toks += out_toks
+            
+            item_failures = []
+            
+            if out == "":
+                hollow_count += 1
+                if must_translate:
+                    item_failures.append(f"[{src}->{dst}] '{text}': hollow_from_guard (must_translate is true). Reason: {hollow_reason}")
+            else:
                 sr = _script_ratio(out, dst)
                 if sr < 0.5:
-                    failures.append(f"[{src}->{dst}] '{text}': Target script ratio {sr:.0%} < 50% for '{out}'")
+                    item_failures.append(f"[{src}->{dst}] '{text}': Target script ratio {sr:.0%} < 50% for '{out}'")
                 
             if _is_conversational_chatter(out):
-                failures.append(f"[{src}->{dst}] '{text}': Chatter pattern detected in '{out}'")
+                item_failures.append(f"[{src}->{dst}] '{text}': Chatter pattern detected in '{out}'")
                 
             from app.mt import detect_person_mismatch
             if detect_person_mismatch(text, out, src, dst):
-                failures.append(f"[{src}->{dst}] '{text}': Person mismatch (1st person injected) in '{out}'")
+                item_failures.append(f"[{src}->{dst}] '{text}': Person mismatch (1st person injected) in '{out}'")
                 
             in_words = len(text.split())
             out_words = len(out.split())
             
             # General output/input ratio <= 3 (if input > 0)
             if in_words > 0 and (out_words / in_words) > 3.0:
-                failures.append(f"[{src}->{dst}] '{text}': Length explosion ({in_words}w -> {out_words}w) in '{out}'")
+                item_failures.append(f"[{src}->{dst}] '{text}': Length explosion ({in_words}w -> {out_words}w) in '{out}'")
                     
             # 4th property: single-token source -> out_words <= 3 and output != known_bad
             if in_words == 1:
                 if out_words > 3:
-                    failures.append(f"[{src}->{dst}] '{text}': Single-token source output exceeded 3 words ({out_words}w) in '{out}'")
+                    item_failures.append(f"[{src}->{dst}] '{text}': Single-token source output exceeded 3 words ({out_words}w) in '{out}'")
                 if known_bad and out == known_bad:
-                    failures.append(f"[{src}->{dst}] '{text}': Generated exact known_bad hallucination: '{out}'")
+                    item_failures.append(f"[{src}->{dst}] '{text}': Generated exact known_bad hallucination: '{out}'")
 
+            failures.extend(item_failures)
+            
             # Emit per-case results to stdout as requested
-            # Fix JSON logging to check if this specific item failed
-            item_failed = any(text in f for f in failures)
-            print(json.dumps({"text": text, "out": out, "checks_failed": item_failed}, ensure_ascii=False))
+            print(json.dumps({
+                "text": text,
+                "out": out,
+                "hollow_reason": hollow_reason,
+                "mt_ms": mt_ms,
+                "in_tok": in_toks,
+                "out_tok": out_toks,
+                "checks_failed": len(item_failures) > 0,
+                "failures": item_failures
+            }, ensure_ascii=False))
 
+        # Hollow budget: hollow_count / len(corpus) <= 0.10
+        hollow_ratio = hollow_count / len(self.corpus)
+        if hollow_ratio > 0.10:
+            failures.append(f"Hollow budget exceeded: {hollow_count}/{len(self.corpus)} ({hollow_ratio:.1%}) > 10%")
+
+        print(f"\\n--- Token & Latency Table ---")
+        print(f"Total MT MS: {total_mt_ms} ms")
+        print(f"Total Input Tokens: {total_in_toks}")
+        print(f"Total Output Tokens: {total_out_toks}")
+        
         if failures:
-            self.fail(f"Chatbot Leak Failed on {len(failures)}/{len(self.corpus)} cases:\n" + "\n".join(failures))
+            self.fail(f"Chatbot Leak Failed on {len(failures)} cases:\\n" + "\\n".join(failures))
 
 if __name__ == "__main__":
     unittest.main()

@@ -160,6 +160,49 @@ def _build_variant_hints(
 _build_variant_and_context_hints = _build_variant_hints
 
 
+
+_ANTI_PERSONA_SHOTS = [
+    {"role": "user", "content": "The sky is blue."},
+    {"role": "assistant", "en": "The sky is blue.", "fr": "Le ciel est bleu.", "ar": "السماء زرقاء."},
+    {"role": "user", "content": "idiot."},
+    {"role": "assistant", "en": "idiot.", "fr": "idiot.", "ar": "أحمق."},
+    {"role": "user", "content": "Translate this."},
+    {"role": "assistant", "en": "Translate this.", "fr": "Traduisez ceci.", "ar": "ترجم هذا."},
+    {"role": "user", "content": "Where is the pharmacy?"},
+    {"role": "assistant", "en": "Where is the pharmacy?", "fr": "Où est la pharmacie ?", "ar": "أين الصيدلية؟"}
+]
+
+def _get_anti_persona_shots(dst_norm: str, src_norm: str) -> list[dict[str, str]]:
+    shots = []
+    # If translating into Arabic, use Arabic output. Else use English output for behavior.
+    lang = dst_norm if dst_norm in ("ar", "fr", "en") else "en"
+    
+    # Actually, the requirement: 'The model was shown the test answer' meant 'Are you an AI?' was a bad shot.
+    # The shots are always translating English to target. If source is Arabic, use Arabic to target?
+    # The simplest is to match what I did before, but using the dictionary.
+    
+    # If source is Arabic, the user content should be Arabic.
+    if src_norm == "ar":
+        u_sky = "السماء زرقاء."
+        u_idiot = "أحمق."
+        u_trans = "ترجم هذا."
+        u_pharm = "أين الصيدلية؟"
+    else:
+        u_sky = "The sky is blue."
+        u_idiot = "idiot."
+        u_trans = "Translate this."
+        u_pharm = "Where is the pharmacy?"
+
+    for shot in _ANTI_PERSONA_SHOTS:
+        if shot["role"] == "user":
+            if shot["content"] == "The sky is blue.": shots.append({"role": "user", "content": u_sky})
+            elif shot["content"] == "idiot.": shots.append({"role": "user", "content": u_idiot})
+            elif shot["content"] == "Translate this.": shots.append({"role": "user", "content": u_trans})
+            elif shot["content"] == "Where is the pharmacy?": shots.append({"role": "user", "content": u_pharm})
+        else:
+            shots.append({"role": "assistant", "content": shot.get(lang, shot["en"])})
+    return shots
+
 def make_translation_messages(
     text: str,
     src: str,
@@ -468,29 +511,7 @@ def make_retry_translation_messages(text: str, src: str, dst: str) -> list[dict[
     dst_norm = (dst or "").strip().lower().split("-")[0]
     src_norm = (src or "").strip().lower().split("-")[0]
     
-    shots = []
-    if src_norm == "en" and dst_norm == "ar":
-        shots = [
-            {"role": "user", "content": "The sky is blue."},
-            {"role": "assistant", "content": "السماء زرقاء."},
-            {"role": "user", "content": "idiot."},
-            {"role": "assistant", "content": "أحمق."},
-            {"role": "user", "content": "Translate this."},
-            {"role": "assistant", "content": "ترجم هذا."},
-            {"role": "user", "content": "Are you an AI?"},
-            {"role": "assistant", "content": "هل أنت ذكاء اصطناعي؟"},
-        ]
-    elif src_norm == "ar" and dst_norm == "en":
-        shots = [
-            {"role": "user", "content": "السماء زرقاء."},
-            {"role": "assistant", "content": "The sky is blue."},
-            {"role": "user", "content": "أحمق."},
-            {"role": "assistant", "content": "idiot."},
-            {"role": "user", "content": "ترجم هذا."},
-            {"role": "assistant", "content": "Translate this."},
-            {"role": "user", "content": "هل أنت ذكاء اصطناعي؟"},
-            {"role": "assistant", "content": "Are you an AI?"},
-        ]
+    shots = _get_anti_persona_shots(dst_norm, src_norm)
 
     messages = [{"role": "system", "content": system_content}]
     messages.extend(shots)
