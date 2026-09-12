@@ -441,7 +441,7 @@ _CJK_TARGETS: Final[frozenset[str]] = frozenset(
 
 # Explicit 1p pronouns (with optional prefix و, ف)
 _AR_1P_PRONOUNS = re.compile(
-    r"(?:^|[\s،,])(?:[وف])?(?:أنا|إنني|أنني|إني|نحن|إننا)(?=$|[\s،,؟?.!])",
+    r"(?:^|[\s،,])(?:[وف])?(?:أنا|إنني|أنني|إني|نحن|إننا|إلي|إليّ|لي|معي)(?=$|[\s،,؟?.!])",
     re.UNICODE,
 )
 
@@ -567,7 +567,7 @@ def detect_person_mismatch(source_text: str, target_text: str, src_lang: str, ds
         if src_1p and not tgt_1p:
             return True
     elif norm_dst == "fr":
-        src_1p = has_1p_en(source_text) if norm_src == "en" else (has_1p_ar(source_text) if norm_src == "ar" else False)
+        src_1p = has_1p_en(source_text) or has_1p_ar(source_text) or has_1p_fr(source_text)
         tgt_1p = has_1p_fr(target_text)
         if not src_1p and tgt_1p:
             log.info("Person mismatch fr observed (observe-only): src=%r tgt=%r", source_text, target_text)

@@ -1,4 +1,4 @@
-﻿import json
+import json
 import os
 import unittest
 import requests
@@ -118,7 +118,11 @@ class TestChatbotLeak(unittest.TestCase):
                 item_failures.append(f"[{src}->{dst}] '{text}': Annotation or passthrough leak in '{out}'")
 
             if detect_person_mismatch(text, out, src, dst):
-                item_failures.append(f"[{src}->{dst}] '{text}': Person mismatch (1st person injected) in '{out}'")
+                if dst == "fr":
+                    # Observe-only in this phase as instructed
+                    pass
+                else:
+                    item_failures.append(f"[{src}->{dst}] '{text}': Person mismatch (1st person injected) in '{out}'")
                 
             in_words = len(text.split())
             out_words = len(out.split())
