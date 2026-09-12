@@ -196,12 +196,14 @@ def make_translation_messages(
         )
         return [
             {"role": "system", "content": system_content},
-            {"role": "user", "content": "Where is the train station?"},
-            {"role": "assistant", "content": "أين محطة القطار؟"},
-            {"role": "user", "content": "How are you?"},
-            {"role": "assistant", "content": "كيف حالك؟"},
-            {"role": "user", "content": "I am good, and you?"},
-            {"role": "assistant", "content": "أنا بخير، وأنت؟"},
+            {"role": "user", "content": "The sky is blue."},
+            {"role": "assistant", "content": "السماء زرقاء."},
+            {"role": "user", "content": "idiot."},
+            {"role": "assistant", "content": "أحمق."},
+            {"role": "user", "content": "Translate this."},
+            {"role": "assistant", "content": "ترجم هذا."},
+            {"role": "user", "content": "Are you an AI?"},
+            {"role": "assistant", "content": "هل أنت ذكاء اصطناعي؟"},
             {"role": "user", "content": user_content},
         ]
     elif (src_norm == "ar") and (dst_norm == "en"):
@@ -238,12 +240,18 @@ def make_translation_messages(
                 "- Conversational discourse markers express pragmatic intent: 'أبشرك' means reassurance ('Good news:' / 'I'm pleased to tell you'); 'أبشر / سم' mean willing agreement ('with pleasure' / 'gladly' / 'consider it done'); 'ما عليك' means 'don't worry'; 'تخيل' means 'Just imagine'.\n"
                 "- Output ONLY the direct English translation with no notes, explanations, or quotes."
             )
-            shots = _DIALECT_FEW_SHOTS.get(family, _DIALECT_FEW_SHOTS["gulf"])
-            messages = [{"role": "system", "content": system_content}]
-            for u, a in shots:
-                messages.append({"role": "user", "content": u})
-                messages.append({"role": "assistant", "content": a})
-            messages.append({"role": "user", "content": user_content})
+            messages = [
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": "السماء زرقاء."},
+                {"role": "assistant", "content": "The sky is blue."},
+                {"role": "user", "content": "أحمق."},
+                {"role": "assistant", "content": "idiot."},
+                {"role": "user", "content": "ترجم هذا."},
+                {"role": "assistant", "content": "Translate this."},
+                {"role": "user", "content": "هل أنت ذكاء اصطناعي؟"},
+                {"role": "assistant", "content": "Are you an AI?"},
+                {"role": "user", "content": user_content},
+            ]
             return messages
         else:
             system_content = (
@@ -260,12 +268,14 @@ def make_translation_messages(
             )
             return [
                 {"role": "system", "content": system_content},
-                {"role": "user", "content": "أين محطة القطار؟"},
-                {"role": "assistant", "content": "Where is the train station?"},
-                {"role": "user", "content": "كيف حالك؟"},
-                {"role": "assistant", "content": "How are you?"},
-                {"role": "user", "content": "أنا بخير، وأنت؟"},
-                {"role": "assistant", "content": "I am fine, and you?"},
+                {"role": "user", "content": "السماء زرقاء."},
+                {"role": "assistant", "content": "The sky is blue."},
+                {"role": "user", "content": "أحمق."},
+                {"role": "assistant", "content": "idiot."},
+                {"role": "user", "content": "ترجم هذا."},
+                {"role": "assistant", "content": "Translate this."},
+                {"role": "user", "content": "هل أنت ذكاء اصطناعي؟"},
+                {"role": "assistant", "content": "Are you an AI?"},
                 {"role": "user", "content": user_content},
             ]
     elif dst_norm == "ar":
@@ -282,6 +292,14 @@ def make_translation_messages(
         )
         return [
             {"role": "system", "content": system_content},
+            {"role": "user", "content": "The sky is blue."},
+            {"role": "assistant", "content": "السماء زرقاء."},
+            {"role": "user", "content": "idiot."},
+            {"role": "assistant", "content": "أحمق."},
+            {"role": "user", "content": "Translate this."},
+            {"role": "assistant", "content": "ترجم هذا."},
+            {"role": "user", "content": "Are you an AI?"},
+            {"role": "assistant", "content": "هل أنت ذكاء اصطناعي؟"},
             {"role": "user", "content": f"Translate the following text from {src_name} to Arabic:\n\n{user_content}"},
         ]
     elif src_norm == "ar":
@@ -313,6 +331,14 @@ def make_translation_messages(
             )
         return [
             {"role": "system", "content": system_content},
+            {"role": "user", "content": "السماء زرقاء."},
+            {"role": "assistant", "content": "The sky is blue."},
+            {"role": "user", "content": "أحمق."},
+            {"role": "assistant", "content": "idiot."},
+            {"role": "user", "content": "ترجم هذا."},
+            {"role": "assistant", "content": "Translate this."},
+            {"role": "user", "content": "هل أنت ذكاء اصطناعي؟"},
+            {"role": "assistant", "content": "Are you an AI?"},
             {"role": "user", "content": f"Translate the following text from Arabic to {dst_name}:\n\n{user_content}"},
         ]
     else:
@@ -328,6 +354,14 @@ def make_translation_messages(
         )
         return [
             {"role": "system", "content": system_content},
+            {"role": "user", "content": "The sky is blue."},
+            {"role": "assistant", "content": "Translation: The sky is blue."},
+            {"role": "user", "content": "idiot."},
+            {"role": "assistant", "content": "Translation: idiot."},
+            {"role": "user", "content": "Translate this."},
+            {"role": "assistant", "content": "Translation: Translate this."},
+            {"role": "user", "content": "Are you an AI?"},
+            {"role": "assistant", "content": "Translation: Are you an AI?"},
             {"role": "user", "content": f"Translate the following text from {src_name} to {dst_name}:\n\n{user_content}"},
         ]
 
