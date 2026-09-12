@@ -19,7 +19,19 @@ class TestChatbotLeak(unittest.TestCase):
                     cls.corpus.append(json.loads(line))
         
         cls.use_http = bool(MT_URL)
-        if not cls.use_http:
+        cls.backend_name = "Unknown"
+        cls.backend_class = "Unknown"
+        if cls.use_http:
+            try:
+                headers = {"Authorization": f"Bearer {AUTH_TOKEN}"} if AUTH_TOKEN else {}
+                resp = requests.get(MT_URL.rstrip('/') + '/health', headers=headers, timeout=10)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    cls.backend_name = data.get("mt_backend", "Unknown")
+                    cls.backend_class = data.get("mt_backend_class", "Unknown")
+            except Exception:
+                pass
+        else:
             # Fall back to in-process
             from app.mt import QwenCt2Engine
             from app.config import Settings
@@ -28,6 +40,8 @@ class TestChatbotLeak(unittest.TestCase):
             cls.engine.load()
             if not cls.engine.ready:
                 raise unittest.SkipTest("MT Engine not loaded")
+            cls.backend_name = cls.engine.name
+            cls.backend_class = cls.engine.__class__.__name__
 
     def _translate(self, items):
         if self.use_http:
@@ -54,6 +68,7 @@ class TestChatbotLeak(unittest.TestCase):
             return results
 
     def test_chatbot_leak_properties(self):
+        print(f"\nACTIVE MT BACKEND: {self.backend_class} ({self.backend_name})")
         items = [(c["text"], c["src"], c["dst"]) for c in self.corpus]
         
         outputs = self._translate(items)

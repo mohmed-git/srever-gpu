@@ -576,6 +576,95 @@ def make_retry_translation_messages(text: str, src: str, dst: str) -> list[dict[
     return messages
 
 
+def check_needs_retry(text: str, decoded: str, src: str, dst: str) -> tuple[bool, str | None]:
+    """Checks if initial decode triggers any active guard requiring a retry."""
+    norm_dst = (dst or "").strip().lower().split("-")[0]
+    norm_src = (src or "").strip().lower().split("-")[0]
+
+    if not is_translatable(decoded):
+        return True, "not_translatable"
+    if _low_target_script(decoded, dst):
+        return True, "low_target_script"
+    if _english_leak(decoded, dst):
+        return True, "english_leak"
+    if _is_conversational_chatter(decoded):
+        return True, "conversational_chatter"
+
+    in_words = len(text.split())
+    out_words = len(decoded.split())
+    if in_words > 0 and (out_words / in_words) > 3.0:
+        return True, "length_explosion"
+    if in_words == 1 and out_words > 3:
+        return True, "single_token_explosion"
+    if detect_person_mismatch(text, decoded, src, dst) and norm_dst == "ar":
+        return True, "person_mismatch"
+    if is_degenerate_short(decoded, dst):
+        return True, "degenerate_short"
+    if has_annotation_or_passthrough(text, decoded):
+        return True, "annotation_leak"
+
+    return False, None
+
+
+def _apply_output_guards(
+    text: str,
+    decoded: str,
+    src: str,
+    dst: str,
+    retried: bool = False,
+    primary_decoded: str | None = None,
+) -> tuple[str, bool, str | None, dict[str, Any]]:
+    """Unified post-decode guard chain for all MT engines.
+    Returns: (final_text, hollow, reason, soft_flags)
+    """
+    soft_flags: dict[str, Any] = {}
+    norm_dst = (dst or "").strip().lower().split("-")[0]
+    norm_src = (src or "").strip().lower().split("-")[0]
+
+    hollow, reason = _hollow_check(decoded, text, target_lang=dst)
+
+    if not hollow:
+        in_words = len(text.split())
+        out_words = len(decoded.split())
+        length_explosion = (in_words > 0 and (out_words / in_words) > 3.0)
+        single_token_explosion = (in_words == 1 and out_words > 3)
+        mismatch = detect_person_mismatch(text, decoded, src, dst) and norm_dst == "ar"
+
+        if _low_target_script(decoded, dst):
+            hollow, reason = True, f"target script ratio {_script_ratio(decoded, dst):.0%} < 50%"
+        elif _english_leak(decoded, dst):
+            hollow, reason = True, "english_leak"
+        elif length_explosion or single_token_explosion:
+            hollow, reason = True, "length_explosion"
+        elif _is_conversational_chatter(decoded):
+            hollow, reason = True, "conversational_chatter"
+        elif is_degenerate_short(decoded, dst):
+            hollow, reason = True, "degenerate_short"
+        elif has_annotation_or_passthrough(text, decoded):
+            hollow, reason = True, "annotation_leak"
+        elif mismatch:
+            if retried:
+                # DOWNGRADE: soft person mismatch after retry is emitted, NOT hollowed
+                global PERSON_MISMATCH_SOFT_COUNT
+                PERSON_MISMATCH_SOFT_COUNT += 1
+                soft_flags["person_mismatch_soft"] = True
+                log.warning("Person mismatch soft (emitted after retry): src=%r tgt=%r", text, decoded)
+            else:
+                hollow, reason = True, "person_mismatch"
+
+    if hollow:
+        cand = decoded
+        final_text = ""
+        if retried:
+            if primary_decoded is not None:
+                reason = f"{reason} (primary={primary_decoded!r} retry={cand!r})"
+            else:
+                reason = f"{reason} after retry: {cand!r}"
+        return final_text, True, reason, soft_flags
+
+    return decoded, False, None, soft_flags
+
+
 def clean_translation(text: str, target_lang: str = "", source_text: str = "") -> str:
     out = (text or "").strip()
     if "\n" in out:
@@ -586,6 +675,11 @@ def clean_translation(text: str, target_lang: str = "", source_text: str = "") -
     if len(out) >= 2 and out[0] in "\"'“”«" and out[-1] in "\"'“”»":
         inner = out[1:-1].strip()
         if inner and inner[0] not in "\"'“”«":
+            out = inner
+    # Strip enclosing parentheses e.g. (stop talking) -> stop talking
+    if len(out) >= 2 and out.startswith("(") and out.endswith(")"):
+        inner = out[1:-1].strip()
+        if "(" not in inner and ")" not in inner:
             out = inner
 
     norm_target = (target_lang or "").strip().lower()
@@ -966,10 +1060,12 @@ class M2M100Ct2Engine(MtEngine):
                 target_lang=_dst,
                 source_text=text,
             )
-            hollow, reason = _hollow_check(decoded, text, target_lang=_dst)
+            final_text, hollow, reason, soft_flags = _apply_output_guards(
+                text, decoded, _src, _dst, retried=False
+            )
             out.append(
                 MtResult(
-                    text=decoded,
+                    text=final_text,
                     mt_ms=per_item_ms,
                     backend=self.name,
                     model=self.model_path.rsplit("/", 1)[-1],
@@ -1292,29 +1388,19 @@ class QwenCt2Engine(MtEngine):
                 PERSON_MISMATCH_OBSERVED_COUNT += 1
                 log.info("Person mismatch observed (observe-only): src=%r tgt=%r", text, decoded)
 
+            needs_retry, trigger_reason = check_needs_retry(text, decoded, _s, _d)
             retried = False
-            leak = _english_leak(decoded, _d)
-            low_script = _low_target_script(decoded, _d)
-            not_translatable = not is_translatable(decoded)
-            chatter = _is_conversational_chatter(decoded)
-            
-            in_words = len(text.split())
-            out_words = len(decoded.split())
-            length_explosion = (in_words > 0 and (out_words / in_words) > 3.0)
-            single_token_explosion = (in_words == 1 and out_words > 3)
-            
-            mismatch_retry = detect_person_mismatch(text, decoded, _s, _d) and _d.split("-")[0] == "ar"
-            degenerate_short = is_degenerate_short(decoded, _d)
-            annotation_leak = has_annotation_or_passthrough(text, decoded)
-            
-            if not_translatable or low_script or leak or chatter or length_explosion or single_token_explosion or mismatch_retry or degenerate_short or annotation_leak:
+            primary_decoded = None
+
+            if needs_retry:
                 retried = True
+                primary_decoded = decoded
                 self._metrics_incr("mt_retry")
-                if chatter:
+                if trigger_reason == "conversational_chatter":
                     global CHAT_LEAK_SUSPECTED_COUNT
                     CHAT_LEAK_SUSPECTED_COUNT += 1
                     self._metrics_incr("chat_leak_suspected")
-                if leak:
+                elif trigger_reason == "english_leak":
                     self._metrics_incr("mt_english_leak")
                 decoded = self._translate_single_retry(
                     text, _s, _d,
@@ -1323,32 +1409,15 @@ class QwenCt2Engine(MtEngine):
                     context_prefix=_c_pre,
                 )
 
-            hollow, reason = _hollow_check(decoded, text, target_lang=_d)
-            if not hollow:
-                in_words = len(text.split())
-                out_words = len(decoded.split())
-                length_explosion = (in_words > 0 and (out_words / in_words) > 3.0)
-                single_token_explosion = (in_words == 1 and out_words > 3)
-                mismatch_retry = detect_person_mismatch(text, decoded, _s, _d) and _d.split("-")[0] == "ar"
-                
-                if _low_target_script(decoded, _d):
-                    hollow, reason = True, f"target script ratio {_script_ratio(decoded,_d):.0%} < 50% after retry: {decoded!r}"
-                elif _english_leak(decoded, _d):
-                    hollow, reason = True, f"english_leak detected after retry: {decoded!r}"
-                elif mismatch_retry:
-                    hollow, reason = True, f"person_mismatch detected after retry: {decoded!r}"
-                elif length_explosion or single_token_explosion:
-                    hollow, reason = True, f"length_explosion detected after retry: {decoded!r}"
-                elif _is_conversational_chatter(decoded):
-                    hollow, reason = True, f"chatter detected after retry: {decoded!r}"
-            if hollow:
-                if retried and reason and "retry" not in reason:
-                    reason = f"{reason} (after retry)"
-                decoded = ""            # never hand punctuation or passthrough to TTS
+            final_text, hollow, reason, soft_flags = _apply_output_guards(
+                text, decoded, _s, _d, retried=retried, primary_decoded=primary_decoded
+            )
+            if soft_flags.get("person_mismatch_soft"):
+                self._metrics_incr("person_mismatch_soft")
 
             results.append(
                 MtResult(
-                    text=decoded,
+                    text=final_text,
                     mt_ms=round((time.perf_counter() - started) * 1000.0, 2),
                     backend=self.name,
                     model=self.model_path,
@@ -1869,10 +1938,12 @@ class QwenHfEngine(MtEngine):
                 PERSON_MISMATCH_OBSERVED_COUNT += 1
                 log.info("Person mismatch observed (observe-only): src=%r tgt=%r", text, decoded)
 
-            hollow, reason = _hollow_check(decoded, text, target_lang=_d)
+            final_text, hollow, reason, soft_flags = _apply_output_guards(
+                text, decoded, _s, _d, retried=False
+            )
             results.append(
                 MtResult(
-                    text=decoded,
+                    text=final_text,
                     mt_ms=elapsed_ms,
                     backend=self.name,
                     model=self.settings.mt_model,

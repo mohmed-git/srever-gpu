@@ -2053,6 +2053,8 @@ async def health() -> JSONResponse:
         "language_count": lang_mod.ASR_LANGUAGE_COUNT,
         "pair_count": lang_mod.MT_LANGUAGE_COUNT * (lang_mod.MT_LANGUAGE_COUNT - 1),
         "latency_budget_ms": SETTINGS.latency_budget_ms,
+        "mt_backend": PIPELINE.mt.name if PIPELINE else None,
+        "mt_backend_class": PIPELINE.mt.__class__.__name__ if PIPELINE else None,
     }
     if PIPELINE is not None:
         body["uptime_seconds"] = (
@@ -2137,6 +2139,8 @@ async def capabilities() -> dict[str, Any]:
     bottleneck_rps = min(measured_rps) if measured_rps else None
     return {
         "version": VERSION,
+        "mt_backend": PIPELINE.mt.name if PIPELINE else None,
+        "mt_backend_class": PIPELINE.mt.__class__.__name__ if PIPELINE else None,
         "device": SETTINGS.device,
         "latency_budget_ms": SETTINGS.latency_budget_ms,
         "measured": {
