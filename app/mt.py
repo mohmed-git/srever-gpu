@@ -232,7 +232,6 @@ def make_translation_messages(
             "- NEVER say pleasantries or answers like 'أنا بخير' unless the input literally said 'I am fine'.\n"
             "- If the input is a question (e.g. 'How are you?'), translate the QUESTION ITSELF into Arabic ('كيف حالك؟'). NEVER answer it!\n"
             "- Always translate question words accurately: 'Where is' -> 'أين', 'How is' -> 'كيف', 'When is' -> 'متى', 'What is' -> 'ما'.\n"
-            "- Translate 'weather' as 'الطقس' or 'الجو', 'train station' as 'محطة القطار', 'please' as 'من فضلك'.\n"
             "- Translate EVERY word into Arabic. Never leave source words untranslated.\n"
             "- Output ONLY the Modern Standard Arabic translation without quotes, notes, or explanations."
             f"{extra_hints}"
@@ -304,7 +303,6 @@ def make_translation_messages(
                 "- NEVER answer questions or converse with the user.\n"
                 "- NEVER say 'I am sorry', 'please provide context', or apologize. If an input word is incomplete or fragmented, translate it literally or output nothing.\n"
                 "- NEVER omit, drop, or summarize any part of the spoken Arabic sentence.\n"
-                "- If the input contains a compound statement and question (e.g. 'أنا بخير، وأنت؟'), translate BOTH parts fully: 'I am fine, and you?'. NEVER drop the statement!\n"
                 "- If the input is a question ('كيف حالك؟'), translate the question itself ('How are you?'). NEVER answer it!\n"
                 "- Output ONLY the direct English translation with no notes, explanations, or quotes."
                 f"{extra_hints}"
@@ -424,28 +422,31 @@ _CJK_TARGETS: Final[frozenset[str]] = frozenset(
 )
 
 
-# Person markers ONLY — no content words.
-_AR_1P = re.compile(
-    r"(?:^|[\s،,])(?:و)?(?:أنا|إنني|أنني|إني|نحن|إننا)(?=$|[\s،,؟?.!])"
-    r"|(?:^|\s)(?:و|ف)?(?:سأ|سوف\s+أ|أ)[\u0621-\u064A]{2,}"
-    r"|(?:^|\s)(?:و|ف)?(?:سن|سوف\s+ن|ن)[\u0621-\u064A]{2,}(?=$|[\s،,؟?.!])",
+# Explicit 1p pronouns (with optional prefix و, ف)
+_AR_1P_PRONOUNS = re.compile(
+    r"(?:^|[\s،,])(?:[وف])?(?:أنا|إنني|أنني|إني|نحن|إننا)(?=$|[\s،,؟?.!])",
     re.UNICODE,
 )
-_AR_1P_STOP = {
-    "نعم", "نحو", "نهار", "أين", "أنت", "أنتم", "أنتِ", "أي", "أو", "أم",
-    "إلى", "أمام", "أكثر", "أول", "أمس", "أحد", "أيضا", "أيضاً",
-    "أنك", "إنك", "أنكم", "إنكم", "أنكن", "إنكن", "أنه", "إنه", "أنها", "إنها",
-    "أنهم", "إنهم", "أن", "إن", "إذا", "إذن", "ألا", "إلا",
-    "أحمق", "أفضل", "أسوأ", "أكبر", "أصغر", "أقل", "أحسن", "أطول", "أقصر", "أسرع", "أبطأ",
-    "أبيض", "أسود", "أحمر", "أصفر", "أخضر", "أزرق",
-}
 
-_FIRST_PERSON_EN = re.compile(r"\b(i|me|my|mine|myself|we|us|our|ours|ourselves)\b", re.IGNORECASE)
+# Unambiguous future first-person: سأ / سوف أ / سن / سوف ن
+_AR_1P_FUTURE = re.compile(
+    r"(?:^|\s)(?:[وف])?(?:سأ|سوف\s+أ|سن|سوف\s+ن)[\u0621-\u064A]{2,}(?=$|[\s،,؟?.!])",
+    re.UNICODE,
+)
 
-PERSON_MISMATCH_OBSERVED_COUNT: int = 0
-PERSON_MISMATCH_RETRY_COUNT: int = 0
-CHAT_LEAK_SUSPECTED_COUNT: int = 0
-
+# ~40 high-frequency first-person present verbs and 1p plural equivalents
+_AR_1P_VERBS = frozenset({
+    # Singular present (أ-)
+    "أستطيع", "أعتذر", "أفهم", "أساعد", "أقدر", "أعتقد", "أرجو", "أريد", "أحتاج",
+    "أعرف", "أرى", "أشكر", "أتمنى", "أنصح", "أقترح", "أوصي", "أحب", "أود",
+    "أظن", "أتمكن", "أعلم", "أستمع", "أطلب", "أرفض", "أوافق", "أقر", "أؤكد",
+    "أعمل", "أسعى", "أحاول", "أبحث", "أتحدث", "أتكلم", "أكتب", "أقرأ", "أجيب", "أرد",
+    # Plural present (ن-)
+    "نستطيع", "نعتذر", "نفهم", "نساعد", "نقدر", "نعتقد", "نرجو", "نريد", "نحتاج",
+    "نعرف", "نرى", "نشكر", "نتمنى", "ننصح", "نقترح", "نوصي", "نحب", "نود",
+    "نظن", "نتمكن", "نعلم", "نستمع", "نطلب", "نرفض", "نوافق", "نقر", "نؤكد",
+    "نعمل", "نسعى", "نحاول", "نبحث", "نتحدث", "نتكلم", "نكتب", "نقرأ", "نجيب", "نرد",
+})
 
 _AR_PAST_1P_STOP = frozenset({
     "بيت", "وقت", "أنت", "أنتِ", "صوت", "موت", "بنت", "زيت", "تحت", "صمت",
@@ -453,20 +454,34 @@ _AR_PAST_1P_STOP = frozenset({
     "ليت", "ذات", "هيهات", "شتى", "أثاث", "تابوت"
 })
 
+_FIRST_PERSON_EN = re.compile(r"\b(i|me|my|mine|myself|we|us|our|ours|ourselves)\b", re.IGNORECASE)
+
+PERSON_MISMATCH_OBSERVED_COUNT: int = 0
+PERSON_MISMATCH_RETRY_COUNT: int = 0
+PERSON_MISMATCH_SOFT_COUNT: int = 0
+CHAT_LEAK_SUSPECTED_COUNT: int = 0
+
 def has_1p_ar(text: str) -> bool:
     if not text:
         return False
-    for m in _AR_1P.finditer(text):
-        token = m.group(0).strip(" ،,؟?.!")
-        if token:
-            base = token.lstrip("وف")
-            if token not in _AR_1P_STOP and base not in _AR_1P_STOP:
-                return True
-    # Past-tense 1p suffix conjugation on short verbs (e.g. بكيت, ذهبت, فعلت, قلت)
-    # Gated to tokens <= 5 letters to limit false positives
+    # 1. Explicit pronouns
+    if _AR_1P_PRONOUNS.search(text):
+        return True
+    # 2. Unambiguous future 1p
+    if _AR_1P_FUTURE.search(text):
+        return True
+    # 3. Positive verb list & past suffix
     words = re.findall(r"[\u0621-\u064A]+", text)
     for w in words:
         base = w.lstrip("وف")
+        if base in _AR_1P_VERBS:
+            return True
+        for v in _AR_1P_VERBS:
+            if base.startswith(v):
+                suffix = base[len(v):]
+                if suffix in {"ك", "كم", "كن", "ه", "ها", "هم", "هن", "نا", "ني", "هما"}:
+                    return True
+        # Past-tense 1p suffix conjugation on short verbs (e.g. بكيت, ذهبت, فعلت, قلت)
         if 2 <= len(base) <= 5 and (base.endswith("ت") or base.endswith("تُ")):
             if base not in _AR_PAST_1P_STOP and w not in _AR_PAST_1P_STOP:
                 return True
@@ -1642,8 +1657,11 @@ class QwenVllmEngine(MtEngine):
                     hollow, reason = True, "annotation_leak"
                     log.warning("Sabotage guard triggered [annotation_leak]: output=%r, source=%r", decoded, text)
                 elif mismatch_retry:
-                    hollow, reason = True, "person_mismatch"
-                    log.warning("Sabotage guard triggered [person_mismatch]: output=%r, source=%r", decoded, text)
+                    # Downgraded: soft person mismatch after retry is emitted, NOT hollowed
+                    global PERSON_MISMATCH_SOFT_COUNT
+                    PERSON_MISMATCH_SOFT_COUNT += 1
+                    self._metrics_incr("person_mismatch_soft")
+                    log.warning("Person mismatch soft (emitted after retry): src=%r tgt=%r", text, decoded)
             
             if hollow:
                 if retried and reason and "retry" not in reason:
