@@ -455,11 +455,17 @@ _AR_PAST_1P_STOP = frozenset({
 })
 
 _FIRST_PERSON_EN = re.compile(r"\b(i|me|my|mine|myself|we|us|our|ours|ourselves)\b", re.IGNORECASE)
+_FIRST_PERSON_FR = re.compile(r"\b(?:je|moi|mon|ma|mes|nous|notre|nos)\b|\b(?:j|m)[\'’]", re.IGNORECASE)
 
 PERSON_MISMATCH_OBSERVED_COUNT: int = 0
 PERSON_MISMATCH_RETRY_COUNT: int = 0
 PERSON_MISMATCH_SOFT_COUNT: int = 0
 CHAT_LEAK_SUSPECTED_COUNT: int = 0
+
+def has_1p_fr(text: str) -> bool:
+    if not text:
+        return False
+    return bool(_FIRST_PERSON_FR.search(text))
 
 def has_1p_ar(text: str) -> bool:
     if not text:
@@ -526,6 +532,7 @@ def detect_person_mismatch(source_text: str, target_text: str, src_lang: str, ds
     """Symmetric detector:
     1. en -> ar: Catches chat leaks (source has NO 1st person, but target output introduces 1st person).
     2. ar -> en: Catches omission errors (source has 1st person 'أنا بخير', but target drops 1st person).
+    3. dst == fr: Observe-only detector for French 1st-person injection.
     """
     if not source_text or not target_text:
         return False
@@ -533,7 +540,7 @@ def detect_person_mismatch(source_text: str, target_text: str, src_lang: str, ds
     norm_dst = (dst_lang or "").strip().lower().split("-")[0]
 
     if norm_dst == "ar":
-        src_1p = has_1p_en(source_text)
+        src_1p = has_1p_en(source_text) if norm_src == "en" else has_1p_fr(source_text)
         tgt_1p = has_1p_ar(target_text)
         if not src_1p and tgt_1p:
             return True
@@ -541,6 +548,12 @@ def detect_person_mismatch(source_text: str, target_text: str, src_lang: str, ds
         src_1p = has_1p_ar(source_text)
         tgt_1p = has_1p_en(target_text)
         if src_1p and not tgt_1p:
+            return True
+    elif norm_dst == "fr":
+        src_1p = has_1p_en(source_text) if norm_src == "en" else (has_1p_ar(source_text) if norm_src == "ar" else False)
+        tgt_1p = has_1p_fr(target_text)
+        if not src_1p and tgt_1p:
+            log.info("Person mismatch fr observed (observe-only): src=%r tgt=%r", source_text, target_text)
             return True
 
     return False
@@ -659,7 +672,7 @@ def _apply_output_guards(
             if primary_decoded is not None:
                 reason = f"{reason} (primary={primary_decoded!r} retry={cand!r})"
             else:
-                reason = f"{reason} after retry: {cand!r}"
+                reason = f"{reason} detected after retry: {cand!r}"
         return final_text, True, reason, soft_flags
 
     return decoded, False, None, soft_flags
@@ -1672,27 +1685,19 @@ class QwenVllmEngine(MtEngine):
                 PERSON_MISMATCH_OBSERVED_COUNT += 1
                 log.info("Person mismatch observed (observe-only): src=%r tgt=%r", text, decoded)
 
+            needs_retry, trigger_reason = check_needs_retry(text, decoded, _s, _d)
             retried = False
-            leak = _english_leak(decoded, _d)
-            low_script = _low_target_script(decoded, _d)
-            not_translatable = not is_translatable(decoded)
-            chatter = _is_conversational_chatter(decoded)
-            in_words = len(text.split())
-            out_words = len(decoded.split())
-            length_explosion = (in_words > 0 and (out_words / in_words) > 3.0)
-            single_token_explosion = (in_words == 1 and out_words > 3)
-            mismatch_retry = detect_person_mismatch(text, decoded, _s, _d) and _d.split("-")[0] == "ar"
-            degenerate_short = is_degenerate_short(decoded, _d)
-            annotation_leak = has_annotation_or_passthrough(text, decoded)
+            primary_decoded = None
 
-            if not_translatable or low_script or leak or chatter or length_explosion or single_token_explosion or mismatch_retry or degenerate_short or annotation_leak:
+            if needs_retry:
                 retried = True
+                primary_decoded = decoded
                 self._metrics_incr("mt_retry")
-                if chatter:
+                if trigger_reason == "conversational_chatter":
                     global CHAT_LEAK_SUSPECTED_COUNT
                     CHAT_LEAK_SUSPECTED_COUNT += 1
                     self._metrics_incr("chat_leak_suspected")
-                if leak:
+                elif trigger_reason == "english_leak":
                     self._metrics_incr("mt_english_leak")
                 decoded = self._translate_single_retry(
                     text, _s, _d,
@@ -1701,45 +1706,15 @@ class QwenVllmEngine(MtEngine):
                     context_prefix=_c_pre,
                 )
 
-            hollow, reason = _hollow_check(decoded, text, target_lang=_d)
-            if not hollow:
-                in_words = len(text.split())
-                out_words = len(decoded.split())
-                length_explosion = (in_words > 0 and (out_words / in_words) > 3.0)
-                single_token_explosion = (in_words == 1 and out_words > 3)
-                mismatch_retry = detect_person_mismatch(text, decoded, _s, _d) and _d.split("-")[0] == "ar"
-                
-                if _low_target_script(decoded, _d):
-                    hollow, reason = True, f"target script ratio {_script_ratio(decoded,_d):.0%} < 50% after retry: {decoded!r}"
-                elif _english_leak(decoded, _d):
-                    hollow, reason = True, f"english_leak detected after retry: {decoded!r}"
-                elif mismatch_retry:
-                    hollow, reason = True, f"person_mismatch detected after retry: {decoded!r}"
-                elif length_explosion or single_token_explosion:
-                    hollow, reason = True, f"length_explosion detected after retry: {decoded!r}"
-                elif _is_conversational_chatter(decoded):
-                    hollow, reason = True, f"chatter detected after retry: {decoded!r}"
-                elif is_degenerate_short(decoded, _d):
-                    hollow, reason = True, "degenerate_short"
-                    log.warning("Sabotage guard triggered [degenerate_short]: output=%r, source=%r", decoded, text)
-                elif has_annotation_or_passthrough(text, decoded):
-                    hollow, reason = True, "annotation_leak"
-                    log.warning("Sabotage guard triggered [annotation_leak]: output=%r, source=%r", decoded, text)
-                elif mismatch_retry:
-                    # Downgraded: soft person mismatch after retry is emitted, NOT hollowed
-                    global PERSON_MISMATCH_SOFT_COUNT
-                    PERSON_MISMATCH_SOFT_COUNT += 1
-                    self._metrics_incr("person_mismatch_soft")
-                    log.warning("Person mismatch soft (emitted after retry): src=%r tgt=%r", text, decoded)
-            
-            if hollow:
-                if retried and reason and "retry" not in reason:
-                    reason = f"{reason} (after retry)"
-                decoded = ""
-                
+            final_text, hollow, reason, soft_flags = _apply_output_guards(
+                text, decoded, _s, _d, retried=retried, primary_decoded=primary_decoded
+            )
+            if soft_flags.get("person_mismatch_soft"):
+                self._metrics_incr("person_mismatch_soft")
+
             results.append(
                 MtResult(
-                    text=decoded,
+                    text=final_text,
                     mt_ms=elapsed_ms,
                     backend=self.name,
                     model=self.resolved_model,
