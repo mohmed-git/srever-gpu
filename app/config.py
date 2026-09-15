@@ -106,6 +106,7 @@ class Settings:
     asr_batch_wait_ms: float = field(default_factory=lambda: _env_float("ASR_BATCH_WAIT_MS", 0.0))
     asr_energy_gate_dbfs: float = field(default_factory=lambda: _env_float("ASR_ENERGY_GATE_DBFS", -58.0))
     asr_lid_gate: bool = field(default_factory=lambda: _env_bool("ASR_LID_GATE", True))
+    asr_lid_gate_armed: bool = field(default_factory=lambda: _env_bool("ASR_LID_GATE_ARMED", False))
     asr_lid_threshold: float = field(default_factory=lambda: _env_float("ASR_LID_THRESHOLD", 0.6))
 
     # ---- MT ------------------------------------------------------------

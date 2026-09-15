@@ -491,100 +491,7 @@ class _StreamState:
                     changed = True
 
 
-def resolve_route(
-    state: _StreamState,
-    capture: str | None = None,
-    lid_winner: str | None = None,
-    lid_conf: float | None = None,
-    speaker_id: int | None = None,
-) -> dict[str, Any]:
-    """Deterministically resolves routing and sinks for Tri-Mode (Protocol 2) and pair_auto."""
-    mode = state.mode
-    lang0 = state.languages[0] if state.languages else (state.source or "en")
-    lang1 = state.languages[1] if len(state.languages) > 1 else (state.target or "ar")
-
-    if mode == "hybrid_a":
-        # Mode 1: Earbud User + Guest (Phone)
-        if capture == "earbud_mic" or speaker_id == 0:
-            spk = 0
-            src = lang0
-            dst = lang1
-            sink = "speaker"  # Guest hears translation on phone speaker
-            attribution = "capture_source"
-        else:
-            spk = 1
-            src = lang1
-            dst = lang0
-            sink = "earbuds"  # Earbud user hears translation in-ear
-            attribution = "capture_source"
-        return {
-            "speaker_id": spk,
-            "sink": sink,
-            "attribution": attribution,
-            "lid_conf": lid_conf,
-            "source": src,
-            "target": dst,
-            "direction": f"{src}->{dst}",
-            "channel": state.channel_map.get(str(spk), "L" if spk == 0 else "R"),
-        }
-
-    elif mode == "share_b":
-        # Mode 2: Shared Buds (L/R)
-        # Attribution by LID constrained between the 2 languages
-        if lid_winner == lang1 or speaker_id == 1:
-            spk = 1
-            src = lang1
-            dst = lang0
-            chan = state.channel_map.get("0", "L")
-            sink = f"earbud_{chan.lower()}"
-        else:
-            spk = 0
-            src = lang0
-            dst = lang1
-            chan = state.channel_map.get("1", "R")
-            sink = f"earbud_{chan.lower()}"
-        return {
-            "speaker_id": spk,
-            "sink": sink,
-            "attribution": "lid",
-            "lid_conf": lid_conf,
-            "source": src,
-            "target": dst,
-            "direction": f"{src}->{dst}",
-            "channel": chan,
-        }
-
-    elif mode == "listen_c":
-        # Mode 3: Listen-only (Lecture/Tour)
-        src = state.source or lang0
-        dst = state.target or lang1
-        return {
-            "speaker_id": None,
-            "sink": "earbuds",
-            "attribution": "pinned",
-            "lid_conf": lid_conf,
-            "source": src,
-            "target": dst,
-            "direction": f"{src}->{dst}",
-            "channel": "both",
-        }
-
-    else:
-        # Default / pair_auto / single
-        spk = speaker_id if speaker_id is not None else (0 if lid_winner == lang0 else 1)
-        chan = state.channel_map.get(str(spk), "L" if spk == 0 else "R")
-        src = lang0 if spk == 0 else lang1
-        dst = lang1 if spk == 0 else lang0
-        return {
-            "speaker_id": spk,
-            "sink": chan,
-            "attribution": "lid" if mode == "pair_auto" else "pinned",
-            "lid_conf": lid_conf,
-            "source": src,
-            "target": dst,
-            "direction": f"{src}->{dst}",
-            "channel": chan,
-        }
+from app.routing import SINKS, resolve_route
 
 
 async def _verify_pinned_language(
@@ -1396,10 +1303,21 @@ async def _on_audio_frame(state: _StreamState, chunk: bytes) -> None:
             slot.total_frames += 1
             if flags & 0x04:
                 slot.during_playback_frames += 1
+            flag_capture = None
             if flags & 0x08:
-                slot.capture = "earbud_mic"
+                flag_capture = "earbud_mic"
             elif flags & 0x10:
-                slot.capture = "phone_mic"
+                flag_capture = "phone_mic"
+
+            if flag_capture is not None:
+                if slot.capture is not None and slot.capture != flag_capture:
+                    if pipeline is not None:
+                        pipeline.metrics.incr("capture_flag_conflict")
+                    log.warning(
+                        "slot %d capture flag conflict: control=%r, audio_flag=%r",
+                        utt_id, slot.capture, flag_capture,
+                    )
+                slot.capture = flag_capture
 
             # PREROLL flag check (bit 0: 0x01)
             if flags & 0x01:
@@ -1955,6 +1873,28 @@ async def _handle_utterance_payload(
         speaker_id = route_meta["speaker_id"]
         direction = route_meta["direction"]
         channel = route_meta["channel"]
+        if PIPELINE is not None and len(state.languages) >= 2 and hasattr(PIPELINE.asr, "detect_language_constrained"):
+            try:
+                decoded_chk = await asyncio.to_thread(
+                    audio_mod.decode,
+                    raw,
+                    declared_format=state.audio_format,
+                    sample_rate=state.sample_rate,
+                    channels=state.channels,
+                )
+                chk_win, chk_conf, _ = await asyncio.to_thread(
+                    PIPELINE.asr.detect_language_constrained,
+                    decoded_chk.samples,
+                    state.languages,
+                )
+                if chk_conf >= 0.7 and chk_win != source:
+                    PIPELINE.metrics.incr("attribution_conflict")
+                    log.warning(
+                        "hybrid_a attribution conflict: capture=%r implies %r, but constrained LID detected %r (conf=%.2f)",
+                        capture, source, chk_win, chk_conf,
+                    )
+            except Exception as exc:
+                pass
     elif state.mode == "listen_c":
         route_meta = resolve_route(state)
         source = route_meta["source"]

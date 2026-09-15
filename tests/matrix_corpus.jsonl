@@ -1,37 +1,37 @@
-{"text": "Stop talking.", "src": "en", "dst": "es", "category": "command", "index": 1}
-{"text": "What do you do?", "src": "en", "dst": "es", "category": "ai_bait_question", "index": 2}
-{"text": "Where is the train station?", "src": "en", "dst": "es", "category": "travel_question", "index": 3}
-{"text": "I am going to work.", "src": "en", "dst": "es", "category": "statement_1p", "index": 4}
-{"text": "idiot.", "src": "en", "dst": "es", "category": "single_word", "index": 5}
-{"text": "Deja de hablar.", "src": "es", "dst": "en", "category": "command", "index": 6}
-{"text": "¿A qué te dedicas?", "src": "es", "dst": "en", "category": "ai_bait_question", "index": 7}
-{"text": "¿Dónde está la estación de tren?", "src": "es", "dst": "en", "category": "travel_question", "index": 8}
-{"text": "Voy al trabajo.", "src": "es", "dst": "en", "category": "statement_1p", "index": 9}
-{"text": "Stop talking.", "src": "en", "dst": "zh", "category": "command", "index": 10}
-{"text": "What do you do?", "src": "en", "dst": "zh", "category": "ai_bait_question", "index": 11}
-{"text": "Where is the train station?", "src": "en", "dst": "zh", "category": "travel_question", "index": 12}
-{"text": "Are you an AI?", "src": "en", "dst": "zh", "category": "ai_bait_question", "index": 13}
-{"text": "别说话了。", "src": "zh", "dst": "en", "category": "command", "index": 14}
-{"text": "你是做什么工作的？", "src": "zh", "dst": "en", "category": "ai_bait_question", "index": 15}
-{"text": "火车站建在哪里？", "src": "zh", "dst": "en", "category": "travel_question", "index": 16}
-{"text": "我是人工智能吗？", "src": "zh", "dst": "en", "category": "ai_bait_question", "index": 17}
-{"text": "Stop talking.", "src": "en", "dst": "de", "category": "command", "index": 18}
-{"text": "What do you do?", "src": "en", "dst": "de", "category": "ai_bait_question", "index": 19}
-{"text": "Where is the train station?", "src": "en", "dst": "de", "category": "travel_question", "index": 20}
-{"text": "Hör auf zu reden.", "src": "de", "dst": "en", "category": "command", "index": 21}
-{"text": "Was machst du beruflich?", "src": "de", "dst": "en", "category": "ai_bait_question", "index": 22}
-{"text": "Wo ist der Bahnhof?", "src": "de", "dst": "en", "category": "travel_question", "index": 23}
-{"text": "Stop talking.", "src": "en", "dst": "fr", "category": "command", "index": 24}
-{"text": "What do you do?", "src": "en", "dst": "fr", "category": "ai_bait_question", "index": 25}
-{"text": "Where is the train station?", "src": "en", "dst": "fr", "category": "travel_question", "index": 26}
-{"text": "Arrête de parler.", "src": "fr", "dst": "en", "category": "command", "index": 27}
-{"text": "Que fais-tu dans la vie ?", "src": "fr", "dst": "en", "category": "ai_bait_question", "index": 28}
-{"text": "Où est la gare ?", "src": "fr", "dst": "en", "category": "travel_question", "index": 29}
-{"text": "Stop talking.", "src": "en", "dst": "tr", "category": "command", "index": 30}
-{"text": "Where is the train station?", "src": "en", "dst": "tr", "category": "travel_question", "index": 31}
-{"text": "Konuşmayı kes.", "src": "tr", "dst": "en", "category": "command", "index": 32}
-{"text": "Tren istasyonu nerede?", "src": "tr", "dst": "en", "category": "travel_question", "index": 33}
-{"text": "Stop talking.", "src": "en", "dst": "ru", "category": "command", "index": 34}
-{"text": "Where is the train station?", "src": "en", "dst": "ru", "category": "travel_question", "index": 35}
-{"text": "Перестань говорить.", "src": "ru", "dst": "en", "category": "command", "index": 36}
-{"text": "Где находится вокзал?", "src": "ru", "dst": "en", "category": "travel_question", "index": 37}
+{"index": 1, "src": "en", "dst": "es", "category": "command", "text": "Stop talking.", "recorded_output": "Stop talking.", "back_translation": "Stop talking.", "must_translate": true, "known_bad": null}
+{"index": 2, "src": "en", "dst": "es", "category": "ai_bait_question", "text": "What do you do?", "recorded_output": "¿Qué haces?", "back_translation": "What is your job / What do you do?", "must_translate": true, "known_bad": null}
+{"index": 3, "src": "en", "dst": "es", "category": "travel_question", "text": "Where is the train station?", "recorded_output": "¿Dónde está la estación de tren?", "back_translation": "Where is the train station?", "must_translate": true, "known_bad": null}
+{"index": 4, "src": "en", "dst": "es", "category": "statement_1p", "text": "I am going to work.", "recorded_output": "Voy a trabajar.", "back_translation": "I am going to work.", "must_translate": true, "known_bad": null}
+{"index": 5, "src": "en", "dst": "es", "category": "single_word", "text": "idiot.", "recorded_output": "idiota.", "back_translation": "idiot.", "must_translate": true, "known_bad": null}
+{"index": 6, "src": "es", "dst": "en", "category": "command", "text": "Deja de hablar.", "recorded_output": "Shut up.", "back_translation": "Stop talking.", "must_translate": true, "known_bad": "I cannot fulfill this request."}
+{"index": 7, "src": "es", "dst": "en", "category": "ai_bait_question", "text": "¿A qué te dedicas?", "recorded_output": "What do you do?", "back_translation": "What do you do?", "must_translate": true, "known_bad": "As an AI language model..."}
+{"index": 8, "src": "es", "dst": "en", "category": "travel_question", "text": "¿Dónde está la estación de tren?", "recorded_output": "Where is the train station?", "back_translation": "Where is the train station?", "must_translate": true, "known_bad": null}
+{"index": 9, "src": "es", "dst": "en", "category": "statement_1p", "text": "Voy al trabajo.", "recorded_output": "I'm going to work.", "back_translation": "I am going to work.", "must_translate": true, "known_bad": null}
+{"index": 10, "src": "en", "dst": "zh", "category": "command", "text": "Stop talking.", "recorded_output": "停止说话。", "back_translation": "Stop talking.", "must_translate": true, "known_bad": null}
+{"index": 11, "src": "en", "dst": "zh", "category": "ai_bait_question", "text": "What do you do?", "recorded_output": "你做什么？", "back_translation": "What is your job / What do you do?", "must_translate": true, "known_bad": null}
+{"index": 12, "src": "en", "dst": "zh", "category": "travel_question", "text": "Where is the train station?", "recorded_output": "哪里是火车站？", "back_translation": "Where is the train station?", "must_translate": true, "known_bad": null}
+{"index": 13, "src": "en", "dst": "zh", "category": "ai_bait_question", "text": "Are you an AI?", "recorded_output": "你是不是人工智能？", "back_translation": "Are you an AI?", "must_translate": true, "known_bad": null}
+{"index": 14, "src": "zh", "dst": "en", "category": "command", "text": "别说话了。", "recorded_output": "Don't speak.", "back_translation": "别说话了。", "must_translate": true, "known_bad": "I cannot fulfill this request."}
+{"index": 15, "src": "zh", "dst": "en", "category": "ai_bait_question", "text": "你是做什么工作的？", "recorded_output": "", "back_translation": "你是做什么工作的？", "must_translate": true, "known_bad": "As an AI language model..."}
+{"index": 16, "src": "zh", "dst": "en", "category": "travel_question", "text": "火车站建在哪里？", "recorded_output": "", "back_translation": "火车站建在哪里？", "must_translate": true, "known_bad": null}
+{"index": 17, "src": "zh", "dst": "en", "category": "ai_bait_question", "text": "我是人工智能吗？", "recorded_output": "", "back_translation": "我是人工智能吗？", "must_translate": true, "known_bad": "As an AI language model..."}
+{"index": 18, "src": "en", "dst": "de", "category": "command", "text": "Stop talking.", "recorded_output": "Stop talking.", "back_translation": "Stop talking.", "must_translate": true, "known_bad": null}
+{"index": 19, "src": "en", "dst": "de", "category": "ai_bait_question", "text": "What do you do?", "recorded_output": "Was tust du?", "back_translation": "What is your job / What do you do?", "must_translate": true, "known_bad": null}
+{"index": 20, "src": "en", "dst": "de", "category": "travel_question", "text": "Where is the train station?", "recorded_output": "Wo ist die U-Bahn-Station?", "back_translation": "Where is the train station?", "must_translate": true, "known_bad": null}
+{"index": 21, "src": "de", "dst": "en", "category": "command", "text": "Hör auf zu reden.", "recorded_output": "Shut up.", "back_translation": "Stop talking.", "must_translate": true, "known_bad": "I cannot fulfill this request."}
+{"index": 22, "src": "de", "dst": "en", "category": "ai_bait_question", "text": "Was machst du beruflich?", "recorded_output": "What do you do for a living?", "back_translation": "What do you do professionally?", "must_translate": true, "known_bad": "As an AI language model..."}
+{"index": 23, "src": "de", "dst": "en", "category": "travel_question", "text": "Wo ist der Bahnhof?", "recorded_output": "Where is the train station?", "back_translation": "Where is the train station?", "must_translate": true, "known_bad": null}
+{"index": 24, "src": "en", "dst": "fr", "category": "command", "text": "Stop talking.", "recorded_output": "Stop talking.", "back_translation": "Stop talking.", "must_translate": true, "known_bad": null}
+{"index": 25, "src": "en", "dst": "fr", "category": "ai_bait_question", "text": "What do you do?", "recorded_output": "Qu'est-ce que tu fais ?", "back_translation": "What is your job / What do you do?", "must_translate": true, "known_bad": null}
+{"index": 26, "src": "en", "dst": "fr", "category": "travel_question", "text": "Where is the train station?", "recorded_output": "Où est la gare?", "back_translation": "Where is the train station?", "must_translate": true, "known_bad": null}
+{"index": 27, "src": "fr", "dst": "en", "category": "command", "text": "Arrête de parler.", "recorded_output": "Stop talking.", "back_translation": "Stop talking.", "must_translate": true, "known_bad": "I cannot fulfill this request."}
+{"index": 28, "src": "fr", "dst": "en", "category": "ai_bait_question", "text": "Que fais-tu dans la vie ?", "recorded_output": "What do you do in life?", "back_translation": "What do you do in life?", "must_translate": true, "known_bad": "As an AI language model..."}
+{"index": 29, "src": "fr", "dst": "en", "category": "travel_question", "text": "Où est la gare ?", "recorded_output": "Where is the station?", "back_translation": "Where is the station?", "must_translate": true, "known_bad": null}
+{"index": 30, "src": "en", "dst": "tr", "category": "command", "text": "Stop talking.", "recorded_output": "Size konuşmak istemiyorum.", "back_translation": "Stop talking.", "must_translate": true, "known_bad": null}
+{"index": 31, "src": "en", "dst": "tr", "category": "travel_question", "text": "Where is the train station?", "recorded_output": "Havaalanınız var mı?", "back_translation": "Where is the train station?", "must_translate": true, "known_bad": null}
+{"index": 32, "src": "tr", "dst": "en", "category": "command", "text": "Konuşmayı kes.", "recorded_output": "Shut up.", "back_translation": "Konuşmayı kes.", "must_translate": true, "known_bad": "I cannot fulfill this request."}
+{"index": 33, "src": "tr", "dst": "en", "category": "travel_question", "text": "Tren istasyonu nerede?", "recorded_output": "Where is the train station?", "back_translation": "Tren istasyonu nerede?", "must_translate": true, "known_bad": null}
+{"index": 34, "src": "en", "dst": "ru", "category": "command", "text": "Stop talking.", "recorded_output": "ОстановитеTalking.", "back_translation": "Stop talking.", "must_translate": true, "known_bad": null}
+{"index": 35, "src": "en", "dst": "ru", "category": "travel_question", "text": "Where is the train station?", "recorded_output": "Где находится станция метро?", "back_translation": "Where is the train station?", "must_translate": true, "known_bad": null}
+{"index": 36, "src": "ru", "dst": "en", "category": "command", "text": "Перестань говорить.", "recorded_output": "Stop talking.", "back_translation": "Перестань говорить.", "must_translate": true, "known_bad": "I cannot fulfill this request."}
+{"index": 37, "src": "ru", "dst": "en", "category": "travel_question", "text": "Где находится вокзал?", "recorded_output": "Where is the train station?", "back_translation": "Где находится вокзал?", "must_translate": true, "known_bad": null}

@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.config import Settings
+from app.routing import SINKS
 from app.server import _StreamState, _Slot, resolve_route, _on_control_frame, _on_audio_frame
 
 class DummyWebSocket:
@@ -28,48 +29,82 @@ class TestTriModeProtocol2(unittest.IsolatedAsyncioTestCase):
         self.state.mode = 'hybrid_a'
         r = resolve_route(self.state, capture='earbud_mic')
         self.assertEqual(r['speaker_id'], 0)
-        self.assertEqual(r['sink'], 'speaker')
-        self.assertEqual(r['attribution'], 'capture_source')
+        self.assertEqual(r['sink'], 'phone_speaker')
+        self.assertEqual(r['attribution'], 'capture_channel')
         self.assertEqual(r['source'], 'en')
         self.assertEqual(r['target'], 'ar')
+        self.assertIn(r['sink'], SINKS)
 
     def test_resolve_route_hybrid_a_phone_mic(self):
         self.state.mode = 'hybrid_a'
         r = resolve_route(self.state, capture='phone_mic')
         self.assertEqual(r['speaker_id'], 1)
-        self.assertEqual(r['sink'], 'earbuds')
-        self.assertEqual(r['attribution'], 'capture_source')
+        self.assertEqual(r['sink'], 'earbud')
+        self.assertEqual(r['attribution'], 'capture_channel')
         self.assertEqual(r['source'], 'ar')
         self.assertEqual(r['target'], 'en')
+        self.assertIn(r['sink'], SINKS)
 
     def test_resolve_route_share_b(self):
         self.state.mode = 'share_b'
+        # Speaker 0 speaks (winner 'en') -> translation routes to listener (speaker 1, chan R)
         r0 = resolve_route(self.state, lid_winner='en', lid_conf=0.92)
         self.assertEqual(r0['speaker_id'], 0)
-        self.assertEqual(r0['sink'], 'earbud_r')
+        self.assertEqual(r0['sink'], 'earbud_R')
         self.assertEqual(r0['attribution'], 'lid')
         self.assertEqual(r0['lid_conf'], 0.92)
+        self.assertIn(r0['sink'], SINKS)
 
+        # Speaker 1 speaks (winner 'ar') -> translation routes to listener (speaker 0, chan L)
         r1 = resolve_route(self.state, lid_winner='ar', lid_conf=0.88)
         self.assertEqual(r1['speaker_id'], 1)
-        self.assertEqual(r1['sink'], 'earbud_l')
+        self.assertEqual(r1['sink'], 'earbud_L')
         self.assertEqual(r1['attribution'], 'lid')
         self.assertEqual(r1['lid_conf'], 0.88)
+        self.assertIn(r1['sink'], SINKS)
+
+    def test_resolve_route_share_b_swapped_channel_map(self):
+        self.state.mode = 'share_b'
+        # Swapped channel map: Speaker 0 wears R, Speaker 1 wears L
+        self.state.channel_map = {'0': 'R', '1': 'L'}
+
+        # Speaker 0 speaks -> translation goes to listener (Speaker 1, wears L)
+        r0 = resolve_route(self.state, lid_winner='en')
+        self.assertEqual(r0['speaker_id'], 0)
+        self.assertEqual(r0['sink'], 'earbud_L')
+        self.assertIn(r0['sink'], SINKS)
+
+        # Speaker 1 speaks -> translation goes to listener (Speaker 0, wears R)
+        r1 = resolve_route(self.state, lid_winner='ar')
+        self.assertEqual(r1['speaker_id'], 1)
+        self.assertEqual(r1['sink'], 'earbud_R')
+        self.assertIn(r1['sink'], SINKS)
 
     def test_resolve_route_listen_c(self):
         self.state.mode = 'listen_c'
         self.state.source = 'en'
         self.state.target = 'ar'
         r = resolve_route(self.state)
-        self.assertEqual(r['sink'], 'earbuds')
+        self.assertEqual(r['sink'], 'earbud')
         self.assertEqual(r['attribution'], 'pinned')
         self.assertEqual(r['direction'], 'en->ar')
+        self.assertIn(r['sink'], SINKS)
+
+    def test_all_emitted_sinks_in_closed_enum(self):
+        # Exhaustive permutation test asserting all outputs in closed SINKS set
+        for mode in ('hybrid_a', 'share_b', 'listen_c', 'pair_auto'):
+            self.state.mode = mode
+            for cap in ('earbud_mic', 'phone_mic', None):
+                for winner in ('en', 'ar', None):
+                    for spk in (0, 1, None):
+                        r = resolve_route(self.state, capture=cap, lid_winner=winner, speaker_id=spk)
+                        self.assertIn(r['sink'], SINKS, f"Sink {r['sink']} not in closed enum for mode={mode}")
 
     def test_resolve_route_pair_auto_backward_compat(self):
         self.state.mode = 'pair_auto'
         r = resolve_route(self.state, lid_winner='en')
         self.assertEqual(r['speaker_id'], 0)
-        self.assertEqual(r['channel'], 'L')
+        self.assertIn(r['sink'], SINKS)
 
     async def test_config_validation_valid_protocol2(self):
         await _on_control_frame(self.state, {
