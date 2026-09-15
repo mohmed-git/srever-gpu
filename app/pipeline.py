@@ -313,6 +313,40 @@ class Pipeline:
                     code="silent_audio",
                 )
 
+            # Phase C: Encoder-level LID gate
+            is_mismatch, det_lang, det_prob = await self._check_lid_gate(decoded.samples, src)
+            if is_mismatch:
+                total_ms = (time.perf_counter() - wall_start) * 1000.0
+                self.metrics.incr("lid_mismatch")
+                self.metrics.incr("hollow_results")
+                self.metrics.incr("requests_completed")
+                log.warning(
+                    "Phase C Encoder LID gate: expected src=%r, detected %r (prob=%.2f). MT skipped.",
+                    src, det_lang, det_prob,
+                )
+                return TranslationOutcome(
+                    original_text="",
+                    translated_text="",
+                    source_lang=det_lang,
+                    target_lang=dst,
+                    asr_ms=0.0,
+                    mt_ms=0.0,
+                    total_server_ms=round(total_ms, 2),
+                    detail={
+                        "hollow": True,
+                        "hollow_reason": "lid_mismatch",
+                        "detected_lang": det_lang,
+                        "detected_prob": round(float(det_prob), 4),
+                        "mt_ms_note": "MT was not run: encoder LID mismatch",
+                        "decode_ms": round(decode_ms, 2),
+                        "audio_seconds": decoded.duration_s,
+                        "audio_peak": round(decoded.peak, 5),
+                        "queue_ms": 0.0,
+                        "within_budget": total_ms <= self.settings.latency_budget_ms,
+                        "latency_budget_ms": self.settings.latency_budget_ms,
+                    },
+                )
+
             asr_result, asr_timing = await self._asr_sched.submit(
                 {"samples": decoded.samples, "language": None if src == "auto" else src}
             )
@@ -548,6 +582,28 @@ class Pipeline:
             )
         return normalised
 
+    async def _check_lid_gate(self, samples: np.ndarray, src: str) -> tuple[bool, str, float]:
+        """Runs encoder LID to gate mismatched spoken audio when source language is pinned.
+        Returns (mismatch_flag, detected_lang, detected_prob).
+        """
+        if not getattr(self.settings, "asr_lid_gate", True) or src in (None, "auto"):
+            return False, src or "unknown", 1.0
+        if not hasattr(self.asr, "detect_language"):
+            return False, src, 1.0
+        try:
+            det = await asyncio.to_thread(self.asr.detect_language, samples)
+            if det is not None and isinstance(det, tuple) and len(det) >= 2:
+                det_lang, det_prob = str(det[0]), float(det[1])
+                norm_det = lang_mod.normalise(det_lang) or det_lang
+                norm_src = lang_mod.normalise(src) or src
+                threshold = getattr(self.settings, "asr_lid_threshold", 0.6)
+                if det_prob >= threshold and norm_det != norm_src:
+                    return True, det_lang, det_prob
+                return False, det_lang, det_prob
+        except Exception as exc:
+            log.warning("Encoder LID check failed: %s", exc)
+        return False, src, 1.0
+
     # ---- streaming (sentence-by-sentence) ------------------------------
     async def translate_audio_streaming(
         self,
@@ -574,6 +630,40 @@ class Pipeline:
                 input_sample_rate=input_sample_rate,
                 channels=channels,
             )
+
+            # Phase C: Encoder-level LID gate
+            is_mismatch, det_lang, det_prob = await self._check_lid_gate(decoded.samples, src)
+            if is_mismatch:
+                total_ms = (time.perf_counter() - wall_start) * 1000.0
+                self.metrics.incr("lid_mismatch")
+                self.metrics.incr("hollow_results")
+                self.metrics.incr("requests_completed")
+                log.warning(
+                    "Phase C Encoder LID gate (streaming): expected src=%r, detected %r (prob=%.2f). MT skipped.",
+                    src, det_lang, det_prob,
+                )
+                yield {
+                    "type": "final",
+                    "original_text": "",
+                    "translated_text": "",
+                    "source_lang": det_lang,
+                    "target_lang": dst,
+                    "source_variant": source_variant or None,
+                    "target_variant": target_variant or None,
+                    "asr_ms": 0.0,
+                    "mt_ms": 0.0,
+                    "total_server_ms": round(total_ms, 2),
+                    "sentence_count": 0,
+                    "streamed": False,
+                    "first_sentence_ms": None,
+                    "first_sentence_ms_note": "MT was not run: encoder LID mismatch",
+                    "hollow": True,
+                    "hollow_reason": "lid_mismatch",
+                    "detected_lang": det_lang,
+                    "detected_prob": round(float(det_prob), 4),
+                    "rms_dbfs": None,
+                }
+                return
 
             asr_result, asr_timing = await self._asr_sched.submit(
                 {"samples": decoded.samples, "language": None if src == "auto" else src}
