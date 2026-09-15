@@ -206,6 +206,11 @@ _CONTROL_KEYS = {
     "languages",
     "channel_map",
     "floor_dbfs",
+    "speakers",
+    "route",
+    "capture",
+    "sink",
+    "role",
 }
 
 
@@ -303,6 +308,10 @@ class _Slot:
         self.channel: str | None = None
         self.lid_low_confidence: bool = False
 
+        # Tri-Mode (Protocol 2)
+        self.capture: str | None = None
+        self.route: dict[str, Any] | None = None
+
     @property
     def buf_ms(self) -> int:
         return len(self.buffer) // 32
@@ -317,6 +326,7 @@ class _StreamState:
         self.mode: str = "single"
         self.languages: list[str] = ["ar", "en"]
         self.channel_map: dict[str, str] = {"0": "L", "1": "R"}
+        self.speakers: list[dict[str, Any]] = []
         self.floor_dbfs: float | None = None
         self.source: str | None = None
         self.target: str | None = None
@@ -468,6 +478,113 @@ class _StreamState:
                 self.floor_dbfs = float(message["floor_dbfs"])
             except (TypeError, ValueError):
                 pass
+        if "speakers" in message and isinstance(message["speakers"], list):
+            self.speakers = message["speakers"]
+            if not ("languages" in message and message["languages"]):
+                spk_langs = [
+                    str(s.get("lang")).strip().lower()
+                    for s in message["speakers"]
+                    if isinstance(s, dict) and s.get("lang")
+                ]
+                if len(spk_langs) >= 2 and spk_langs[:2] != self.languages:
+                    self.languages = spk_langs[:2]
+                    changed = True
+
+
+def resolve_route(
+    state: _StreamState,
+    capture: str | None = None,
+    lid_winner: str | None = None,
+    lid_conf: float | None = None,
+    speaker_id: int | None = None,
+) -> dict[str, Any]:
+    """Deterministically resolves routing and sinks for Tri-Mode (Protocol 2) and pair_auto."""
+    mode = state.mode
+    lang0 = state.languages[0] if state.languages else (state.source or "en")
+    lang1 = state.languages[1] if len(state.languages) > 1 else (state.target or "ar")
+
+    if mode == "hybrid_a":
+        # Mode 1: Earbud User + Guest (Phone)
+        if capture == "earbud_mic" or speaker_id == 0:
+            spk = 0
+            src = lang0
+            dst = lang1
+            sink = "speaker"  # Guest hears translation on phone speaker
+            attribution = "capture_source"
+        else:
+            spk = 1
+            src = lang1
+            dst = lang0
+            sink = "earbuds"  # Earbud user hears translation in-ear
+            attribution = "capture_source"
+        return {
+            "speaker_id": spk,
+            "sink": sink,
+            "attribution": attribution,
+            "lid_conf": lid_conf,
+            "source": src,
+            "target": dst,
+            "direction": f"{src}->{dst}",
+            "channel": state.channel_map.get(str(spk), "L" if spk == 0 else "R"),
+        }
+
+    elif mode == "share_b":
+        # Mode 2: Shared Buds (L/R)
+        # Attribution by LID constrained between the 2 languages
+        if lid_winner == lang1 or speaker_id == 1:
+            spk = 1
+            src = lang1
+            dst = lang0
+            chan = state.channel_map.get("0", "L")
+            sink = f"earbud_{chan.lower()}"
+        else:
+            spk = 0
+            src = lang0
+            dst = lang1
+            chan = state.channel_map.get("1", "R")
+            sink = f"earbud_{chan.lower()}"
+        return {
+            "speaker_id": spk,
+            "sink": sink,
+            "attribution": "lid",
+            "lid_conf": lid_conf,
+            "source": src,
+            "target": dst,
+            "direction": f"{src}->{dst}",
+            "channel": chan,
+        }
+
+    elif mode == "listen_c":
+        # Mode 3: Listen-only (Lecture/Tour)
+        src = state.source or lang0
+        dst = state.target or lang1
+        return {
+            "speaker_id": None,
+            "sink": "earbuds",
+            "attribution": "pinned",
+            "lid_conf": lid_conf,
+            "source": src,
+            "target": dst,
+            "direction": f"{src}->{dst}",
+            "channel": "both",
+        }
+
+    else:
+        # Default / pair_auto / single
+        spk = speaker_id if speaker_id is not None else (0 if lid_winner == lang0 else 1)
+        chan = state.channel_map.get(str(spk), "L" if spk == 0 else "R")
+        src = lang0 if spk == 0 else lang1
+        dst = lang1 if spk == 0 else lang0
+        return {
+            "speaker_id": spk,
+            "sink": chan,
+            "attribution": "lid" if mode == "pair_auto" else "pinned",
+            "lid_conf": lid_conf,
+            "source": src,
+            "target": dst,
+            "direction": f"{src}->{dst}",
+            "channel": chan,
+        }
 
 
 async def _verify_pinned_language(
@@ -848,7 +965,7 @@ async def _run_partial(state: _StreamState, slot: _Slot, seq: int) -> None:
                                     tgt,
                                     cs_s_var,
                                     cs_t_var,
-                                    "",
+                                    state.last_committed_src_text,
                                 ),
                                 priority=2,
                             )
@@ -942,36 +1059,31 @@ async def _commit_slot(state: _StreamState, slot: _Slot, seq: int) -> None:
         slot.tentative_task.cancel()
     raw = bytes(slot.buffer)
     if not state.utterance_queue.full():
-        if state.mode == "pair_auto":
-            queue_item = (
-                "fresh",
-                raw,
-                utt_id,
-                commit_time,
-                slot.source,
-                slot.target,
-                slot.source_variant,
-                slot.target_variant,
-                during_ratio,
-                context_prefix,
-                slot.speaker_id,
-                slot.direction,
-                slot.channel,
-                slot.lid_low_confidence,
-            )
-        else:
-            queue_item = (
-                "fresh",
-                raw,
-                utt_id,
-                commit_time,
-                slot.source,
-                slot.target,
-                slot.source_variant,
-                slot.target_variant,
-                during_ratio,
-                context_prefix,
-            )
+        route_meta = resolve_route(
+            state,
+            capture=slot.capture,
+            speaker_id=slot.speaker_id,
+            lid_winner=slot.source,
+            lid_conf=getattr(slot, "lid_conf", None),
+        )
+        queue_item = (
+            "fresh",
+            raw,
+            utt_id,
+            commit_time,
+            route_meta["source"],
+            route_meta["target"],
+            slot.source_variant,
+            slot.target_variant,
+            during_ratio,
+            context_prefix,
+            route_meta["speaker_id"],
+            route_meta["direction"],
+            route_meta["channel"],
+            slot.lid_low_confidence,
+            route_meta,
+            slot.capture,
+        )
         await state.utterance_queue.put(queue_item)
     else:
         await state.send_json({"error": "overloaded", "retry_after_ms": 250, "detail": "utterance queue full", "utterance": utt_id})
@@ -982,6 +1094,42 @@ async def _on_control_frame(state: _StreamState, control: dict[str, Any]) -> Non
     unknown = set(control) - _CONTROL_KEYS
     state.apply(control)
     action = str(control.get("action", "")).strip().lower()
+
+    if action == "utt_meta" or ("utt" in control and "capture" in control):
+        utt_val = control.get("utt")
+        if utt_val is not None:
+            try:
+                u_id = int(utt_val)
+                if u_id in state.slots:
+                    state.slots[u_id].capture = control.get("capture")
+            except (TypeError, ValueError):
+                pass
+        await state.send_json({"event": "utt_meta_ack", "utt": control.get("utt")})
+        return
+
+    if "mode" in control and state.protocol_version == 2:
+        m = str(control["mode"]).strip().lower()
+        if m not in {"single", "pair_auto", "hybrid_a", "share_b", "listen_c"}:
+            await state.send_json({
+                "event": "config_error",
+                "reason": "unsupported_mode",
+                "detail": f"Mode '{m}' is not supported",
+            })
+            return
+        if m in {"hybrid_a", "share_b"} and len(state.languages) < 2 and not (state.source and state.target):
+            await state.send_json({
+                "event": "config_error",
+                "reason": "missing_languages",
+                "detail": f"Mode '{m}' requires at least two languages",
+            })
+            return
+        if m == "listen_c" and not (state.target or state.languages):
+            await state.send_json({
+                "event": "config_error",
+                "reason": "missing_target",
+                "detail": "Mode 'listen_c' requires a target language",
+            })
+            return
 
     if action in {"commit", "flush", "end", "eou"}:
         if state.protocol_version == 2:
@@ -1001,7 +1149,7 @@ async def _on_control_frame(state: _StreamState, control: dict[str, Any]) -> Non
 
             if target_slot is not None:
                 slot_id = target_slot.utt_id
-                if not state.target and not (state.mode == "pair_auto" and len(state.languages) >= 2):
+                if not state.target and not (state.mode in {"pair_auto", "hybrid_a", "share_b"} and len(state.languages) >= 2):
                     await state.send_json({
                         "error": "missing_target",
                         "detail": "target language not set",
@@ -1169,9 +1317,11 @@ async def _on_control_frame(state: _StreamState, control: dict[str, Any]) -> Non
     await state.send_json(
         {
             "event": "config",
+            "protocol": state.protocol_version,
             "mode": state.mode,
             "languages": state.languages,
             "channel_map": state.channel_map,
+            "speakers": getattr(state, "speakers", []),
             "source": state.source,
             "target": state.target,
             "source_variant": state.source_variant,
@@ -1179,7 +1329,6 @@ async def _on_control_frame(state: _StreamState, control: dict[str, Any]) -> Non
             "format": state.audio_format,
             "sample_rate": state.sample_rate,
             "channels": state.channels,
-            "protocol": state.protocol_version,
             "floor_dbfs": state.floor_dbfs,
             "applies_from_utt": applies_from_utt,
             "ignored_keys": sorted(unknown) or None,
@@ -1247,6 +1396,10 @@ async def _on_audio_frame(state: _StreamState, chunk: bytes) -> None:
             slot.total_frames += 1
             if flags & 0x04:
                 slot.during_playback_frames += 1
+            if flags & 0x08:
+                slot.capture = "earbud_mic"
+            elif flags & 0x10:
+                slot.capture = "phone_mic"
 
             # PREROLL flag check (bit 0: 0x01)
             if flags & 0x01:
@@ -1712,6 +1865,8 @@ async def _utterance_worker(state: _StreamState) -> None:
                 slot_dir = extra[7] if len(extra) > 7 else None
                 slot_chan = extra[8] if len(extra) > 8 else None
                 slot_low_conf = extra[9] if len(extra) > 9 else False
+                slot_route = extra[10] if len(extra) > 10 else None
+                slot_capture = extra[11] if len(extra) > 11 else None
                 await _handle_utterance_payload(
                     state,
                     raw,
@@ -1726,6 +1881,8 @@ async def _utterance_worker(state: _StreamState) -> None:
                     direction=slot_dir,
                     channel=slot_chan,
                     lid_low_confidence=slot_low_conf,
+                    route_meta=slot_route,
+                    capture=slot_capture,
                 )
 
             elif isinstance(item, tuple) and len(item) == 2:
@@ -1752,14 +1909,16 @@ async def _handle_utterance_payload(
     direction: str | None = None,
     channel: str | None = None,
     lid_low_confidence: bool = False,
+    route_meta: dict[str, Any] | None = None,
+    capture: str | None = None,
 ) -> None:
     state.utterances += 1
     utt_tag = utt_id if utt_id is not None else state.utterances
 
     assert PIPELINE is not None
 
-    if state.mode == "pair_auto" and len(state.languages) >= 2:
-        if speaker_id is None or source is None:
+    if state.mode in {"pair_auto", "share_b"} and len(state.languages) >= 2:
+        if speaker_id is None or source is None or route_meta is None:
             try:
                 decoded, _ = await PIPELINE._decode_checked(
                     raw,
@@ -1772,12 +1931,12 @@ async def _handle_utterance_payload(
                     decoded.samples,
                     state.languages,
                 )
-                cand0, cand1 = state.languages[0], state.languages[1]
-                source = winner
-                target = cand1 if winner == cand0 else cand0
-                speaker_id = 0 if winner == cand0 else 1
-                direction = f"{source}->{target}"
-                channel = state.channel_map.get(str(speaker_id), "L" if speaker_id == 0 else "R")
+                route_meta = resolve_route(state, capture=capture, lid_winner=winner, lid_conf=conf)
+                source = route_meta["source"]
+                target = route_meta["target"]
+                speaker_id = route_meta["speaker_id"]
+                direction = route_meta["direction"]
+                channel = route_meta["channel"]
                 lid_low_confidence = low_conf
                 if low_conf and PIPELINE is not None:
                     PIPELINE.metrics.incr("lid_low_confidence")
@@ -1788,7 +1947,24 @@ async def _handle_utterance_payload(
                 else:
                     source_variant = None
             except Exception as exc:
-                log.warning("pair_auto LID failed in _handle_utterance_payload: %s", exc)
+                log.warning("%s LID failed in _handle_utterance_payload: %s", state.mode, exc)
+    elif state.mode == "hybrid_a":
+        route_meta = resolve_route(state, capture=capture, speaker_id=speaker_id)
+        source = route_meta["source"]
+        target = route_meta["target"]
+        speaker_id = route_meta["speaker_id"]
+        direction = route_meta["direction"]
+        channel = route_meta["channel"]
+    elif state.mode == "listen_c":
+        route_meta = resolve_route(state)
+        source = route_meta["source"]
+        target = route_meta["target"]
+        speaker_id = route_meta["speaker_id"]
+        direction = route_meta["direction"]
+        channel = route_meta["channel"]
+
+    if route_meta is None:
+        route_meta = resolve_route(state, capture=capture, speaker_id=speaker_id)
 
     if state.stream:
         await _stream_utterance(
@@ -1805,6 +1981,7 @@ async def _handle_utterance_payload(
             direction=direction,
             channel=channel,
             lid_low_confidence=lid_low_confidence,
+            route_meta=route_meta,
         )
         return
 
@@ -1869,7 +2046,14 @@ async def _handle_utterance_payload(
     out_payload["retried"] = outcome.detail.get("retried", False) if outcome.detail else False
     out_payload["hollow_reason"] = outcome.detail.get("hollow_reason", None) if outcome.detail else None
     out_payload["rms_dbfs"] = outcome.detail.get("rms_dbfs", None) if outcome.detail else None
-    if state.mode == "pair_auto":
+    if state.protocol_version == 2 or state.mode in {"hybrid_a", "share_b", "listen_c", "pair_auto"}:
+        out_payload["route"] = {
+            "speaker_id": route_meta.get("speaker_id") if route_meta else speaker_id,
+            "sink": route_meta.get("sink") if route_meta else (channel or "earbuds"),
+            "attribution": route_meta.get("attribution") if route_meta else "pinned",
+            "lid_conf": route_meta.get("lid_conf") if route_meta else None,
+        }
+    if speaker_id is not None or state.mode in {"hybrid_a", "share_b", "listen_c", "pair_auto"}:
         out_payload["speaker_id"] = speaker_id
         out_payload["direction"] = direction
         out_payload["channel"] = channel
@@ -1918,6 +2102,7 @@ async def _stream_utterance(
     direction: str | None = None,
     channel: str | None = None,
     lid_low_confidence: bool = False,
+    route_meta: dict[str, Any] | None = None,
 ) -> None:
     """Relay the pipeline's per-sentence frames to the client."""
     assert PIPELINE is not None
@@ -1979,7 +2164,14 @@ async def _stream_utterance(
                 state.last_has_terminal_punct = bool(src_text.rstrip() and src_text.rstrip()[-1] in _TERMINATORS)
 
             frame_payload = {**frame, "utterance": utt_tag, "utt": utt_tag}
-            if state.mode == "pair_auto":
+            if state.protocol_version == 2 or state.mode in {"hybrid_a", "share_b", "listen_c", "pair_auto"}:
+                frame_payload["route"] = {
+                    "speaker_id": route_meta.get("speaker_id") if route_meta else speaker_id,
+                    "sink": route_meta.get("sink") if route_meta else (channel or "earbuds"),
+                    "attribution": route_meta.get("attribution") if route_meta else "pinned",
+                    "lid_conf": route_meta.get("lid_conf") if route_meta else None,
+                }
+            if speaker_id is not None or state.mode in {"hybrid_a", "share_b", "listen_c", "pair_auto"}:
                 frame_payload["speaker_id"] = speaker_id
                 frame_payload["direction"] = direction
                 frame_payload["channel"] = channel
