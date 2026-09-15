@@ -128,6 +128,7 @@ def resolve_route(
             "source": src,
             "target": dst,
             "direction": f"{src}->{dst}",
+            "channel": listener_chan,
         }
 
     # Contract assertion: Sink must be a member of the canonical closed enum
