@@ -606,6 +606,30 @@ def make_retry_translation_messages(text: str, src: str, dst: str) -> list[dict[
     return messages
 
 
+_CJK_LANGS: Final[frozenset[str]] = frozenset({
+    "zh", "zh-cn", "zh-tw", "zh-hans", "zh-hant", "yue", "wuu", "chinese", "cantonese",
+    "ja", "japanese",
+    "ko", "korean",
+})
+
+
+def is_cjk_lang(lang: str | None) -> bool:
+    if not lang:
+        return False
+    norm = lang.strip().lower()
+    base = norm.split("-")[0]
+    return norm in _CJK_LANGS or base in _CJK_LANGS
+
+
+def _count_units(text: str, lang: str | None = None) -> int:
+    """Counts linguistic units: non-whitespace characters for CJK scripts, space-separated words for others."""
+    if not text:
+        return 0
+    if is_cjk_lang(lang):
+        return len(re.findall(r"\S", text))
+    return len(text.split())
+
+
 def check_needs_retry(text: str, decoded: str, src: str, dst: str) -> tuple[bool, str | None]:
     """Checks if initial decode triggers any active guard requiring a retry."""
     norm_dst = (dst or "").strip().lower().split("-")[0]
@@ -620,11 +644,12 @@ def check_needs_retry(text: str, decoded: str, src: str, dst: str) -> tuple[bool
     if _is_conversational_chatter(decoded):
         return True, "conversational_chatter"
 
-    in_words = len(text.split())
-    out_words = len(decoded.split())
-    if in_words > 0 and (out_words / in_words) > 3.0:
+    in_units = _count_units(text, src)
+    out_units = _count_units(decoded, dst)
+    max_single = 6 if is_cjk_lang(dst) else 3
+    if in_units > 0 and (out_units / in_units) > 3.0:
         return True, "length_explosion"
-    if in_words == 1 and out_words > 3:
+    if in_units == 1 and out_units > max_single:
         return True, "single_token_explosion"
     if detect_person_mismatch(text, decoded, src, dst) and (norm_dst == "ar" or (norm_src == "ar" and norm_dst == "en")):
         return True, "person_mismatch"
@@ -654,10 +679,11 @@ def _apply_output_guards(
     hollow, reason = _hollow_check(decoded, text, target_lang=dst)
 
     if not hollow:
-        in_words = len(text.split())
-        out_words = len(decoded.split())
-        length_explosion = (in_words > 0 and (out_words / in_words) > 3.0)
-        single_token_explosion = (in_words == 1 and out_words > 3)
+        in_units = _count_units(text, src)
+        out_units = _count_units(decoded, dst)
+        max_single = 6 if is_cjk_lang(dst) else 3
+        length_explosion = (in_units > 0 and (out_units / in_units) > 3.0)
+        single_token_explosion = (in_units == 1 and out_units > max_single)
         mismatch = detect_person_mismatch(text, decoded, src, dst) and (norm_dst == "ar" or (norm_src == "ar" and norm_dst == "en"))
 
         if _low_target_script(decoded, dst):
