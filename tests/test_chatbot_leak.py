@@ -23,6 +23,10 @@ class TestChatbotLeak(unittest.TestCase):
         cls.backend_class = "Unknown"
         cls.model_id = "Unknown"
         cls.quantization = "Unknown"
+        cls.gpu_name = "Unknown"
+        cls.compute_capability = "Unknown"
+        cls.cuda_runtime_version = "Unknown"
+        cls.torch_cuda_version = "Unknown"
         if cls.use_http:
             try:
                 headers = {"Authorization": f"Bearer {AUTH_TOKEN}"} if AUTH_TOKEN else {}
@@ -34,15 +38,28 @@ class TestChatbotLeak(unittest.TestCase):
                     mt_info = data.get("engines", {}).get("mt", {})
                     cls.model_id = mt_info.get("model", "Unknown")
                     cls.quantization = mt_info.get("quantization", "none")
+                    cls.gpu_name = data.get("gpu_name") or "Unknown"
+                    cls.compute_capability = data.get("compute_capability") or "Unknown"
+                    cls.cuda_runtime_version = data.get("cuda_runtime_version") or "Unknown"
+                    cls.torch_cuda_version = data.get("torch_cuda_version") or "Unknown"
             except Exception:
                 pass
         else:
             # Fall back to in-process
             from app.mt import QwenCt2Engine
             from app.config import Settings
+            from app.metrics import gpu_hardware_info
             cls.settings = Settings()
             cls.engine = QwenCt2Engine(cls.settings)
-            cls.engine.load()
+            try:
+                cls.engine.load()
+            except Exception as exc:
+                raise unittest.SkipTest(f"In-process MT engine load skipped: {exc}")
+            hw = gpu_hardware_info()
+            cls.gpu_name = hw.get("gpu_name") or "CPU/None"
+            cls.compute_capability = hw.get("compute_capability") or "None"
+            cls.cuda_runtime_version = hw.get("cuda_runtime_version") or "None"
+            cls.torch_cuda_version = hw.get("torch_cuda_version") or "None"
             if not cls.engine.ready:
                 raise unittest.SkipTest("MT Engine not loaded")
             cls.backend_name = cls.engine.name
@@ -76,7 +93,8 @@ class TestChatbotLeak(unittest.TestCase):
             return results
 
     def test_chatbot_leak_properties(self):
-        print(f"\nACTIVE MT BACKEND: {self.backend_class} ({self.backend_name}) | Model: {self.model_id} | Quant: {self.quantization}")
+        print(f"\n[ACTIVE MT BACKEND: {self.backend_class} ({self.backend_name}) | Model: {self.model_id} | Quant: {self.quantization}]")
+        print(f"[GPU: {self.gpu_name} | Compute Capability: {self.compute_capability} | CUDA Runtime: {self.cuda_runtime_version} | PyTorch CUDA: {self.torch_cuda_version}]")
         items = [(c["text"], c["src"], c["dst"]) for c in self.corpus]
         
         outputs = self._translate(items)

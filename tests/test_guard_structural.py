@@ -37,33 +37,79 @@ class TestGuardStructural(unittest.TestCase):
             )
 
     def test_zero_tuple_unpacking_over_items_outside_unpack_item(self):
-        # Remove def _unpack_item block from code before checking
-        unpack_func_pattern = r"def _unpack_item\(.*?\n(?=\S)"
-        code_without_unpack = re.sub(unpack_func_pattern, "", self.code, flags=re.DOTALL)
-        
-        tuple_unpack_patterns = [
-            r"for\s+\([^\)]+\)\s+in\s+items",
-            r"for\s+\([^\)]+\)\s*,\s*\w+\s+in\s+zip\(\s*items",
-            r"for\s+\w+\s*,\s*\([^\)]+\)\s+in\s+zip\(\s*items",
-            r"for\s+\w+\s*,\s*\w+\s*,\s*\w+\s+in\s+items",
-        ]
-        found_matches = []
-        for pat in tuple_unpack_patterns:
-            matches = re.findall(pat, code_without_unpack)
-            if matches:
-                found_matches.extend(matches)
-        
+        import ast
+
+        tree = ast.parse(self.code, filename=MT_PATH)
+        violations = []
+
+        for node in ast.walk(tree):
+            # Skip AST nodes inside _unpack_item function definition
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "_unpack_item":
+                continue
+
+            # Case 1: For loop unpacking: `for (text, ...) in items:` or `for (text, ...), row in zip(items, ...):`
+            if isinstance(node, ast.For):
+                target = node.target
+                has_tuple_target = isinstance(target, ast.Tuple)
+                has_nested_tuple = (
+                    isinstance(target, ast.Tuple)
+                    and any(isinstance(elt, ast.Tuple) for elt in target.elts)
+                )
+                
+                # Accurately verify if the variable name 'items' is being iterated over (excluding dict .items())
+                iterates_items_var = any(
+                    isinstance(sub, ast.Name) and sub.id == "items" for sub in ast.walk(node.iter)
+                )
+                if iterates_items_var and (has_tuple_target or has_nested_tuple):
+                    violations.append(f"Line {node.lineno}: for-loop tuple unpacking over {ast.unparse(node.iter)}: '{ast.unparse(node).splitlines()[0]}'")
+
+            # Case 2: Assignment unpacking on its own line: `text, src, dst = item`
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Tuple):
+                        val_str = ast.unparse(node.value)
+                        if val_str in {"item", "items[0]", "j.payload"}:
+                            violations.append(f"Line {node.lineno}: direct assignment tuple unpacking from '{val_str}': '{ast.unparse(node)}'")
+
         self.assertEqual(
-            len(found_matches), 0,
-            f"Found forbidden tuple unpacking over items outside _unpack_item in app/mt.py: {found_matches}"
+            violations, [],
+            f"Found forbidden tuple unpacking over items outside _unpack_item via AST walk:\n" + "\n".join(violations)
         )
 
     def test_sabotage_tuple_unpacking_structural_test(self):
-        # Sabotage: re-adding line 1922 from 1deaf8b MUST be caught by the pattern
-        sabotaged_code = self.code + "\nfor (text, _s, _d), row in zip(items, generated):\n    pass\n"
-        pattern = r"for\s+\([^\)]+\)\s*,\s*\w+\s+in\s+zip\(\s*items"
-        matches = re.findall(pattern, sabotaged_code)
-        self.assertGreater(len(matches), 0, "Sabotage pattern was not detected!")
+        import ast
+
+        def check_code_violations(source: str):
+            tree = ast.parse(source)
+            violations = []
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "_unpack_item":
+                    continue
+                if isinstance(node, ast.For):
+                    target = node.target
+                    has_tuple = isinstance(target, ast.Tuple) or (
+                        isinstance(target, ast.Tuple) and any(isinstance(elt, ast.Tuple) for elt in target.elts)
+                    )
+                    iterates_items_var = any(
+                        isinstance(sub, ast.Name) and sub.id == "items" for sub in ast.walk(node.iter)
+                    )
+                    if iterates_items_var and has_tuple:
+                        violations.append(f"Line {node.lineno}: {ast.unparse(node).splitlines()[0]}")
+                if isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, ast.Tuple) and ast.unparse(node.value) in {"item", "items[0]", "j.payload"}:
+                            violations.append(f"Line {node.lineno}: {ast.unparse(node)}")
+            return violations
+
+        # Sabotage 1: re-adding line 1922 from 1deaf8b (for (text, _s, _d), row in zip(items, generated):)
+        sabotage_for = self.code + "\ndef bad_func(items, generated):\n    for (text, _s, _d), row in zip(items, generated):\n        pass\n"
+        v1 = check_code_violations(sabotage_for)
+        self.assertGreater(len(v1), 0, "AST check failed to detect sabotaged for-loop tuple unpacking!")
+
+        # Sabotage 2: standalone assignment on its own line (text, src, dst = item)
+        sabotage_assign = self.code + "\ndef bad_func2(item):\n    text, src, dst = item\n    return text\n"
+        v2 = check_code_violations(sabotage_assign)
+        self.assertGreater(len(v2), 0, "AST check failed to detect sabotaged standalone assignment tuple unpacking!")
 
     def test_all_translate_batch_bodies_use_unpack_item(self):
         engine_classes = ["QwenCt2Engine", "QwenVllmEngine", "QwenHfEngine", "M2M100Ct2Engine"]

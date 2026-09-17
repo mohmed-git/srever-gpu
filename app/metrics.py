@@ -260,6 +260,56 @@ class Metrics:
         }
 
 
+def gpu_hardware_info() -> dict[str, Any]:
+    """Retrieve GPU hardware and CUDA runtime versions permanently for /health."""
+    info: dict[str, Any] = {
+        "gpu_name": None,
+        "compute_capability": None,
+        "cuda_runtime_version": None,
+        "torch_cuda_version": None,
+    }
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            idx = torch.cuda.current_device()
+            info["gpu_name"] = torch.cuda.get_device_name(idx)
+            info["torch_cuda_version"] = getattr(torch.version, "cuda", None)
+            try:
+                cap = torch.cuda.get_device_capability(idx)
+                info["compute_capability"] = f"{cap[0]}.{cap[1]}"
+            except Exception as exc:
+                info["compute_capability"] = f"unsupported ({exc})"
+
+            # Try to get runtime version from torch if available
+            try:
+                info["cuda_runtime_version"] = str(getattr(torch.version, "cuda", ""))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        if not info["gpu_name"]:
+            name = pynvml.nvmlDeviceGetName(handle)
+            info["gpu_name"] = name.decode() if isinstance(name, bytes) else name
+        try:
+            cuda_v = pynvml.nvmlSystemGetCudaDriverVersion()
+            major = cuda_v // 1000
+            minor = (cuda_v % 1000) // 10
+            info["cuda_runtime_version"] = f"{major}.{minor}"
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    return info
+
+
 def resource_report() -> dict[str, Any]:
     """Process RSS + GPU memory, with 'unavailable' distinct from zero."""
     report: dict[str, Any] = {"cpu": _cpu_memory(), "gpu": _gpu_memory()}

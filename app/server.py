@@ -32,7 +32,7 @@ from pydantic import BaseModel, Field, field_validator
 from . import languages as lang_mod
 from . import mt as mt_mod
 from .config import SETTINGS, Settings
-from .metrics import resource_report
+from .metrics import resource_report, gpu_hardware_info
 from .pipeline import Pipeline, RequestError
 from .scheduler import Overloaded
 from .sentences import _TERMINATORS, split_sentences
@@ -2177,6 +2177,7 @@ async def ping() -> JSONResponse:
 @app.get("/health")
 async def health() -> JSONResponse:
     ready = PIPELINE is not None and PIPELINE.ready
+    gpu_hw = gpu_hardware_info()
     body: dict[str, Any] = {
         "status": "ok" if ready else ("error" if STARTUP_ERROR else "loading"),
         "version": VERSION,
@@ -2190,6 +2191,10 @@ async def health() -> JSONResponse:
         "latency_budget_ms": SETTINGS.latency_budget_ms,
         "mt_backend": PIPELINE.mt.name if PIPELINE else None,
         "mt_backend_class": PIPELINE.mt.__class__.__name__ if PIPELINE else None,
+        "gpu_name": gpu_hw.get("gpu_name"),
+        "compute_capability": gpu_hw.get("compute_capability"),
+        "cuda_runtime_version": gpu_hw.get("cuda_runtime_version"),
+        "torch_cuda_version": gpu_hw.get("torch_cuda_version"),
     }
     if PIPELINE is not None:
         body["uptime_seconds"] = (
