@@ -123,6 +123,10 @@ class Settings:
     # CPU verification path: a real CT2 translation model that fits this box.
     mt_cpu_model_path: str = field(default_factory=lambda: _env("MT_CPU_MODEL_PATH", ""))
     mt_tokenizer: str = field(default_factory=lambda: _env("MT_TOKENIZER", "Qwen/Qwen2.5-1.5B-Instruct"))
+    # Production allow-list: default {"qwen_vllm", "qwen_ct2"}. qwen_hf is a dev fallback.
+    mt_allowed_backends: str = field(
+        default_factory=lambda: _env("MT_ALLOWED_BACKENDS", "qwen_vllm,qwen_ct2")
+    )
     partial_ms: int = field(default_factory=lambda: _env_int("PARTIAL_MS", 320))
 
     # ---- admission control --------------------------------------------
@@ -191,6 +195,9 @@ class Settings:
         if self.asr_cpu_threads > 0:
             return self.asr_cpu_threads
         return max(1, (os.cpu_count() or 2))
+
+    def allowed_mt_backends(self) -> set[str]:
+        return {b.strip().lower() for b in self.mt_allowed_backends.split(",") if b.strip()}
 
     def describe(self) -> dict[str, Any]:
         data = asdict(self)

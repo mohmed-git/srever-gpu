@@ -17,6 +17,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt accelerate autoawq
 
+# Build-time verification: ensure vllm imports cleanly without silent fallback
+RUN python3 -c "import vllm; print('Build verification succeeded: vLLM', vllm.__version__)"
+
 # Build-time pre-conversion of Qwen2.5-1.5B-Instruct to CTranslate2 int8_float16
 RUN ct2-transformers-converter --model Qwen/Qwen2.5-1.5B-Instruct --quantization int8_float16 --output_dir /models/qwen2.5-1.5b-ct2
 

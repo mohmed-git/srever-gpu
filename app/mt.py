@@ -725,17 +725,57 @@ def clean_translation(text: str, target_lang: str = "", source_text: str = "") -
 
 
 
-def _estimate_dynamic_tokens(items: list[tuple[str, str, str]], max_allowed: int, tokenizer: Any = None) -> int:
+@dataclass(frozen=True)
+class MtItem:
+    text: str
+    src: str
+    dst: str
+    source_variant: str = ""
+    target_variant: str = ""
+    context_prefix: str = ""
+    tier: str = ""
+
+
+def _unpack_item(item: Any) -> MtItem:
+    """Canonical unpacker for MT batch items. The ONLY way any engine reads an item."""
+    if isinstance(item, MtItem):
+        return item
+    if isinstance(item, (list, tuple)):
+        n = len(item)
+        text = str(item[0]) if n > 0 else ""
+        src = str(item[1]) if n > 1 else ""
+        dst = str(item[2]) if n > 2 else ""
+        s_var = str(item[3]) if n > 3 and item[3] is not None else ""
+        t_var = str(item[4]) if n > 4 and item[4] is not None else ""
+        c_pre = str(item[5]) if n > 5 and item[5] is not None else ""
+        tier = str(item[6]) if n > 6 and item[6] is not None else ""
+        return MtItem(
+            text=text,
+            src=src,
+            dst=dst,
+            source_variant=s_var,
+            target_variant=t_var,
+            context_prefix=c_pre,
+            tier=tier,
+        )
+    raise TypeError(f"cannot unpack MT item of type {type(item).__name__}: {item!r}")
+
+
+def _estimate_dynamic_tokens(items: list[Any], max_allowed: int, tokenizer: Any = None) -> int:
     """Safely bound max output tokens for spaced and unspaced scripts (CJK, Thai, etc.)."""
+    raw_texts = [
+        it.text if isinstance(it, MtItem) else (it[0] if isinstance(it, (list, tuple)) else str(it))
+        for it in items
+    ]
     if tokenizer is not None:
         try:
-            max_in = max((len(tokenizer.encode(t[0], add_special_tokens=False)) for t in items), default=4)
+            max_in = max((len(tokenizer.encode(t, add_special_tokens=False)) for t in raw_texts), default=4)
             est = int(2.5 * max_in) + 12
             return min(max_allowed, max(16, est))
         except Exception:
             pass
-    max_words = max((len(t[0].split()) for t in items), default=4)
-    max_chars = max((len(t[0]) for t in items), default=16)
+    max_words = max((len(t.split()) for t in raw_texts), default=4)
+    max_chars = max((len(t) for t in raw_texts), default=16)
     est = max(int(max_words * 2.5) + 12, int(max_chars * 1.2) + 8)
     return min(max_allowed, max(16, est))
 
@@ -777,20 +817,25 @@ class MtEngine:
         return False
 
     def translate_batch(
-        self, items: list[tuple[str, str, str]]
+        self, items: list[Any]
     ) -> list[MtResult]:  # pragma: no cover
-        """items: list of (text, source_lang, target_lang)."""
+        """items: list of items readable via _unpack_item."""
         raise NotImplementedError
 
     def translate(self, text: str, source: str, target: str) -> MtResult:
-        return self.translate_batch([(text, source, target)])[0]
+        return self.translate_batch([(text, source, target, "", "", "")])[0]
 
     def warmup(self) -> dict[str, Any]:
         if not self.ready:
             return {"available": False, "reason": "model not loaded"}
         started = time.perf_counter()
         try:
-            result = self.translate("Hello.", "en", "ar")
+            # Exercise the production 6-tuple shape built by pipeline.py:208
+            # (text, src, dst, source_variant, target_variant, "")
+            results = self.translate_batch([("Hello.", "en", "ar", "", "", "")])
+            if not results:
+                raise RuntimeError("warmup returned empty results")
+            result = results[0]
         except Exception as exc:
             return {"available": False, "reason": f"{type(exc).__name__}: {exc}"}
         return {
@@ -1045,18 +1090,19 @@ class M2M100Ct2Engine(MtEngine):
     def supports(self, code: str) -> bool:
         return (not self._supported) or (code in self._supported)
 
-    def translate_batch(self, items: list[tuple[str, str, str]]) -> list[MtResult]:
+    def translate_batch(self, items: list[Any]) -> list[MtResult]:
         if not self.ready:
             raise RuntimeError("MT model not loaded")
         if not items:
             return []
 
+        unpacked = [_unpack_item(it) for it in items]
         batch_pieces: list[list[str]] = []
         prefixes: list[list[str]] = []
-        for text, src, dst in items:
-            pieces = [f"__{src}__"] + self._sp.EncodeAsPieces(text) + ["</s>"]
+        for it in unpacked:
+            pieces = [f"__{it.src}__"] + self._sp.EncodeAsPieces(it.text) + ["</s>"]
             batch_pieces.append(pieces)
-            prefixes.append([f"__{dst}__"])
+            prefixes.append([f"__{it.dst}__"])
 
         started = time.perf_counter()
         results = self._translator.translate_batch(
@@ -1076,7 +1122,8 @@ class M2M100Ct2Engine(MtEngine):
         per_item_ms = round(elapsed_ms, 2)
 
         out: list[MtResult] = []
-        for (text, _src, _dst), pieces, result in zip(items, batch_pieces, results):
+        for it, pieces, result in zip(unpacked, batch_pieces, results):
+            text, _src, _dst = it.text, it.src, it.dst
             hypothesis = list(result.hypotheses[0]) if result.hypotheses else []
             if hypothesis:
                 hypothesis = hypothesis[1:]  # drop the forced target token
@@ -1341,7 +1388,7 @@ class QwenCt2Engine(MtEngine):
         else:
             self.error = f"warmup probe degenerate: {reason}"
 
-    def translate_batch(self, items: list[tuple[str, ...]]) -> list[MtResult]:
+    def translate_batch(self, items: list[Any]) -> list[MtResult]:
         if self._fallback_engine is not None and self._fallback_engine.ready:
             return self._fallback_engine.translate_batch(items)
         if not self.ready:
@@ -1349,31 +1396,25 @@ class QwenCt2Engine(MtEngine):
         if not items:
             return []
 
+        unpacked = [_unpack_item(item) for item in items]
         # Group items by translation direction while tracking original indices
-        groups: dict[str, list[tuple[int, str, str, str, list[str], str, str, str]]] = {}
-        for idx, item in enumerate(items):
-            text, src, dst = item[0], item[1], item[2]
-            source_variant = item[3] if len(item) > 3 else ""
-            target_variant = item[4] if len(item) > 4 else ""
-            context_prefix = item[5] if len(item) > 5 else ""
+        groups: dict[str, list[tuple[int, MtItem, list[str]]]] = {}
+        for idx, it in enumerate(unpacked):
             key, static, per_req = self._split_prompt(
-                text, src, dst,
-                source_variant=source_variant,
-                target_variant=target_variant,
-                context_prefix=context_prefix,
+                it.text, it.src, it.dst,
+                source_variant=it.source_variant,
+                target_variant=it.target_variant,
+                context_prefix=it.context_prefix,
             )
-            groups.setdefault(key, []).append(
-                (idx, text, src, dst, per_req, source_variant, target_variant, context_prefix)
-            )
+            groups.setdefault(key, []).append((idx, it, per_req))
 
-        collected: list[tuple[int, Any, list[str], str, str, str, str, str, str]] = []
+        collected: list[tuple[int, Any, list[str], MtItem]] = []
         started = time.perf_counter()
 
         for key, grp in groups.items():
             static = self._static_tokens[key]
-            full_tokens_batch = [static + item[4] for item in grp]
-            group_items = [(item[1], item[2], item[3]) for item in grp]
-            dyn_tokens = _estimate_dynamic_tokens(group_items, self.settings.mt_max_new_tokens, tokenizer=self._tokenizer)
+            full_tokens_batch = [static + entry[2] for entry in grp]
+            dyn_tokens = _estimate_dynamic_tokens([entry[1] for entry in grp], self.settings.mt_max_new_tokens, tokenizer=self._tokenizer)
 
             # End tokens: <|im_end|> and <|endoftext|>.
             # Architectural decision: "Ċ" (newline token) is deliberately omitted from end_token
@@ -1388,14 +1429,16 @@ class QwenCt2Engine(MtEngine):
                 repetition_penalty=1.0,
                 end_token=["<|im_end|>", "<|endoftext|>"],
             )
-            for (idx, text, src, dst, per_req, s_var, t_var, c_pre), out in zip(grp, outputs):
-                collected.append((idx, out, static + per_req, text, src, dst, s_var, t_var, c_pre))
+            for (idx, it, per_req), out in zip(grp, outputs):
+                collected.append((idx, out, static + per_req, it))
 
         elapsed_ms = round((time.perf_counter() - started) * 1000.0, 2)
         collected.sort(key=lambda x: x[0])
 
         results: list[MtResult] = []
-        for _idx, output, full_prompt_tokens, text, _s, _d, _s_var, _t_var, _c_pre in collected:
+        for _idx, output, full_prompt_tokens, it in collected:
+            text, _s, _d = it.text, it.src, it.dst
+            _s_var, _t_var, _c_pre = it.source_variant, it.target_variant, it.context_prefix
             if hasattr(output, "sequences_ids") and output.sequences_ids and output.sequences_ids[0]:
                 decoded_raw = self._tokenizer.decode(output.sequences_ids[0], skip_special_tokens=True)
             elif output.sequences and output.sequences[0]:
@@ -1611,8 +1654,18 @@ class QwenVllmEngine(MtEngine):
             )
         except Exception as exc:
             self.error = f"{type(exc).__name__}: {exc}"
-            log.error(
-                "vLLM initialization failed (%s); falling back to QwenHfEngine on CUDA to keep service healthy",
+            allowed = self.settings.allowed_mt_backends()
+            if "qwen_hf" not in allowed:
+                log.error(
+                    "vLLM initialization failed (%s); silent fallback to qwen_hf is FORBIDDEN by MT_ALLOWED_BACKENDS (%s). Refusing startup.",
+                    exc,
+                    allowed,
+                )
+                raise RuntimeError(
+                    f"vLLM initialization failed ({exc}) and fallback to qwen_hf is forbidden by MT_ALLOWED_BACKENDS"
+                ) from exc
+            log.warning(
+                "vLLM initialization failed (%s); falling back to QwenHfEngine on CUDA because 'qwen_hf' is in MT_ALLOWED_BACKENDS override",
                 exc,
             )
             self._fallback = QwenHfEngine(self.settings)
@@ -1653,7 +1706,7 @@ class QwenVllmEngine(MtEngine):
             messages, tokenize=False, add_generation_prompt=True
         )
 
-    def translate_batch(self, items: list[tuple[str, ...]]) -> list[MtResult]:
+    def translate_batch(self, items: list[Any]) -> list[MtResult]:
         if not self.ready:
             raise RuntimeError("MT model not loaded")
         if not items:
@@ -1662,18 +1715,19 @@ class QwenVllmEngine(MtEngine):
             return self._fallback.translate_batch(items)
         from vllm import SamplingParams
 
+        unpacked = [_unpack_item(item) for item in items]
         prompts = [
             self._prompt(
-                item[0],
-                item[1],
-                item[2],
-                source_variant=item[3] if len(item) > 3 else "",
-                target_variant=item[4] if len(item) > 4 else "",
-                context_prefix=item[5] if len(item) > 5 else "",
+                it.text,
+                it.src,
+                it.dst,
+                source_variant=it.source_variant,
+                target_variant=it.target_variant,
+                context_prefix=it.context_prefix,
             )
-            for item in items
+            for it in unpacked
         ]
-        dyn_tokens = _estimate_dynamic_tokens(items, self.settings.mt_max_new_tokens, tokenizer=self._tokenizer)
+        dyn_tokens = _estimate_dynamic_tokens(unpacked, self.settings.mt_max_new_tokens, tokenizer=self._tokenizer)
         sampling = SamplingParams(
             temperature=0.0,
             top_p=1.0,
@@ -1686,11 +1740,11 @@ class QwenVllmEngine(MtEngine):
         elapsed_ms = round((time.perf_counter() - started) * 1000.0, 2)
 
         results: list[MtResult] = []
-        for idx, (item, output) in enumerate(zip(items, outputs)):
-            text, _s, _d = item[0], item[1], item[2]
-            _s_var = item[3] if len(item) > 3 else ""
-            _t_var = item[4] if len(item) > 4 else ""
-            _c_pre = item[5] if len(item) > 5 else ""
+        for idx, (it, output) in enumerate(zip(unpacked, outputs)):
+            text, _s, _d = it.text, it.src, it.dst
+            _s_var = it.source_variant
+            _t_var = it.target_variant
+            _c_pre = it.context_prefix
             
             completion = output.outputs[0] if output.outputs else None
             decoded = clean_translation(
@@ -1870,7 +1924,7 @@ class QwenHfEngine(MtEngine):
     def ready(self) -> bool:
         return self._model is not None and self._tokenizer is not None
 
-    def translate_batch(self, items: list[tuple[str, ...]]) -> list[MtResult]:
+    def translate_batch(self, items: list[Any]) -> list[MtResult]:
         import torch
 
         if not self.ready:
@@ -1878,19 +1932,16 @@ class QwenHfEngine(MtEngine):
         if not items:
             return []
 
+        unpacked = [_unpack_item(item) for item in items]
         texts = []
-        for item in items:
-            text, src, dst = item[0], item[1], item[2]
-            source_variant = item[3] if len(item) > 3 else ""
-            target_variant = item[4] if len(item) > 4 else ""
-            context_prefix = item[5] if len(item) > 5 else ""
+        for it in unpacked:
             messages = make_translation_messages(
-                text,
-                src,
-                dst,
-                source_variant=source_variant,
-                target_variant=target_variant,
-                context_prefix=context_prefix,
+                it.text,
+                it.src,
+                it.dst,
+                source_variant=it.source_variant,
+                target_variant=it.target_variant,
+                context_prefix=it.context_prefix,
             )
             texts.append(
                 self._tokenizer.apply_chat_template(
@@ -1906,7 +1957,7 @@ class QwenHfEngine(MtEngine):
         )
         started = time.perf_counter()
         # Cap generation length dynamically to prevent runaway decode latency
-        dyn_tokens = _estimate_dynamic_tokens(items, self.settings.mt_max_new_tokens, tokenizer=self._tokenizer)
+        dyn_tokens = _estimate_dynamic_tokens(unpacked, self.settings.mt_max_new_tokens, tokenizer=self._tokenizer)
         with torch.inference_mode():
             generated = self._model.generate(
                 **encoded,
@@ -1919,7 +1970,8 @@ class QwenHfEngine(MtEngine):
 
         prompt_len = encoded["input_ids"].shape[1]
         results: list[MtResult] = []
-        for (text, _s, _d), row in zip(items, generated):
+        for it, row in zip(unpacked, generated):
+            text, _s, _d = it.text, it.src, it.dst
             new_tokens = row[prompt_len:]
             decoded = clean_translation(
                 self._tokenizer.decode(new_tokens, skip_special_tokens=True),
@@ -2048,14 +2100,35 @@ def build_mt_engine(settings: Settings) -> MtEngine:
     """Pick a backend. Explicit MT_BACKEND is honoured even if it then fails:
     a silent downgrade would make the reported model a lie."""
     backend = settings.mt_backend.strip().lower()
+    allowed = settings.allowed_mt_backends()
 
-    if backend == "qwen_vllm":
+    # Determine resolved backend name
+    if backend in {"auto", ""}:
+        resolved_backend = "qwen_ct2" if settings.on_cuda else "m2m100_ct2"
+    else:
+        resolved_backend = backend
+
+    # Enforce production allow-list (m2m100_ct2 is permitted for CPU tests when auto or explicit)
+    if resolved_backend not in allowed and resolved_backend != "m2m100_ct2":
+        raise RuntimeError(
+            f"MT backend {resolved_backend!r} is not in MT_ALLOWED_BACKENDS ({allowed}). "
+            f"qwen_hf is a development fallback and forbidden in production without "
+            f"an explicit MT_ALLOWED_BACKENDS override."
+        )
+
+    if resolved_backend == "qwen_hf":
+        log.warning(
+            "CRITICAL: MT_ALLOWED_BACKENDS contains 'qwen_hf' (development fallback override). "
+            "Inference latency will exceed production latency budget!"
+        )
+
+    if resolved_backend == "qwen_vllm":
         return QwenVllmEngine(settings)
-    if backend == "qwen_ct2":
+    if resolved_backend == "qwen_ct2":
         return QwenCt2Engine(settings)
-    if backend == "qwen_hf":
+    if resolved_backend == "qwen_hf":
         return QwenHfEngine(settings)
-    if backend == "m2m100_ct2":
+    if resolved_backend == "m2m100_ct2":
         path = _discover_ct2_model(settings)
         if path is None:
             raise FileNotFoundError(
@@ -2063,18 +2136,5 @@ def build_mt_engine(settings: Settings) -> MtEngine:
             )
         return M2M100Ct2Engine(settings, path)
 
-    if backend not in {"auto", ""}:
-        raise ValueError(f"unknown MT_BACKEND: {settings.mt_backend}")
-
-    # auto: on CUDA prefer Qwen on CTranslate2 (Phase 2.4 fast path), then vLLM
-    if settings.on_cuda:
-        return QwenCt2Engine(settings)
-    path = _discover_ct2_model(settings)
-    if path is not None:
-        return M2M100Ct2Engine(settings, path)
-    raise FileNotFoundError(
-        "no usable MT backend: running Qwen on CPU transformers would not meet any latency target, "
-        "and no local CTranslate2 model was found. Set MT_CPU_MODEL_PATH to a CTranslate2 model directory, "
-        "or MT_BACKEND=qwen_hf to force the slow portable path."
-    )
+    raise ValueError(f"unknown MT_BACKEND: {settings.mt_backend}")
 

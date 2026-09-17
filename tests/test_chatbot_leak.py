@@ -21,6 +21,8 @@ class TestChatbotLeak(unittest.TestCase):
         cls.use_http = bool(MT_URL)
         cls.backend_name = "Unknown"
         cls.backend_class = "Unknown"
+        cls.model_id = "Unknown"
+        cls.quantization = "Unknown"
         if cls.use_http:
             try:
                 headers = {"Authorization": f"Bearer {AUTH_TOKEN}"} if AUTH_TOKEN else {}
@@ -29,6 +31,9 @@ class TestChatbotLeak(unittest.TestCase):
                     data = resp.json()
                     cls.backend_name = data.get("mt_backend", "Unknown")
                     cls.backend_class = data.get("mt_backend_class", "Unknown")
+                    mt_info = data.get("engines", {}).get("mt", {})
+                    cls.model_id = mt_info.get("model", "Unknown")
+                    cls.quantization = mt_info.get("quantization", "none")
             except Exception:
                 pass
         else:
@@ -42,6 +47,9 @@ class TestChatbotLeak(unittest.TestCase):
                 raise unittest.SkipTest("MT Engine not loaded")
             cls.backend_name = cls.engine.name
             cls.backend_class = cls.engine.__class__.__name__
+            info = cls.engine.info()
+            cls.model_id = info.get("model", "Unknown")
+            cls.quantization = info.get("compute_type", "int8")
 
     def _translate(self, items):
         if self.use_http:
@@ -68,7 +76,7 @@ class TestChatbotLeak(unittest.TestCase):
             return results
 
     def test_chatbot_leak_properties(self):
-        print(f"\nACTIVE MT BACKEND: {self.backend_class} ({self.backend_name})")
+        print(f"\nACTIVE MT BACKEND: {self.backend_class} ({self.backend_name}) | Model: {self.model_id} | Quant: {self.quantization}")
         items = [(c["text"], c["src"], c["dst"]) for c in self.corpus]
         
         outputs = self._translate(items)

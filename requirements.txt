@@ -21,7 +21,8 @@ soxr>=0.4          # high-quality resampling; audio.py falls back if absent
 sentencepiece>=0.2 # tokeniser for the CTranslate2 MT path
 
 # ---- MT: GPU path ---------------------------------------------------
-# transformers is used for the fast, ultra-stable CUDA translation engine.
+# vLLM is the production engine for Qwen with continuous batching & AWQ.
+vllm>=0.6.3
 transformers>=4.56
 
 # ---- optional observability -----------------------------------------
