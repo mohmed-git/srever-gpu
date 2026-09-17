@@ -1,7 +1,11 @@
 import json
 import os
+import sys
 import unittest
 import requests
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 
 from app.mt import _script_ratio, _is_conversational_chatter, is_degenerate_short, has_annotation_or_passthrough, detect_person_mismatch
 
