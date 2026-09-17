@@ -220,10 +220,11 @@ def norm_hash(
     target: str = "",
     source_variant: str = "",
     target_variant: str = "",
+    tier: str = "",
 ) -> str:
-    """Normalized hash for sentence caching in mt_cache, scoped to translation pair."""
+    """Normalized hash for sentence caching in mt_cache, scoped to translation pair and model tier."""
     cleaned = " ".join(text.strip().lower().split())
-    key = f"{source}:{target}:{source_variant}:{target_variant}:{cleaned}"
+    key = f"{source}:{target}:{source_variant}:{target_variant}:{tier}:{cleaned}"
     return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
 
 
@@ -665,8 +666,9 @@ async def _run_tentative(state: _StreamState, slot: _Slot, seq: int) -> None:
         presplit_hits = 0
         s_var = slot.source_variant or state.source_variant or ""
         t_var = slot.target_variant or state.target_variant or ""
+        mt_tier = getattr(getattr(pipeline, "mt", None), "name", "") or ""
         for s in sentences:
-            h = norm_hash(s, detected, dst, s_var, t_var)
+            h = norm_hash(s, detected, dst, s_var, t_var, tier=mt_tier)
             if state.cache_get(h) is not None:
                 presplit_hits += 1
             else:
@@ -689,7 +691,7 @@ async def _run_tentative(state: _StreamState, slot: _Slot, seq: int) -> None:
             ]
             mt_outcomes = await asyncio.gather(*mt_jobs)
             for s, (res, _) in zip(uncached, mt_outcomes):
-                state.cache_put(norm_hash(s, detected, dst, s_var, t_var), res)
+                state.cache_put(norm_hash(s, detected, dst, s_var, t_var, tier=mt_tier), res)
 
         sentence_frames: list[dict[str, Any]] = []
         translated_pieces: list[str] = []
@@ -703,7 +705,7 @@ async def _run_tentative(state: _StreamState, slot: _Slot, seq: int) -> None:
                 piece_hollow, piece_reason = False, None
                 mt_backend, out_tokens = None, None
             else:
-                mt_res = state.cache_get(norm_hash(s, detected, dst, s_var, t_var))
+                mt_res = state.cache_get(norm_hash(s, detected, dst, s_var, t_var, tier=mt_tier))
                 if mt_res:
                     piece = mt_res.text
                     piece_ms = mt_res.mt_ms
@@ -861,8 +863,9 @@ async def _run_partial(state: _StreamState, slot: _Slot, seq: int) -> None:
                 closed = candidate_sents[:-1]
                 cs_s_var = slot.source_variant or state.source_variant or ""
                 cs_t_var = slot.target_variant or state.target_variant or ""
+                mt_tier = getattr(getattr(pipeline, "mt", None), "name", "") or ""
                 for cs in closed:
-                    h = norm_hash(cs, detected, tgt, cs_s_var, cs_t_var)
+                    h = norm_hash(cs, detected, tgt, cs_s_var, cs_t_var, tier=mt_tier)
                     if state.cache_get(h) is None:
                         try:
                             mt_res, _ = await pipeline._mt_sched.submit(

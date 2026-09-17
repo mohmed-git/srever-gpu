@@ -214,21 +214,21 @@ class TestIncidentFixes(unittest.TestCase):
 
     # ---- T11: Multilingual prompt isolation & bare user turn ---------------
     def test_t11_multilingual_prompt_isolation(self):
-        # ar -> cs must be zero-shot with bare user turn
+        # ar -> cs has system + 5 anti-persona shots (10 turns) + user turn = 12
         msgs_cs = make_translation_messages("كيف حالك", "ar", "cs")
-        self.assertEqual(len(msgs_cs), 2, "ar -> cs must have exactly 2 turns (zero-shot)")
-        self.assertEqual(msgs_cs[1]["content"], "كيف حالك", "User turn must be bare text")
+        self.assertEqual(len(msgs_cs), 12, "ar -> cs must have 12 turns (system + 5 anti-persona shots + user)")
+        self.assertIn("كيف حالك", msgs_cs[-1]["content"], "User turn must contain input text")
         self.assertNotIn("Where is the train station?", msgs_cs[0]["content"])
 
-        # ar -> de must be zero-shot with bare user turn
+        # ar -> de has 12 turns
         msgs_de = make_translation_messages("مرحبا", "ar", "de")
-        self.assertEqual(len(msgs_de), 2, "ar -> de must have exactly 2 turns (zero-shot)")
-        self.assertEqual(msgs_de[1]["content"], "مرحبا")
+        self.assertEqual(len(msgs_de), 12, "ar -> de must have 12 turns")
+        self.assertIn("مرحبا", msgs_de[-1]["content"])
 
-        # fr -> ar must be zero-shot with bare user turn
+        # fr -> ar has 12 turns
         msgs_fr_ar = make_translation_messages("Bonjour", "fr", "ar")
-        self.assertEqual(len(msgs_fr_ar), 2, "fr -> ar must have exactly 2 turns (zero-shot)")
-        self.assertEqual(msgs_fr_ar[1]["content"], "Bonjour")
+        self.assertEqual(len(msgs_fr_ar), 12, "fr -> ar must have 12 turns")
+        self.assertIn("Bonjour", msgs_fr_ar[-1]["content"])
 
         # en -> ar and ar -> en must retain hardened few-shot prompts
         msgs_en_ar = make_translation_messages("Where is the train station?", "en", "ar")
@@ -536,7 +536,7 @@ class TestIncidentFixesAsync(unittest.IsolatedAsyncioTestCase):
 
             item = await state.utterance_queue.get()
             self.assertEqual(item[0], "fresh")
-            _, raw, utt_id, commit_time, slot_src, slot_dst, slot_src_var, slot_tgt_var, during_ratio, context_prefix = item
+            _, raw, utt_id, commit_time, slot_src, slot_dst, slot_src_var, slot_tgt_var, during_ratio, context_prefix, *rest = item
             self.assertGreaterEqual(during_ratio, 0.5, "during_ratio must be >= 0.5 when all frames have bit 2 set")
 
             from app.server import _handle_utterance_payload
@@ -620,7 +620,7 @@ class TestIncidentFixesAsync(unittest.IsolatedAsyncioTestCase):
             await _on_audio_frame(state, pack_v2(flags=0x02, utt=1, seq=3, payload=b"\x00\x00" * 160))
 
             item1 = await state.utterance_queue.get()
-            _, raw1, utt_id1, _, slot_src, slot_dst, slot_src_var, slot_tgt_var, during_ratio1, context_prefix = item1
+            _, raw1, utt_id1, _, slot_src, slot_dst, slot_src_var, slot_tgt_var, during_ratio1, context_prefix, *rest = item1
 
             # Mock pipeline returning text that matches recent_tts_outputs
             class MockPipelineEchoText:
@@ -674,7 +674,7 @@ class TestIncidentFixesAsync(unittest.IsolatedAsyncioTestCase):
             await _on_audio_frame(state, pack_v2(flags=0x06, utt=2, seq=1, payload=b"\x00\x00" * 160))
 
             item2 = await state.utterance_queue.get()
-            _, raw2, utt_id2, _, slot_src, slot_dst, slot_src_var, slot_tgt_var, during_ratio2, context_prefix = item2
+            _, raw2, utt_id2, _, slot_src, slot_dst, slot_src_var, slot_tgt_var, during_ratio2, context_prefix, *rest = item2
 
             await _handle_utterance_payload(
                 state,
@@ -776,6 +776,12 @@ class TestIncidentFixesAsync(unittest.IsolatedAsyncioTestCase):
         h_ca = norm_hash("مرحبا كيف حالك؟", source="ar", target="ca")
         self.assertNotEqual(h_es, h_en, "Hashes for different target languages must differ")
         self.assertNotEqual(h_es, h_ca, "Hashes for different target languages must differ")
+
+    def test_norm_hash_tier_isolation(self):
+        from app.server import norm_hash
+        h_15b = norm_hash("صحيت اليوم", source="ar", target="en", tier="1.5b")
+        h_7b = norm_hash("صحيت اليوم", source="ar", target="en", tier="7b")
+        self.assertNotEqual(h_15b, h_7b, "Hashes across model tiers must never collide")
 
         # Test cache clearance on apply()
         ws = DummyWebSocket()
@@ -1047,30 +1053,28 @@ class TestIncidentFixesAsync(unittest.IsolatedAsyncioTestCase):
         """Verify prompt construction, few-shot conditioning, and MSA invariants
         across all 13 regional Arabic dialects."""
         from app.languages import AR_VARIANTS
-        from app.mt import _DIALECT_NAMES, _DIALECT_FAMILIES, _DIALECT_FEW_SHOTS
+        from app.mt import _DIALECT_NAMES, _DIALECT_FAMILIES
 
         self.assertEqual(len(AR_VARIANTS), 13)
         for code in AR_VARIANTS:
             self.assertIn(code, _DIALECT_NAMES)
             self.assertIn(code, _DIALECT_FAMILIES)
             name, family = _DIALECT_FAMILIES[code]
-            self.assertIn(family, _DIALECT_FEW_SHOTS)
 
-            # 1. ar -> en dialect prompt & few-shots
+            # 1. ar -> en dialect prompt
             msgs_en = make_translation_messages("جملة عامية", "ar", "en", source_variant=code)
             sys_en = msgs_en[0]["content"]
             self.assertIn(f"The speaker uses {name} colloquial Arabic; interpret idioms accordingly.", sys_en)
+            user_shots = [m["content"] for m in msgs_en if m["role"] == "user"]
             if code in {"YE", "SD"}:
-                # Unvalidated families fall back to plain hint line without few-shots
                 self.assertIn("strict, literal", sys_en)
                 self.assertEqual(len(msgs_en), 2)
             else:
-                self.assertIn("specialized in regional colloquial dialects", sys_en)
-                self.assertIn("بدري", sys_en)
-                self.assertNotIn("strict, literal", sys_en)
-                expected_shots = _DIALECT_FEW_SHOTS[family]
-                user_shots = [m["content"] for m in msgs_en if m["role"] == "user"]
-                self.assertIn(expected_shots[0][0], user_shots)
+                # 5 anti-persona shots must be present
+                self.assertIn("السماء زرقاء.", user_shots)
+                self.assertIn("أبداً.", user_shots)
+                # Dialect few-shots removed per Chief Architect ruling §3
+                self.assertNotIn("أبشرك كل الأمور تمام ومخلصين بدري.", user_shots)
 
             # 2. ar -> fr dialect prompt
             msgs_fr = make_translation_messages("جملة عامية", "ar", "fr", source_variant=code)

@@ -106,38 +106,9 @@ _DIALECT_FAMILIES: Final[dict[str, tuple[str, str]]] = {
     "SD": ("Sudanese", "sudanese"),
 }
 
-_DIALECT_FEW_SHOTS: Final[dict[str, list[tuple[str, str]]]] = {
-    "gulf": [
-        ("أبشرك كل الأمور تمام ومخلصين بدري.", "Good news: everything is great and we finished early."),
-        ("وين رايح الحين؟", "Where are you going right now?"),
-        ("تخيل نحاول نخلص الشغل قبل الظهر.", "Just imagine, we are trying to finish work before noon."),
-    ],
-    "egyptian": [
-        ("عامل إيه يا فندم؟ إحنا مخلصين الشغل بدري النهاردة.", "How are you doing sir? We finished work early today."),
-        ("أنت رايح فين دلوقتي؟", "Where are you going right now?"),
-        ("عايزين نخلص الموضوع ده بسرعة.", "We want to finish this matter quickly."),
-    ],
-    "levantine": [
-        ("كيفك اليوم؟ بدي قلك إنو مخلصين بكير وهلأ رايحين.", "How are you today? I want to tell you we finished early and now we are leaving."),
-        ("وين رايح هلأ؟", "Where are you going right now?"),
-        ("عم نجرب نخلص الشغل بسرعة.", "We are trying to finish the work quickly."),
-    ],
-    "iraqi": [
-        ("شلونك عيوني؟ أبشرك كملنا شغلنا بدري وهسه طالعين.", "How are you my dear? Good news: we finished our work early and now we are leaving."),
-        ("وين رايح هسه؟", "Where are you going right now?"),
-        ("نريد نخلص الشغل هواية بسرعة.", "We want to finish the work very quickly."),
-    ],
-    "maghrebi": [
-        ("لاباس عليك؟ راه سالينا الخدمة بدري ودابا غاديين.", "How are you doing? We finished work early and now we are leaving."),
-        ("فين غادي دابا؟", "Where are you going right now?"),
-        ("بغينا نساليو هاد الخدمة مزيان.", "We want to finish this work well."),
-    ],
-    "sudanese": [
-        ("كيفنك يا غالي؟ أبشرك خلصنا بدري وهسع ماشين.", "How are you my dear? Good news: we finished early and now we are leaving."),
-        ("ماشي وين هسع؟", "Where are you going right now?"),
-        ("دايرين نخلص الشغل ده سريع شديد.", "We want to finish this work very quickly."),
-    ],
-}
+# Dialect few-shots removed per Chief Architect ruling §3: 1.5B does not reliably
+# apply in-context lexical mappings to colloquial tokens and costs ~150 prompt tokens.
+# The 1-line variant hint below is retained as the lightweight, zero-token-bloat signal.
 
 
 def _build_variant_hints(
@@ -647,7 +618,8 @@ def check_needs_retry(text: str, decoded: str, src: str, dst: str) -> tuple[bool
     in_units = _count_units(text, src)
     out_units = _count_units(decoded, dst)
     max_single = 6 if is_cjk_lang(dst) else 3
-    if in_units > 0 and (out_units / in_units) > 3.0:
+    max_ratio = 4.0 if (norm_src == "ar" and norm_dst == "en") else 3.0
+    if in_units > 0 and out_units > 8 and (out_units / in_units) > max_ratio:
         return True, "length_explosion"
     if in_units == 1 and out_units > max_single:
         return True, "single_token_explosion"
