@@ -127,6 +127,8 @@ class Settings:
     mt_allowed_backends: str = field(
         default_factory=lambda: _env("MT_ALLOWED_BACKENDS", "qwen_vllm,qwen_ct2")
     )
+    # Optional LoRA adapter path or HuggingFace ID (e.g. "mohmedbj/linguabuds-qwen2.5-7b-dialect-lora")
+    mt_lora_path: str = field(default_factory=lambda: _env("MT_LORA_PATH", ""))
     partial_ms: int = field(default_factory=lambda: _env_int("PARTIAL_MS", 320))
 
     # ---- admission control --------------------------------------------

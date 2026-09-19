@@ -1642,14 +1642,24 @@ class QwenVllmEngine(MtEngine):
             kwargs["quantization"] = "awq"
         elif quant in {"gptq", "gptq_marlin"}:
             kwargs["quantization"] = "gptq"
+        lora_target = self.settings.mt_lora_path.strip()
+        if lora_target:
+            kwargs["enable_lora"] = True
+            kwargs["max_lora_rank"] = 64
         try:
             self._llm = LLM(**kwargs)
             self._tokenizer = self._llm.get_tokenizer()
+            self._lora_request = None
+            if lora_target:
+                from vllm.lora.request import LoRARequest
+                self._lora_request = LoRARequest("dialect_lora", 1, lora_target)
+                log.info("vLLM LoRA adapter registered: %s", lora_target)
             self.load_seconds = time.perf_counter() - started
             log.info(
-                "MT ready: qwen_vllm model=%s quant=%s load=%.2fs",
+                "MT ready: qwen_vllm model=%s quant=%s lora=%s load=%.2fs",
                 self.resolved_model,
                 quant,
+                lora_target or "none",
                 self.load_seconds,
             )
         except Exception as exc:
@@ -1736,7 +1746,10 @@ class QwenVllmEngine(MtEngine):
             stop=["\n", "<|im_end|>", "<|endoftext|>"],
         )
         started = time.perf_counter()
-        outputs = self._llm.generate(prompts, sampling, use_tqdm=False)
+        gen_kwargs: dict[str, Any] = {"use_tqdm": False}
+        if getattr(self, "_lora_request", None) is not None:
+            gen_kwargs["lora_request"] = self._lora_request
+        outputs = self._llm.generate(prompts, sampling, **gen_kwargs)
         elapsed_ms = round((time.perf_counter() - started) * 1000.0, 2)
 
         results: list[MtResult] = []
@@ -1862,6 +1875,8 @@ class QwenVllmEngine(MtEngine):
             "ready": self.ready,
             "error": self.error,
         }
+        if getattr(self.settings, "mt_lora_path", "").strip():
+            out["lora_adapter"] = self.settings.mt_lora_path.strip()
         if self.model_substitution_note:
             out["model_substitution_note"] = self.model_substitution_note
         if self.resolved_model in _AWQ_REPOS.values():
