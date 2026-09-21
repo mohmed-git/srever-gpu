@@ -410,36 +410,54 @@ _CJK_TARGETS: Final[frozenset[str]] = frozenset(
 )
 
 
-# Explicit 1p pronouns (with optional prefix و, ف)
+def _normalize_ar(text: str) -> str:
+    """Normalize Arabic text for robust detection across dialects and unpunctuated ASR transcripts.
+    1. Strip diacritics / tashkeel (064B - 0652, 0670).
+    2. Strip tatweel / kashida (0640).
+    3. Normalize alef variants (أ, إ, آ, ٱ) -> bare alif (ا).
+    4. Normalize ta-marbuta (ة) -> ha (ه).
+    5. Normalize alif maqsura (ى) -> ya (ي).
+    """
+    if not text:
+        return ""
+    t = re.sub(r"[\u064B-\u0652\u0670]", "", text)
+    t = re.sub(r"\u0640", "", t)
+    t = re.sub(r"[\u0622\u0623\u0625\u0671]", "\u0627", t)
+    t = re.sub(r"\u0629", "\u0647", t)
+    t = re.sub(r"\u0649", "\u064A", t)
+    return t
+
+
+# Explicit 1p pronouns (with optional prefix و, ف) - matched on normalized text
 _AR_1P_PRONOUNS = re.compile(
-    r"(?:^|[\s،,])(?:[وف])?(?:أنا|إنني|أنني|إني|نحن|إننا|إلي|إليّ|لي|معي)(?=$|[\s،,؟?.!])",
+    r"(?:^|[\s،,])(?:[وف])?(?:انا|انني|اني|نحن|اننا|لي|معي)(?=$|[\s،,؟?.!])",
     re.UNICODE,
 )
 
-# Unambiguous future first-person: سأ / سوف أ / سن / سوف ن
+# Unambiguous future first-person: سأ / سوف أ / سن / سوف ن - matched on normalized text
 _AR_1P_FUTURE = re.compile(
-    r"(?:^|\s)(?:[وف])?(?:سأ|سوف\s+أ|سن|سوف\s+ن)[\u0621-\u064A]{2,}(?=$|[\s،,؟?.!])",
+    r"(?:^|\s)(?:[وف])?(?:سا|سوف\s+ا|سن|سوف\s+ن)[\u0621-\u064A]{2,}(?=$|[\s،,؟?.!])",
     re.UNICODE,
 )
 
-# ~40 high-frequency first-person present verbs and 1p plural equivalents
+# ~40 high-frequency first-person present verbs and 1p plural equivalents - normalized
 _AR_1P_VERBS = frozenset({
-    # Singular present (أ-)
-    "أستطيع", "أعتذر", "أفهم", "أساعد", "أقدر", "أعتقد", "أرجو", "أريد", "أحتاج",
-    "أعرف", "أرى", "أشكر", "أتمنى", "أنصح", "أقترح", "أوصي", "أحب", "أود",
-    "أظن", "أتمكن", "أعلم", "أستمع", "أطلب", "أرفض", "أوافق", "أقر", "أؤكد",
-    "أعمل", "أسعى", "أحاول", "أبحث", "أتحدث", "أتكلم", "أكتب", "أقرأ", "أجيب", "أرد",
+    # Singular present (أ / ا-)
+    "استطيع", "اعتذر", "افهم", "اساعد", "اقدر", "اعتقد", "ارجو", "اريد", "احتاج",
+    "اعرف", "اري", "اشكر", "اتمني", "انصح", "اقترح", "اوصي", "احب", "اود",
+    "اظن", "اتمكن", "اعلم", "استمع", "اطلب", "ارفض", "اوافق", "اقر", "اوكد",
+    "اعمل", "اسعي", "احاول", "ابحث", "اتحدث", "اتكلم", "اكتب", "اقرا", "اجيب", "ارد",
     # Plural present (ن-)
     "نستطيع", "نعتذر", "نفهم", "نساعد", "نقدر", "نعتقد", "نرجو", "نريد", "نحتاج",
-    "نعرف", "نرى", "نشكر", "نتمنى", "ننصح", "نقترح", "نوصي", "نحب", "نود",
-    "نظن", "نتمكن", "نعلم", "نستمع", "نطلب", "نرفض", "نوافق", "نقر", "نؤكد",
-    "نعمل", "نسعى", "نحاول", "نبحث", "نتحدث", "نتكلم", "نكتب", "نقرأ", "نجيب", "نرد",
+    "نعرف", "نري", "نشكر", "نتمني", "ننصح", "نقترح", "نوصي", "نحب", "نود",
+    "نظن", "نتمكن", "نعلم", "نستمع", "نطلب", "نرفض", "نوافق", "نقر", "نوكد",
+    "نعمل", "نسعي", "نحاول", "نبحث", "نتحدث", "نتكلم", "نكتب", "نقرا", "نجيب", "نرد",
 })
 
 _AR_PAST_1P_STOP = frozenset({
-    "بيت", "وقت", "أنت", "أنتِ", "صوت", "موت", "بنت", "زيت", "تحت", "صمت",
+    "بيت", "وقت", "انت", "صوت", "موت", "بنت", "زيت", "تحت", "صمت",
     "حوت", "سبت", "نبات", "شتات", "ثبت", "قوت", "نعت", "ست", "مات", "فات",
-    "ليت", "ذات", "هيهات", "شتى", "أثاث", "تابوت"
+    "ليت", "ذات", "هيهات", "شتي", "اثاث", "تابوت"
 })
 
 _FIRST_PERSON_EN = re.compile(r"\b(i|me|my|mine|myself|we|us|our|ours|ourselves)\b", re.IGNORECASE)
@@ -458,14 +476,15 @@ def has_1p_fr(text: str) -> bool:
 def has_1p_ar(text: str) -> bool:
     if not text:
         return False
+    norm = _normalize_ar(text)
     # 1. Explicit pronouns
-    if _AR_1P_PRONOUNS.search(text):
+    if _AR_1P_PRONOUNS.search(norm):
         return True
     # 2. Unambiguous future 1p
-    if _AR_1P_FUTURE.search(text):
+    if _AR_1P_FUTURE.search(norm):
         return True
     # 3. Positive verb list & past suffix
-    words = re.findall(r"[\u0621-\u064A]+", text)
+    words = re.findall(r"[\u0621-\u064A]+", norm)
     for w in words:
         base = w.lstrip("وف")
         if base in _AR_1P_VERBS:
@@ -623,7 +642,7 @@ def check_needs_retry(text: str, decoded: str, src: str, dst: str) -> tuple[bool
         return True, "length_explosion"
     if in_units == 1 and out_units > max_single:
         return True, "single_token_explosion"
-    if detect_person_mismatch(text, decoded, src, dst) and (norm_dst == "ar" or (norm_src == "ar" and norm_dst == "en")):
+    if detect_person_mismatch(text, decoded, src, dst) and norm_dst == "ar":
         return True, "person_mismatch"
     if is_degenerate_short(decoded, dst):
         return True, "degenerate_short"
@@ -656,7 +675,7 @@ def _apply_output_guards(
         max_single = 6 if is_cjk_lang(dst) else 3
         length_explosion = (in_units > 0 and (out_units / in_units) > 3.0)
         single_token_explosion = (in_units == 1 and out_units > max_single)
-        mismatch = detect_person_mismatch(text, decoded, src, dst) and (norm_dst == "ar" or (norm_src == "ar" and norm_dst == "en"))
+        mismatch = detect_person_mismatch(text, decoded, src, dst) and norm_dst == "ar"
 
         if _low_target_script(decoded, dst):
             hollow, reason = True, f"target script ratio {_script_ratio(decoded, dst):.0%} < 50%"
@@ -885,12 +904,12 @@ _CHATTER_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
     re.compile(r"\bje\s+ne\s+(?:peux|vais)\s+pas\s+traduire\b", re.IGNORECASE),
     re.compile(r"^\s*comment\s+puis-je\s+(?:vous\s+)?(?:aider|assister)", re.IGNORECASE),
     re.compile(r"^\s*je\s+suis.*traducteur", re.IGNORECASE),
-    # Arabic
-    re.compile(r"^\s*(?:إليك|هذه)\s+الترجمة", re.UNICODE),
-    re.compile(r"^\s*(?:لا\s+يمكنني|لا\s+أستطيع|عذراً).*ترجم", re.UNICODE),
-    re.compile(r"\b(?:لن\s+أترجم|لا\s+يمكنني\s+ترجمة)\b", re.UNICODE),
-    re.compile(r"^\s*كيف\s+(?:يمكنني|أستطيع).*(?:مساعدة|مساعدتك)", re.UNICODE),
-    re.compile(r"^\s*أنا.*مترجم", re.UNICODE),
+    # Arabic (normalized and unnormalized)
+    re.compile(r"^\s*(?:اليك|إليك|هذه)\s+الترجم[ةه]", re.UNICODE),
+    re.compile(r"^\s*(?:لا\s+يمكنني|لا\s+[أا]ستطيع|عذراً|عذرا).*ترجم", re.UNICODE),
+    re.compile(r"\b(?:لن\s+[أا]ترجم|لا\s+يمكنني\s+ترجم[ةه])\b", re.UNICODE),
+    re.compile(r"^\s*كيف\s+(?:يمكنني|[أا]ستطيع).*(?:مساعد[ةه]|مساعدتك)", re.UNICODE),
+    re.compile(r"^\s*[أا]نا.*مترجم", re.UNICODE),
 )
 
 
@@ -898,7 +917,8 @@ def _is_conversational_chatter(text: str) -> bool:
     """True when the model outputs conversational meta-talk or apologies instead of translating."""
     if not text:
         return False
-    return any(bool(p.search(text)) for p in _CHATTER_PATTERNS)
+    norm_text = _normalize_ar(text)
+    return any(bool(p.search(norm_text) or p.search(text)) for p in _CHATTER_PATTERNS)
 
 
 def _hollow_check(text: str, source_text: str, target_lang: str = "") -> tuple[bool, str | None]:
