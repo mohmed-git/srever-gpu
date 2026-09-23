@@ -131,6 +131,38 @@ class Settings:
     mt_lora_path: str = field(default_factory=lambda: _env("MT_LORA_PATH", ""))
     partial_ms: int = field(default_factory=lambda: _env_int("PARTIAL_MS", 320))
 
+    # ---- Two-Tier Model Router -----------------------------------------
+    mt_two_tier_enabled: bool = field(
+        default_factory=lambda: _env_bool("MT_TWO_TIER_ENABLED", False)
+    )
+    mt_two_tier_threshold_words: int = field(
+        default_factory=lambda: _env_int("MT_TWO_TIER_THRESHOLD_WORDS", 6)
+    )
+    mt_tier1_model: str = field(
+        default_factory=lambda: _env("MT_TIER1_MODEL", "Qwen/Qwen2.5-1.5B-Instruct")
+    )
+    mt_tier1_quant: str = field(
+        default_factory=lambda: _env("MT_TIER1_QUANT", "awq")
+    )
+    mt_tier1_backend: str = field(
+        default_factory=lambda: _env("MT_TIER1_BACKEND", "qwen_ct2")
+    )
+    mt_tier1_gpu_mem_fraction: float = field(
+        default_factory=lambda: _env_float("MT_TIER1_GPU_MEM_FRACTION", 0.15)
+    )
+    mt_tier2_model: str = field(
+        default_factory=lambda: _env("MT_TIER2_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+    )
+    mt_tier2_quant: str = field(
+        default_factory=lambda: _env("MT_TIER2_QUANT", "awq")
+    )
+    mt_tier2_backend: str = field(
+        default_factory=lambda: _env("MT_TIER2_BACKEND", "qwen_vllm")
+    )
+    mt_tier2_gpu_mem_fraction: float = field(
+        default_factory=lambda: _env_float("MT_TIER2_GPU_MEM_FRACTION", 0.45)
+    )
+
     # ---- admission control --------------------------------------------
     # Latency budget scaled to realistic real-time GPU target (500ms).
     latency_budget_ms: float = field(default_factory=lambda: _env_float("LATENCY_BUDGET_MS", 500.0))
@@ -199,7 +231,10 @@ class Settings:
         return max(1, (os.cpu_count() or 2))
 
     def allowed_mt_backends(self) -> set[str]:
-        return {b.strip().lower() for b in self.mt_allowed_backends.split(",") if b.strip()}
+        backends = {b.strip().lower() for b in self.mt_allowed_backends.split(",") if b.strip()}
+        if self.mt_two_tier_enabled:
+            backends.add("two_tier")
+        return backends
 
     def describe(self) -> dict[str, Any]:
         data = asdict(self)

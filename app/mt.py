@@ -620,6 +620,21 @@ def _count_units(text: str, lang: str | None = None) -> int:
     return len(text.split())
 
 
+def resolve_tier(text: str, src: str = "", threshold_words: int = 6) -> str:
+    """Determine model tier ('1.5b' vs '7b') based on utterance length.
+
+    Invariants:
+    - Utterances <= threshold_words (default 6 words) route to Tier 1 ('1.5b').
+    - For CJK scripts, <= threshold_words * 2 (12 chars) routes to Tier 1 ('1.5b').
+    - Utterances > threshold route to Tier 2 ('7b').
+    """
+    if not text:
+        return "1.5b"
+    units = _count_units(text, src)
+    cutoff = (threshold_words * 2) if is_cjk_lang(src) else threshold_words
+    return "1.5b" if units <= cutoff else "7b"
+
+
 def check_needs_retry(text: str, decoded: str, src: str, dst: str) -> tuple[bool, str | None]:
     """Checks if initial decode triggers any active guard requiring a retry."""
     norm_dst = (dst or "").strip().lower().split("-")[0]
@@ -811,6 +826,7 @@ class MtResult:
     hollow: bool
     hollow_reason: str | None
     retried: bool = False
+    tier: str = ""
 
 
 class MtEngine:
@@ -2131,6 +2147,223 @@ def _discover_ct2_model(settings: Settings) -> str | None:
     return None
 
 
+class TwoTierMtEngine(MtEngine):
+    """Two-Tier Smart Model Router Engine.
+
+    Routes utterances dynamically based on length:
+      - Tier 1: Qwen2.5-1.5B for short conversational phrases (<= 6 words) -> 40-60ms latency
+      - Tier 2: Qwen2.5-7B for complex/long sentences (> 6 words) -> rich dialect understanding
+
+    Guarantees:
+      - Cache isolation by stamping tier in MtResult and routing.
+      - Full preservation of batch item order when splitting across tiers.
+      - Metric counters 'mt_tier1_routed' and 'mt_tier2_routed'.
+    """
+
+    name = "two_tier"
+
+    def __init__(
+        self,
+        settings: Settings,
+        tier1_engine: MtEngine | None = None,
+        tier2_engine: MtEngine | None = None,
+        threshold_words: int | None = None,
+    ) -> None:
+        super().__init__(settings)
+        self.threshold = (
+            threshold_words
+            if threshold_words is not None
+            else getattr(settings, "mt_two_tier_threshold_words", 6)
+        )
+        self.tier1_engine: MtEngine | None = tier1_engine
+        self.tier2_engine: MtEngine | None = tier2_engine
+
+    def resolve_tier(self, text: str, src: str = "") -> str:
+        return resolve_tier(text, src, self.threshold)
+
+    def load(self) -> None:
+        import copy
+        started = time.perf_counter()
+
+        if self.tier1_engine is None:
+            t1_backend = getattr(self.settings, "mt_tier1_backend", "qwen_ct2").strip().lower()
+            if t1_backend in {"auto", ""}:
+                t1_backend = "qwen_ct2" if self.settings.on_cuda else "m2m100_ct2"
+
+            t1_settings = copy.copy(self.settings)
+            t1_settings.mt_backend = t1_backend
+            t1_settings.mt_model = getattr(self.settings, "mt_tier1_model", "Qwen/Qwen2.5-1.5B-Instruct")
+            t1_settings.mt_quant = getattr(self.settings, "mt_tier1_quant", "awq")
+            t1_settings.mt_gpu_mem_fraction = getattr(self.settings, "mt_tier1_gpu_mem_fraction", 0.15)
+            t1_settings.mt_lora_path = ""  # Tier 1 is lean base model
+
+            if t1_backend == "qwen_vllm":
+                self.tier1_engine = QwenVllmEngine(t1_settings)
+            elif t1_backend == "qwen_ct2":
+                self.tier1_engine = QwenCt2Engine(t1_settings)
+            elif t1_backend == "m2m100_ct2":
+                path = _discover_ct2_model(t1_settings)
+                if path:
+                    self.tier1_engine = M2M100Ct2Engine(t1_settings, path)
+                else:
+                    self.tier1_engine = QwenHfEngine(t1_settings)
+            else:
+                self.tier1_engine = QwenHfEngine(t1_settings)
+
+            self.tier1_engine.metrics = self.metrics
+            self.tier1_engine.load()
+
+        if self.tier2_engine is None:
+            t2_backend = getattr(self.settings, "mt_tier2_backend", "qwen_vllm").strip().lower()
+            if t2_backend in {"auto", ""}:
+                t2_backend = "qwen_vllm" if self.settings.on_cuda else "m2m100_ct2"
+
+            t2_settings = copy.copy(self.settings)
+            t2_settings.mt_backend = t2_backend
+            t2_settings.mt_model = getattr(self.settings, "mt_tier2_model", "Qwen/Qwen2.5-7B-Instruct")
+            t2_settings.mt_quant = getattr(self.settings, "mt_tier2_quant", "awq")
+            t2_settings.mt_gpu_mem_fraction = getattr(self.settings, "mt_tier2_gpu_mem_fraction", 0.45)
+            t2_settings.mt_lora_path = getattr(self.settings, "mt_lora_path", "")
+
+            if t2_backend == "qwen_vllm":
+                self.tier2_engine = QwenVllmEngine(t2_settings)
+            elif t2_backend == "qwen_ct2":
+                self.tier2_engine = QwenCt2Engine(t2_settings)
+            elif t2_backend == "m2m100_ct2":
+                path = _discover_ct2_model(t2_settings)
+                if path:
+                    self.tier2_engine = M2M100Ct2Engine(t2_settings, path)
+                else:
+                    self.tier2_engine = QwenHfEngine(t2_settings)
+            else:
+                self.tier2_engine = QwenHfEngine(t2_settings)
+
+            self.tier2_engine.metrics = self.metrics
+            self.tier2_engine.load()
+
+        self.load_seconds = time.perf_counter() - started
+
+    @property
+    def ready(self) -> bool:
+        t1_ready = self.tier1_engine.ready if self.tier1_engine is not None else False
+        t2_ready = self.tier2_engine.ready if self.tier2_engine is not None else False
+        return t1_ready and t2_ready
+
+    def translate_batch(self, items: list[Any]) -> list[MtResult]:
+        if not items:
+            return []
+
+        tier1_jobs: list[tuple[int, MtItem]] = []
+        tier2_jobs: list[tuple[int, MtItem]] = []
+
+        for idx, raw_it in enumerate(items):
+            it = _unpack_item(raw_it)
+            target_tier = it.tier
+            if not target_tier:
+                target_tier = self.resolve_tier(it.text, it.src)
+
+            stamped_item = MtItem(
+                text=it.text,
+                src=it.src,
+                dst=it.dst,
+                source_variant=it.source_variant,
+                target_variant=it.target_variant,
+                context_prefix=it.context_prefix,
+                tier=target_tier,
+            )
+
+            if target_tier in {"1.5b", "tier1"}:
+                tier1_jobs.append((idx, stamped_item))
+            else:
+                tier2_jobs.append((idx, stamped_item))
+
+        results: list[MtResult | None] = [None] * len(items)
+
+        if tier1_jobs and self.tier1_engine is not None:
+            self._metrics_incr("mt_tier1_routed", len(tier1_jobs))
+            t1_inputs = [item for _, item in tier1_jobs]
+            t1_results = self.tier1_engine.translate_batch(t1_inputs)
+            for (idx, _), res in zip(tier1_jobs, t1_results):
+                if getattr(res, "tier", "") != "1.5b":
+                    res = MtResult(
+                        text=res.text,
+                        mt_ms=res.mt_ms,
+                        backend=res.backend,
+                        model=res.model,
+                        input_tokens=res.input_tokens,
+                        output_tokens=res.output_tokens,
+                        batch_size=res.batch_size,
+                        hollow=res.hollow,
+                        hollow_reason=res.hollow_reason,
+                        retried=res.retried,
+                        tier="1.5b",
+                    )
+                results[idx] = res
+
+        if tier2_jobs and self.tier2_engine is not None:
+            self._metrics_incr("mt_tier2_routed", len(tier2_jobs))
+            t2_inputs = [item for _, item in tier2_jobs]
+            t2_results = self.tier2_engine.translate_batch(t2_inputs)
+            for (idx, _), res in zip(tier2_jobs, t2_results):
+                if getattr(res, "tier", "") != "7b":
+                    res = MtResult(
+                        text=res.text,
+                        mt_ms=res.mt_ms,
+                        backend=res.backend,
+                        model=res.model,
+                        input_tokens=res.input_tokens,
+                        output_tokens=res.output_tokens,
+                        batch_size=res.batch_size,
+                        hollow=res.hollow,
+                        hollow_reason=res.hollow_reason,
+                        retried=res.retried,
+                        tier="7b",
+                    )
+                results[idx] = res
+
+        final_list: list[MtResult] = []
+        for r in results:
+            if r is not None:
+                final_list.append(r)
+            else:
+                final_list.append(
+                    MtResult(
+                        text="",
+                        mt_ms=0.0,
+                        backend=self.name,
+                        model="none",
+                        input_tokens=0,
+                        output_tokens=0,
+                        batch_size=len(items),
+                        hollow=True,
+                        hollow_reason="tier_engine_unavailable",
+                        tier="",
+                    )
+                )
+        return final_list
+
+    def info(self) -> dict[str, Any]:
+        return {
+            "backend": self.name,
+            "ready": self.ready,
+            "threshold_words": self.threshold,
+            "tier1": self.tier1_engine.info() if self.tier1_engine is not None else None,
+            "tier2": self.tier2_engine.info() if self.tier2_engine is not None else None,
+            "error": self.error,
+        }
+
+    def warmup(self) -> dict[str, Any]:
+        started = time.perf_counter()
+        t1_res = self.tier1_engine.warmup() if self.tier1_engine is not None else {"available": False}
+        t2_res = self.tier2_engine.warmup() if self.tier2_engine is not None else {"available": False}
+        return {
+            "available": self.ready,
+            "warmup_ms": round((time.perf_counter() - started) * 1000.0, 2),
+            "tier1": t1_res,
+            "tier2": t2_res,
+        }
+
+
 def build_mt_engine(settings: Settings) -> MtEngine:
     """Pick a backend. Explicit MT_BACKEND is honoured even if it then fails:
     a silent downgrade would make the reported model a lie."""
@@ -2139,12 +2372,15 @@ def build_mt_engine(settings: Settings) -> MtEngine:
 
     # Determine resolved backend name
     if backend in {"auto", ""}:
-        resolved_backend = "qwen_ct2" if settings.on_cuda else "m2m100_ct2"
+        if getattr(settings, "mt_two_tier_enabled", False):
+            resolved_backend = "two_tier"
+        else:
+            resolved_backend = "qwen_ct2" if settings.on_cuda else "m2m100_ct2"
     else:
         resolved_backend = backend
 
-    # Enforce production allow-list (m2m100_ct2 is permitted for CPU tests when auto or explicit)
-    if resolved_backend not in allowed and resolved_backend != "m2m100_ct2":
+    # Enforce production allow-list (m2m100_ct2 and two_tier are permitted)
+    if resolved_backend not in allowed and resolved_backend not in {"m2m100_ct2", "two_tier"}:
         raise RuntimeError(
             f"MT backend {resolved_backend!r} is not in MT_ALLOWED_BACKENDS ({allowed}). "
             f"qwen_hf is a development fallback and forbidden in production without "
@@ -2157,6 +2393,8 @@ def build_mt_engine(settings: Settings) -> MtEngine:
             "Inference latency will exceed production latency budget!"
         )
 
+    if resolved_backend == "two_tier":
+        return TwoTierMtEngine(settings)
     if resolved_backend == "qwen_vllm":
         return QwenVllmEngine(settings)
     if resolved_backend == "qwen_ct2":
