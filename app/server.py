@@ -228,10 +228,12 @@ def norm_hash(
     return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
 
 
-def _resolve_item_tier(mt_engine: Any, text: str, src: str = "") -> str:
+def _resolve_item_tier(mt_engine: Any, text: str, src: str = "", source_variant: str | None = None) -> str:
     """Determine tier for cache key scoping."""
     if mt_engine is not None and hasattr(mt_engine, "resolve_tier"):
         try:
+            return mt_engine.resolve_tier(text, src, source_variant=source_variant)
+        except TypeError:
             return mt_engine.resolve_tier(text, src)
         except Exception:
             pass
@@ -821,6 +823,16 @@ async def _run_partial(state: _StreamState, slot: _Slot, seq: int) -> None:
 
     try:
         pipeline.metrics.incr("partials_run")
+        # Sliding-window partials: Cap audio window to the last partial_window_s (default 4.5s)
+        # to ensure linear O(N) cost rather than quadratic O(N^2) encoder re-processing.
+        window_s = getattr(state.settings, "partial_window_s", 4.5)
+        bytes_per_sec = state.sample_rate * state.channels * 2
+        max_partial_bytes = int(window_s * bytes_per_sec)
+        if len(slot.buffer) > max_partial_bytes:
+            raw = bytes(slot.buffer[-max_partial_bytes:])
+        else:
+            raw = bytes(slot.buffer)
+
         decoded, _ = await pipeline._decode_checked(
             raw,
             declared_format=state.audio_format,
@@ -839,6 +851,9 @@ async def _run_partial(state: _StreamState, slot: _Slot, seq: int) -> None:
 
         words = asr_result.text.split()
         prev = slot.partial_prev_words
+        if words == prev and words:
+            pipeline.metrics.incr("partials_unchanged")
+            return
         match_len = 0
         for w1, w2 in zip(words, prev):
             if w1 == w2:
@@ -1423,7 +1438,12 @@ async def _on_audio_frame(state: _StreamState, chunk: bytes) -> None:
 
             # Partials: while frames are arriving and slot.buf_ms >= 800, every partial_ms
             if state.settings.partial_ms > 0 and slot.buf_ms >= 800:
-                interval_s = state.settings.partial_ms / 1000.0
+                base_partial_ms = state.settings.partial_ms
+                # Adaptive cadence under load: if _asr_sched queue depth > 0, double partial_ms
+                if pipeline is not None and getattr(pipeline, "_asr_sched", None) is not None:
+                    if pipeline._asr_sched.queue_depth > 0:
+                        base_partial_ms *= 2
+                interval_s = base_partial_ms / 1000.0
                 now = time.monotonic()
                 if now - slot.last_partial_started >= interval_s:
                     if slot.partial_task is not None and not slot.partial_task.done():

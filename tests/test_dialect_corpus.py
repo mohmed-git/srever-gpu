@@ -47,6 +47,35 @@ class TestDialectCorpus(unittest.TestCase):
             dialect_name = _DIALECT_NAMES[it["dialect"]]
             self.assertIn(f"The speaker uses {dialect_name} colloquial Arabic", sys_msg)
 
+    def test_extended_evaluation_corpora_and_grand_total(self):
+        """All 4 committed evaluation corpora must exist, parse cleanly, and total 116 items."""
+        test_dir = Path(__file__).parent
+        file_counts = {
+            "dialect_corpus.jsonl": 21,
+            "dialect_heldout_v1.jsonl": 46,
+            "podcast_sa_001.jsonl": 19,
+            "a5000_eval_30.jsonl": 30,
+        }
+        total_items = 0
+        for fname, expected_count in file_counts.items():
+            fpath = test_dir / fname
+            self.assertTrue(fpath.exists(), f"{fname} must exist")
+            count = 0
+            with open(fpath, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        item = json.loads(line)
+                        self.assertIn("id", item)
+                        self.assertIn("text", item)
+                        self.assertIn("expected", item)
+                        self.assertTrue(len(item["text"].strip()) > 0)
+                        count += 1
+            self.assertEqual(count, expected_count, f"{fname} count mismatch")
+            total_items += count
+
+        self.assertEqual(total_items, 116, "Grand total across all committed corpora must be exactly 116 items")
+
 
 if __name__ == "__main__":
     unittest.main()

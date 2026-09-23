@@ -70,6 +70,7 @@ class TestLIDGate(unittest.IsolatedAsyncioTestCase):
             sentence_streaming=True,
             warmup=False,
             mt_backend='qwen_hf',
+            mt_allowed_backends='qwen_hf,qwen_ct2,qwen_vllm',
             asr_lid_gate_armed=False,
             asr_lid_threshold=0.6,
         )

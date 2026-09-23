@@ -1,4 +1,4 @@
-﻿import unittest
+import unittest
 from app.mt import has_1p_ar, detect_person_mismatch, _AR_1P_VERBS
 
 class TestPersonDetectorCommit7(unittest.TestCase):
@@ -25,7 +25,7 @@ class TestPersonDetectorCommit7(unittest.TestCase):
 
     def test_sabotage_verb_removal(self):
         # Sabotage: if we temporarily remove a verb from the set, it must fail detection on that verb
-        test_verb = "أعتذر"
+        test_verb = "اعتذر"
         self.assertIn(test_verb, _AR_1P_VERBS)
         # Verify sabotage mechanics: without the verb in the set, a sentence with only that verb fails detection
         sabotaged_set = _AR_1P_VERBS - {test_verb}

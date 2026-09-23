@@ -64,6 +64,28 @@ class TranslationOutcome:
         return payload
 
 
+class _MtSchedProxy:
+    """Composite backward-compatible proxy over _mt_sched_t1 and _mt_sched_t2."""
+
+    def __init__(self, pipeline: Any) -> None:
+        self._pipeline = pipeline
+
+    async def start(self) -> None:
+        await self._pipeline._mt_sched_t1.start()
+        await self._pipeline._mt_sched_t2.start()
+
+    async def stop(self) -> None:
+        await self._pipeline._mt_sched_t1.stop()
+        await self._pipeline._mt_sched_t2.stop()
+
+    async def submit(self, payload: Any, priority: int = 0) -> Any:
+        sched = self._pipeline.select_mt_sched(payload)
+        return await sched.submit(payload, priority=priority)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._pipeline._mt_sched_t2, name)
+
+
 class Pipeline:
     """Owns the engines and their schedulers. One instance per process."""
 
@@ -88,17 +110,37 @@ class Pipeline:
             admission_enabled=settings.admission_enabled,
             reject_over_budget=settings.reject_over_budget,
         )
-        self._mt_sched: BatchScheduler[tuple[str, str, str], Any] = BatchScheduler(
-            "mt",
-            self._run_mt_batch,
+        t1_wait = getattr(settings, "mt_tier1_batch_wait_ms", 0)
+        t2_wait = getattr(settings, "mt_tier2_batch_wait_ms", 20)
+
+        self._mt_sched_t1: BatchScheduler[Any, Any] = BatchScheduler(
+            "mt_t1",
+            self._run_mt_batch_t1,
             max_batch=settings.mt_batch_size,
-            wait_ms=settings.mt_batch_wait_ms,
+            wait_ms=t1_wait,
             max_queue_depth=settings.max_queue_depth,
             budget_ms=settings.latency_budget_ms,
             overload_factor=settings.overload_factor,
             admission_enabled=settings.admission_enabled,
             reject_over_budget=settings.reject_over_budget,
         )
+        self._mt_sched_t2: BatchScheduler[Any, Any] = BatchScheduler(
+            "mt_t2",
+            self._run_mt_batch_t2,
+            max_batch=settings.mt_batch_size,
+            wait_ms=t2_wait,
+            max_queue_depth=settings.max_queue_depth,
+            budget_ms=settings.latency_budget_ms,
+            overload_factor=settings.overload_factor,
+            admission_enabled=settings.admission_enabled,
+            reject_over_budget=settings.reject_over_budget,
+        )
+        self._mt_proxy: _MtSchedProxy = _MtSchedProxy(self)
+
+    @property
+    def _mt_sched(self) -> _MtSchedProxy:
+        """Backward-compatible proxy managing both tier schedulers and dispatching submit."""
+        return self._mt_proxy
 
     # ---- lifecycle -----------------------------------------------------
     async def start(self) -> None:
@@ -111,7 +153,8 @@ class Pipeline:
             log.error("engine load failed: %s", self.load_error)
             raise
         await self._asr_sched.start()
-        await self._mt_sched.start()
+        await self._mt_sched_t1.start()
+        await self._mt_sched_t2.start()
         if self.settings.warmup:
             self.warmup_report = {
                 "asr": await asyncio.to_thread(self.asr.warmup),
@@ -122,7 +165,8 @@ class Pipeline:
 
     async def stop(self) -> None:
         await self._asr_sched.stop()
-        await self._mt_sched.stop()
+        await self._mt_sched_t1.stop()
+        await self._mt_sched_t2.stop()
 
     @property
     def ready(self) -> bool:
@@ -146,8 +190,29 @@ class Pipeline:
             results.append(res)
         return results
 
-    def _run_mt_batch(self, items: list[tuple[str, str, str]]) -> list[Any]:
+    def _run_mt_batch_t1(self, items: list[Any]) -> list[Any]:
+        if hasattr(self.mt, "tier1_engine") and self.mt.tier1_engine is not None:
+            return self.mt.tier1_engine.translate_batch(items)
         return self.mt.translate_batch(items)
+
+    def _run_mt_batch_t2(self, items: list[Any]) -> list[Any]:
+        if hasattr(self.mt, "tier2_engine") and self.mt.tier2_engine is not None:
+            return self.mt.tier2_engine.translate_batch(items)
+        return self.mt.translate_batch(items)
+
+    def _run_mt_batch(self, items: list[Any]) -> list[Any]:
+        return self.mt.translate_batch(items)
+
+    def resolve_tier(self, text: str, src: str = "", source_variant: str | None = None) -> str:
+        if hasattr(self.mt, "resolve_tier"):
+            return self.mt.resolve_tier(text, src, source_variant=source_variant)
+        from app.mt import resolve_tier as _resolve_tier
+        return _resolve_tier(text, src, source_variant=source_variant)
+
+    def select_mt_sched(self, tier: str) -> BatchScheduler[Any, Any]:
+        if tier in {"1.5b", "tier1"}:
+            return self._mt_sched_t1
+        return self._mt_sched_t2
 
     # ---- validation ----------------------------------------------------
     def resolve_languages(self, source: str | None, target: str | None) -> tuple[str, str]:
@@ -204,8 +269,10 @@ class Pipeline:
                     "(an engine given blank input returns a hallucination, not a blank)",
                     code="empty_text",
                 )
-            mt_result, mt_timing = await self._mt_sched.submit(
-                (text, src, dst, source_variant, target_variant, "")
+            s_tier = self.resolve_tier(text, src, source_variant=source_variant)
+            sched = self.select_mt_sched(s_tier)
+            mt_result, mt_timing = await sched.submit(
+                (text, src, dst, source_variant, target_variant, "", s_tier)
             )
             total_ms = (time.perf_counter() - wall_start) * 1000.0
 
@@ -764,8 +831,10 @@ class Pipeline:
                     elif index == 0:
                         # Sentence 0 is submitted and awaited immediately so Early Dispatch
                         # delivers the first speakable word without waiting for sentences 1..n!
-                        mt_result, mt_timing = await self._mt_sched.submit(
-                            (sentence, detected, dst, source_variant, target_variant, context_prefix)
+                        s_tier = self.resolve_tier(sentence, detected, source_variant=source_variant)
+                        sched = self.select_mt_sched(s_tier)
+                        mt_result, mt_timing = await sched.submit(
+                            (sentence, detected, dst, source_variant, target_variant, context_prefix, s_tier)
                         )
                         piece, piece_ms = mt_result.text, mt_result.mt_ms
                         piece_hollow, piece_reason = mt_result.hollow, mt_result.hollow_reason
@@ -780,10 +849,12 @@ class Pipeline:
                         # Launch remaining sentences (1..n) concurrently while sentence 0 is yielded
                         if len(sentences) > 1:
                             for s in sentences[1:]:
+                                st_tier = self.resolve_tier(s, detected, source_variant=source_variant)
+                                st_sched = self.select_mt_sched(st_tier)
                                 mt_tasks.append(
                                     asyncio.create_task(
-                                        self._mt_sched.submit(
-                                            (s, detected, dst, source_variant, target_variant, "")
+                                        st_sched.submit(
+                                            (s, detected, dst, source_variant, target_variant, "", st_tier)
                                         )
                                     )
                                 )

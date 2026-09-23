@@ -620,16 +620,116 @@ def _count_units(text: str, lang: str | None = None) -> int:
     return len(text.split())
 
 
-def resolve_tier(text: str, src: str = "", threshold_words: int = 6) -> str:
-    """Determine model tier ('1.5b' vs '7b') based on utterance length.
+# ============================================================================
+# Closed-Class Dialect Lexicon (~200 high-precision dialect markers & idioms)
+# ============================================================================
+_RAW_DIALECT_WORDS = [
+    # Gulf (Saudi, Kuwaiti, Emirati, Qatari, Omani, Bahraini)
+    "قايلة", "هالقايلة", "القايلة", "الحين", "للحين", "هالحين", "باكر", "عقب", "عقب باكر",
+    "توه", "توني", "انطر", "ننطر", "تنطر", "ينطر", "نطرنا", "تكفى", "ابشر", "أبشر", "سم",
+    "شدراني", "هقيتها", "تبطي", "يبطي", "نحتريك", "يحتري", "تحتري", "يمدي", "امداني", "أمداني",
+    "يمديني", "چذي", "كذي", "شوي", "بالحيل", "اشدعوه", "شدعوه", "فريج", "سالفه", "السالفه",
+    "تبيني", "ما تشيل هم", "لا تشيل هم", "على يمناك", "حطه على يمناك", "طيحت وجهي",
+    "على احر من الجمر", "واسطه", "فظيع", "ونسة", "على هونك", "حرام عليك", "زفت", "باردة",
+    "فاضي", "قلبه ابيض", "الغرشه", "مسطول", "طلع عيني", "لبست فيها", "حاميه", "كوسا",
+    # Levantine (Jordanian, Palestinian, Syrian, Lebanese)
+    "هسا", "هسه", "شو", "شو القصه", "بدي", "بدك", "بدو", "بدنا", "بدكم", "بدهم",
+    "فكك", "سولافه", "هالسولافه", "شوب", "مو عبالي", "يسلمو", "هيك", "مشان", "عشان",
+    "هدول", "هادا", "هاد", "هادي", "اشيا", "قاعد بحكي", "مش معبرني", "مقطوع من شجرة",
+    "تطير في العجة", "طول بالك", "ع رواق", "مسحها بهاللحية", "تكرم عينك", "على راسي",
+    "كاسه شاي", "سكر خفيف", "بحرث على حاله", "يدبر حاله", "يا زلمه", "ولا يهمك",
+    # Egyptian
+    "كده", "كدة", "عايز", "عايزه", "عايزين", "ايه", "إيه", "ازيك", "إزيك", "يا باشا",
+    "عامل ايه", "روق دمك", "فكها شوية", "متحبكهاش", "كوبري اكتوبر", "مفيش", "مافيش",
+    "علطول", "سيبك", "سيبك منه", "حارة السقايين", "بيبيع الميه", "كوسة", "عينه زايغة",
+    "حوارات", "النهارده", "مشوار على السريع", "زحمة موت", "مش مستاهل", "ملهاش لازمة",
+    "جدع", "اوام", "بتاع", "بتاعي", "بتاعتك", "دلوقتي",
+    # Iraqi
+    "شلونك", "شلونكم", "طالع من الدوام", "تلح", "لا تلح", "عويصه", "هيج", "تره",
+    "دخت السبع دوخات", "يا عمي فكنا", "دا اسوي", "ماكو", "شكو", "اريد", "هوايه",
+    "كلش", "بلكت", "خوش", "صدك", "جاي عليك بالطريق", "فدوه", "لعاد", "اكو", "صدوك",
+]
+
+_RAW_DIALECT_PHRASES = [
+    "وين طالع", "في هالقايلة", "في القايلة", "ما تشيل هم", "لا تشيل هم", "حطه على يمناك",
+    "طيحت وجهي", "على احر من الجمر", "مو عبالي", "قاعد بحكي", "مش معبرني", "مقطوع من شجرة",
+    "تطير في العجة", "طول بالك", "ع رواق", "على رواق", "مسحها بهاللحية", "تكرم عينك",
+    "على راسي", "روق دمك", "فكها شوية", "كوبري اكتوبر", "حارة السقايين", "عينه زايغة",
+    "مش مستاهل", "ملهاش لازمة", "طالع من الدوام", "دخت السبع دوخات", "يا عمي فكنا",
+    "دا اسوي", "جاي عليك بالطريق", "بيبيع المية", "مشوار على السريع", "زحمة موت",
+    "شدوا حيلكم", "هلا والله", "يا ساتر", "يا ويلي", "طيب خلاص", "على فكرة", "عيب عليك",
+    "كاسة شاي", "سكر خفيف"
+]
+
+_DIALECT_WORDS: frozenset[str] = frozenset(_normalize_ar(w) for w in _RAW_DIALECT_WORDS if " " not in w)
+_DIALECT_PHRASES: tuple[str, ...] = tuple(_normalize_ar(p) for p in _RAW_DIALECT_PHRASES + [w for w in _RAW_DIALECT_WORDS if " " in w])
+
+
+def is_dialect_utterance(text: str, source_variant: str | None = None) -> bool:
+    """Check if an Arabic utterance contains distinct regional dialect vocabulary or idioms."""
+    if not text:
+        return False
+    norm = _normalize_ar(text).lower()
+    for phrase in _DIALECT_PHRASES:
+        if phrase in norm:
+            return True
+    tokens = set(re.findall(r"[\u0621-\u064A]+", norm))
+    if tokens & _DIALECT_WORDS:
+        return True
+    if source_variant:
+        v = source_variant.strip().upper()
+        if v in {"SA", "EG", "JO", "IQ", "GULF", "LEVANTINE", "EGYPTIAN", "IRAQI"}:
+            if any(t in norm for t in ("وين", "شو", "ليش", "شنو", "ايه", "ايش", "وش")):
+                return True
+    return False
+
+
+def check_cuda_driver_preflight() -> tuple[bool, str]:
+    """Startup preflight check verifying CUDA driver compatibility with PyTorch CUDA runtime."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return True, "cuda_not_available_cpu_only"
+        driver_ver_fn = getattr(torch._C, "_cuda_getDriverVersion", None)
+        if callable(driver_ver_fn):
+            driver_ver = driver_ver_fn()
+            torch_cuda = torch.version.cuda
+            if torch_cuda:
+                parts = [int(p) for p in torch_cuda.split(".") if p.isdigit()]
+                if len(parts) >= 2 and parts[0] == 12 and parts[1] >= 4 and driver_ver < 12020:
+                    return (
+                        False,
+                        f"NVIDIA host driver version ({driver_ver}) is too old for PyTorch CUDA runtime {torch_cuda}; requires driver >= 12040.",
+                    )
+        return True, "ok"
+    except Exception as exc:
+        return False, f"cuda_preflight_error: {exc}"
+
+
+def resolve_tier(
+    text: str,
+    src: str = "",
+    threshold_words: int = 6,
+    source_variant: str | None = None,
+) -> str:
+    """Determine model tier ('1.5b' vs '7b') with dialect-awareness and length budgeting.
 
     Invariants:
-    - Utterances <= threshold_words (default 6 words) route to Tier 1 ('1.5b').
-    - For CJK scripts, <= threshold_words * 2 (12 chars) routes to Tier 1 ('1.5b').
-    - Utterances > threshold route to Tier 2 ('7b').
+    1. Dialect / colloquial Arabic check: If text contains any token or phrase
+       from the closed-class dialect lexicon, route to Tier 2 ('7b') regardless of length.
+       (e.g., 'وين طالع في هالقايلة' is short but routes to 7B because 1.5B scored 0%).
+    2. Utterances <= threshold_words (default 6 words) route to Tier 1 ('1.5b').
+    3. For CJK scripts, <= threshold_words * 2 (12 chars) routes to Tier 1 ('1.5b').
+    4. Utterances > threshold route to Tier 2 ('7b').
     """
     if not text:
         return "1.5b"
+
+    norm_src = (src or "").strip().lower().split("-")[0]
+    if norm_src in {"ar", "auto", ""}:
+        if is_dialect_utterance(text, source_variant=source_variant):
+            return "7b"
+
     units = _count_units(text, src)
     cutoff = (threshold_words * 2) if is_cjk_lang(src) else threshold_words
     return "1.5b" if units <= cutoff else "7b"
@@ -2178,8 +2278,8 @@ class TwoTierMtEngine(MtEngine):
         self.tier1_engine: MtEngine | None = tier1_engine
         self.tier2_engine: MtEngine | None = tier2_engine
 
-    def resolve_tier(self, text: str, src: str = "") -> str:
-        return resolve_tier(text, src, self.threshold)
+    def resolve_tier(self, text: str, src: str = "", source_variant: str | None = None) -> str:
+        return resolve_tier(text, src, self.threshold, source_variant=source_variant)
 
     def load(self) -> None:
         import copy
@@ -2256,11 +2356,12 @@ class TwoTierMtEngine(MtEngine):
         tier1_jobs: list[tuple[int, MtItem]] = []
         tier2_jobs: list[tuple[int, MtItem]] = []
 
-        for idx, raw_it in enumerate(items):
+        for idx in range(len(items)):
+            raw_it = items[idx]
             it = _unpack_item(raw_it)
             target_tier = it.tier
             if not target_tier:
-                target_tier = self.resolve_tier(it.text, it.src)
+                target_tier = self.resolve_tier(it.text, it.src, source_variant=it.source_variant)
 
             stamped_item = MtItem(
                 text=it.text,
@@ -2279,47 +2380,69 @@ class TwoTierMtEngine(MtEngine):
 
         results: list[MtResult | None] = [None] * len(items)
 
-        if tier1_jobs and self.tier1_engine is not None:
+        def _run_t1() -> list[MtResult]:
+            if not tier1_jobs or self.tier1_engine is None:
+                return []
             self._metrics_incr("mt_tier1_routed", len(tier1_jobs))
             t1_inputs = [item for _, item in tier1_jobs]
-            t1_results = self.tier1_engine.translate_batch(t1_inputs)
-            for (idx, _), res in zip(tier1_jobs, t1_results):
-                if getattr(res, "tier", "") != "1.5b":
-                    res = MtResult(
-                        text=res.text,
-                        mt_ms=res.mt_ms,
-                        backend=res.backend,
-                        model=res.model,
-                        input_tokens=res.input_tokens,
-                        output_tokens=res.output_tokens,
-                        batch_size=res.batch_size,
-                        hollow=res.hollow,
-                        hollow_reason=res.hollow_reason,
-                        retried=res.retried,
-                        tier="1.5b",
-                    )
-                results[idx] = res
+            return self.tier1_engine.translate_batch(t1_inputs)
 
-        if tier2_jobs and self.tier2_engine is not None:
+        def _run_t2() -> list[MtResult]:
+            if not tier2_jobs or self.tier2_engine is None:
+                return []
             self._metrics_incr("mt_tier2_routed", len(tier2_jobs))
             t2_inputs = [item for _, item in tier2_jobs]
-            t2_results = self.tier2_engine.translate_batch(t2_inputs)
-            for (idx, _), res in zip(tier2_jobs, t2_results):
-                if getattr(res, "tier", "") != "7b":
-                    res = MtResult(
-                        text=res.text,
-                        mt_ms=res.mt_ms,
-                        backend=res.backend,
-                        model=res.model,
-                        input_tokens=res.input_tokens,
-                        output_tokens=res.output_tokens,
-                        batch_size=res.batch_size,
-                        hollow=res.hollow,
-                        hollow_reason=res.hollow_reason,
-                        retried=res.retried,
-                        tier="7b",
-                    )
-                results[idx] = res
+            return self.tier2_engine.translate_batch(t2_inputs)
+
+        import concurrent.futures
+
+        t1_results: list[MtResult] = []
+        t2_results: list[MtResult] = []
+
+        if tier1_jobs and tier2_jobs:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                f1 = executor.submit(_run_t1)
+                f2 = executor.submit(_run_t2)
+                t1_results = f1.result()
+                t2_results = f2.result()
+        elif tier1_jobs:
+            t1_results = _run_t1()
+        elif tier2_jobs:
+            t2_results = _run_t2()
+
+        for (idx, _), res in zip(tier1_jobs, t1_results):
+            if getattr(res, "tier", "") != "1.5b":
+                res = MtResult(
+                    text=res.text,
+                    mt_ms=res.mt_ms,
+                    backend=res.backend,
+                    model=res.model,
+                    input_tokens=res.input_tokens,
+                    output_tokens=res.output_tokens,
+                    batch_size=res.batch_size,
+                    hollow=res.hollow,
+                    hollow_reason=res.hollow_reason,
+                    retried=res.retried,
+                    tier="1.5b",
+                )
+            results[idx] = res
+
+        for (idx, _), res in zip(tier2_jobs, t2_results):
+            if getattr(res, "tier", "") != "7b":
+                res = MtResult(
+                    text=res.text,
+                    mt_ms=res.mt_ms,
+                    backend=res.backend,
+                    model=res.model,
+                    input_tokens=res.input_tokens,
+                    output_tokens=res.output_tokens,
+                    batch_size=res.batch_size,
+                    hollow=res.hollow,
+                    hollow_reason=res.hollow_reason,
+                    retried=res.retried,
+                    tier="7b",
+                )
+            results[idx] = res
 
         final_list: list[MtResult] = []
         for r in results:

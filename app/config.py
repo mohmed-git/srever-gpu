@@ -150,6 +150,9 @@ class Settings:
     mt_tier1_gpu_mem_fraction: float = field(
         default_factory=lambda: _env_float("MT_TIER1_GPU_MEM_FRACTION", 0.15)
     )
+    mt_tier1_batch_wait_ms: int = field(
+        default_factory=lambda: _env_int("MT_TIER1_BATCH_WAIT_MS", 0)
+    )
     mt_tier2_model: str = field(
         default_factory=lambda: _env("MT_TIER2_MODEL", "Qwen/Qwen2.5-7B-Instruct")
     )
@@ -161,6 +164,12 @@ class Settings:
     )
     mt_tier2_gpu_mem_fraction: float = field(
         default_factory=lambda: _env_float("MT_TIER2_GPU_MEM_FRACTION", 0.45)
+    )
+    mt_tier2_batch_wait_ms: int = field(
+        default_factory=lambda: _env_int("MT_TIER2_BATCH_WAIT_MS", 20)
+    )
+    partial_window_s: float = field(
+        default_factory=lambda: _env_float("PARTIAL_WINDOW_S", 4.5)
     )
 
     # ---- admission control --------------------------------------------

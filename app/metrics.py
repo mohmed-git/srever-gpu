@@ -122,6 +122,8 @@ class Metrics:
             "tentative_skipped_seq_mismatch": 0,
             "partials_run": 0,
             "partials_skipped": 0,
+            "partials_unchanged": 0,
+            "mt_dedup_hits": 0,
             "presplit_hit": 0,
             "presplit_miss": 0,
             "aborted": 0,

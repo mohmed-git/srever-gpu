@@ -81,12 +81,24 @@ class TestTwoTierRouter(unittest.TestCase):
 
     # ---- 1. Length & Script Resolution Tests -------------------------------
     def test_short_utterance_routes_to_tier1(self) -> None:
-        """Utterances <= 6 words strictly route to 1.5b."""
+        """Utterances <= 6 words of standard MSA/English strictly route to 1.5b."""
         self.assertEqual(resolve_tier("مرحبا", "ar", 6), "1.5b")
         self.assertEqual(resolve_tier("كيف حالك اليوم؟", "ar", 6), "1.5b")
-        self.assertEqual(resolve_tier("وين رايح الحين؟", "ar", 6), "1.5b")
+        self.assertEqual(resolve_tier("أين تذهب الآن؟", "ar", 6), "1.5b")
         self.assertEqual(resolve_tier("Hello, how are you?", "en", 6), "1.5b")
         self.assertEqual(resolve_tier("Yes, definitely.", "en", 6), "1.5b")
+
+    def test_dialect_short_utterance_routes_to_tier2(self) -> None:
+        """Colloquial phrases and dialect markers route to 7B even when <= 6 words."""
+        # Terse colloquial idioms (< 6 words)
+        self.assertEqual(resolve_tier("وين طالع في هالقايلة", "ar", 6), "7b")
+        self.assertEqual(resolve_tier("وين رايح الحين؟", "ar", 6), "7b")
+        self.assertEqual(resolve_tier("ما تشيل هم ابدا", "ar", 6), "7b")
+        self.assertEqual(resolve_tier("شو القصة يا زلمة", "ar", 6), "7b")
+        self.assertEqual(resolve_tier("عامل ايه النهارده", "ar", 6), "7b")
+        # With explicit dialect metadata
+        self.assertEqual(resolve_tier("وين رايح؟", "ar", 6, source_variant="SA"), "7b")
+        self.assertEqual(resolve_tier("شو بتعمل؟", "ar", 6, source_variant="JO"), "7b")
 
     def test_boundary_conditions(self) -> None:
         """Boundary: exactly 6 words -> 1.5b, exactly 7 words -> 7b."""
@@ -260,6 +272,59 @@ class TestTwoTierSabotages(unittest.TestCase):
         """Sabotage S2: Returned results must carry non-empty tier field."""
         res = self.router.translate_batch([("مرحبا", "ar", "en", "", "", "")])
         self.assertEqual(res[0].tier, "1.5b", "Tier must be stamped on MtResult")
+
+
+class TestIncidentFixesIntegration(unittest.TestCase):
+    """Integration checks for incident fixes: dedup, driver preflight, and pipeline decoupling."""
+
+    def test_cuda_driver_preflight_executes_safely(self) -> None:
+        from app.mt import check_cuda_driver_preflight
+        ok, reason = check_cuda_driver_preflight()
+        self.assertIsInstance(ok, bool)
+        self.assertIsInstance(reason, str)
+
+    def test_pending_result_deduplication(self) -> None:
+        """Concurrent submissions of identical requests reuse the same in-flight future."""
+        import asyncio
+        import time
+        from app.scheduler import BatchScheduler
+
+        call_count = 0
+
+        def slow_worker(items):
+            nonlocal call_count
+            call_count += 1
+            time.sleep(0.05)  # simulate GPU latency so concurrent requests overlap
+            return [f"result:{it}" for it in items]
+
+        sched = BatchScheduler(
+            name="test_dedup",
+            runner=slow_worker,
+            max_batch=8,
+            wait_ms=5.0,
+        )
+
+        async def run_concurrent():
+            await sched.start()
+            try:
+                # Submit 3 identical items concurrently
+                t1 = asyncio.create_task(sched.submit("identical_query"))
+                t2 = asyncio.create_task(sched.submit("identical_query"))
+                t3 = asyncio.create_task(sched.submit("identical_query"))
+                res1, res2, res3 = await asyncio.gather(t1, t2, t3)
+                return res1, res2, res3
+            finally:
+                await sched.stop()
+
+        r1, r2, r3 = asyncio.run(run_concurrent())
+        self.assertEqual(r1[0], "result:identical_query")
+        self.assertEqual(r2[0], "result:identical_query")
+        self.assertEqual(r3[0], "result:identical_query")
+        # In-flight deduplication: exactly 1 request executes the worker, other 2 get dedup=True
+        dedup_flags = [r1[1].get("dedup"), r2[1].get("dedup"), r3[1].get("dedup")]
+        self.assertEqual(dedup_flags.count(False), 1)
+        self.assertEqual(dedup_flags.count(True), 2)
+        self.assertEqual(call_count, 1, "Runner must only be called once for in-flight duplicates")
 
 
 if __name__ == "__main__":

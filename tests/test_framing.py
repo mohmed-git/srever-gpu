@@ -278,6 +278,7 @@ class TestPipelineStreamingNoNameError(unittest.IsolatedAsyncioTestCase):
             sentence_max_count=4,
             warmup=False,
             mt_backend="qwen_hf",
+            mt_allowed_backends="qwen_hf,qwen_ct2,qwen_vllm",
         )
         pipeline = Pipeline(settings)
         pipeline.asr = FakeAsrEngine()
@@ -662,6 +663,7 @@ class TestPhase24SpeculativeFraming(unittest.IsolatedAsyncioTestCase):
             sentence_max_count=4,
             warmup=False,
             mt_backend="qwen_hf",
+            mt_allowed_backends="qwen_hf,qwen_ct2,qwen_vllm",
         )
         pipeline = Pipeline(pipe_settings)
         pipeline.asr = FakeAsrEngine()

@@ -124,6 +124,7 @@ class BatchScheduler(Generic[T, R]):
 
         # Priority queues: 0 (commit), 1 (tentative), 2 (pre-translate), 3 (partial)
         self._queues: dict[int, deque[_Job[T, R]]] = {0: deque(), 1: deque(), 2: deque(), 3: deque()}
+        self._in_flight: dict[Any, asyncio.Future[R]] = {}
         self._wakeup: asyncio.Event | None = None
         self._worker: asyncio.Task | None = None
         self._closing = False
@@ -163,6 +164,11 @@ class BatchScheduler(Generic[T, R]):
 
     def _total_depth(self) -> int:
         return sum(len(q) for q in self._queues.values())
+
+    @property
+    def queue_depth(self) -> int:
+        """Current total number of queued jobs across all priorities."""
+        return self._total_depth()
 
     @property
     def _queue(self) -> list[_Job[T, R]]:
@@ -255,11 +261,28 @@ class BatchScheduler(Generic[T, R]):
         Returns (result, timing). Raises Overloaded when shedding."""
         if self._worker is None or self._wakeup is None:
             raise RuntimeError(f"scheduler '{self.name}' not started")
+
+        # Pending-result dedup: if an identical request is already queued or executing,
+        # await its Future instead of burning duplicate GPU cycles.
+        dedup_key = payload if isinstance(payload, (str, bytes, tuple, frozenset, int)) else repr(payload)
+        existing_fut = self._in_flight.get(dedup_key)
+        if existing_fut is not None and not existing_fut.done():
+            result = await existing_fut
+            return result, {
+                "queue_wait_ms": 0.0,
+                "batch_size": 1,
+                "dedup": True,
+            }
+
         prio = min(3, max(0, priority))
         self._admit_or_raise(priority=prio)
 
         loop = asyncio.get_running_loop()
-        job: _Job[T, R] = _Job(payload=payload, future=loop.create_future(), priority=prio)
+        fut: asyncio.Future[R] = loop.create_future()
+        self._in_flight[dedup_key] = fut
+        fut.add_done_callback(lambda _: self._in_flight.pop(dedup_key, None))
+
+        job: _Job[T, R] = _Job(payload=payload, future=fut, priority=prio)
         self._queues[prio].append(job)
         self._peak_queue = max(self._peak_queue, self._total_depth())
         self._wakeup.set()
@@ -269,6 +292,7 @@ class BatchScheduler(Generic[T, R]):
         return result, {
             "queue_wait_ms": round(waited_ms, 2),
             "batch_size": getattr(job.future, "_batch_size", 1),
+            "dedup": False,
         }
 
     # ---- worker --------------------------------------------------------
