@@ -113,6 +113,7 @@ class TranslateRequest(BaseModel):
     target: str = Field(..., description="Target language code, e.g. 'en'")
     source_variant: str | None = Field(default=None, description="Source dialect variant, e.g. 'EG'")
     target_variant: str | None = Field(default=None, description="Target dialect variant, e.g. 'SA'")
+    tier: str | None = Field(default=None, description="Optional forced tier: '1.5b' or '7b'")
 
     @field_validator("source", "target")
     @classmethod
@@ -153,6 +154,7 @@ async def translate(req: TranslateRequest, request: Request) -> JSONResponse:
             req.target,
             source_variant=req.source_variant or "",
             target_variant=req.target_variant or "",
+            tier=req.tier or "",
         )
     except Overloaded as exc:
         return JSONResponse(

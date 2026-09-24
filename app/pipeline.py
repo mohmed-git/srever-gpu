@@ -252,6 +252,7 @@ class Pipeline:
         target: str,
         source_variant: str = "",
         target_variant: str = "",
+        tier: str = "",
     ) -> TranslationOutcome:
         wall_start = time.perf_counter()
         self.metrics.enter()
@@ -269,7 +270,7 @@ class Pipeline:
                     "(an engine given blank input returns a hallucination, not a blank)",
                     code="empty_text",
                 )
-            s_tier = self.resolve_tier(text, src, source_variant=source_variant)
+            s_tier = tier.strip().lower() if tier else self.resolve_tier(text, src, source_variant=source_variant)
             sched = self.select_mt_sched(s_tier)
             mt_result, mt_timing = await sched.submit(
                 (text, src, dst, source_variant, target_variant, "", s_tier)
