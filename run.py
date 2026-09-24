@@ -12,6 +12,9 @@ the process, not from forking.
 from __future__ import annotations
 
 import sys
+import os
+
+os.environ.setdefault("VLLM_ENABLE_CUDA_COMPATIBILITY", "1")
 
 import uvicorn
 

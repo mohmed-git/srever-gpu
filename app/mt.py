@@ -1749,6 +1749,7 @@ class QwenVllmEngine(MtEngine):
     def load(self) -> None:
         import os
         os.environ["VLLM_USE_V1"] = "0"
+        os.environ.setdefault("VLLM_ENABLE_CUDA_COMPATIBILITY", "1")
         os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
         from vllm import LLM, SamplingParams
