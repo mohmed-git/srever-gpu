@@ -2282,7 +2282,7 @@ class TwoTierMtEngine(MtEngine):
         return resolve_tier(text, src, self.threshold, source_variant=source_variant)
 
     def load(self) -> None:
-        import copy
+        from dataclasses import replace
         started = time.perf_counter()
 
         if self.tier1_engine is None:
@@ -2290,12 +2290,14 @@ class TwoTierMtEngine(MtEngine):
             if t1_backend in {"auto", ""}:
                 t1_backend = "qwen_ct2" if self.settings.on_cuda else "m2m100_ct2"
 
-            t1_settings = copy.copy(self.settings)
-            t1_settings.mt_backend = t1_backend
-            t1_settings.mt_model = getattr(self.settings, "mt_tier1_model", "Qwen/Qwen2.5-1.5B-Instruct")
-            t1_settings.mt_quant = getattr(self.settings, "mt_tier1_quant", "awq")
-            t1_settings.mt_gpu_mem_fraction = getattr(self.settings, "mt_tier1_gpu_mem_fraction", 0.15)
-            t1_settings.mt_lora_path = ""  # Tier 1 is lean base model
+            t1_settings = replace(
+                self.settings,
+                mt_backend=t1_backend,
+                mt_model=getattr(self.settings, "mt_tier1_model", "Qwen/Qwen2.5-1.5B-Instruct"),
+                mt_quant=getattr(self.settings, "mt_tier1_quant", "awq"),
+                mt_gpu_mem_fraction=getattr(self.settings, "mt_tier1_gpu_mem_fraction", 0.15),
+                mt_lora_path="",  # Tier 1 is lean base model
+            )
 
             if t1_backend == "qwen_vllm":
                 self.tier1_engine = QwenVllmEngine(t1_settings)
@@ -2318,12 +2320,14 @@ class TwoTierMtEngine(MtEngine):
             if t2_backend in {"auto", ""}:
                 t2_backend = "qwen_vllm" if self.settings.on_cuda else "m2m100_ct2"
 
-            t2_settings = copy.copy(self.settings)
-            t2_settings.mt_backend = t2_backend
-            t2_settings.mt_model = getattr(self.settings, "mt_tier2_model", "Qwen/Qwen2.5-7B-Instruct")
-            t2_settings.mt_quant = getattr(self.settings, "mt_tier2_quant", "awq")
-            t2_settings.mt_gpu_mem_fraction = getattr(self.settings, "mt_tier2_gpu_mem_fraction", 0.45)
-            t2_settings.mt_lora_path = getattr(self.settings, "mt_lora_path", "")
+            t2_settings = replace(
+                self.settings,
+                mt_backend=t2_backend,
+                mt_model=getattr(self.settings, "mt_tier2_model", "Qwen/Qwen2.5-7B-Instruct"),
+                mt_quant=getattr(self.settings, "mt_tier2_quant", "awq"),
+                mt_gpu_mem_fraction=getattr(self.settings, "mt_tier2_gpu_mem_fraction", 0.45),
+                mt_lora_path=getattr(self.settings, "mt_lora_path", ""),
+            )
 
             if t2_backend == "qwen_vllm":
                 self.tier2_engine = QwenVllmEngine(t2_settings)

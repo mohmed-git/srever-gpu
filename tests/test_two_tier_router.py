@@ -239,6 +239,23 @@ class TestTwoTierRouter(unittest.TestCase):
         self.assertEqual(info["tier1"]["tier"], "1.5b")
         self.assertEqual(info["tier2"]["tier"], "7b")
 
+    def test_two_tier_load_instantiates_without_frozen_error(self) -> None:
+        """Verify that TwoTierMtEngine.load does not fail with FrozenInstanceError on Settings."""
+        from unittest.mock import patch, MagicMock
+        settings = Settings(mt_backend="two_tier", mt_two_tier_enabled=True)
+        engine = TwoTierMtEngine(settings)
+        with patch("app.mt.QwenCt2Engine") as mock_ct2, patch("app.mt.QwenVllmEngine") as mock_vllm, patch("app.mt.QwenHfEngine") as mock_hf, patch("app.mt.M2M100Ct2Engine") as mock_m2m:
+            mock_inst = MagicMock()
+            mock_inst.ready = True
+            mock_inst.metrics = None
+            mock_ct2.return_value = mock_inst
+            mock_vllm.return_value = mock_inst
+            mock_hf.return_value = mock_inst
+            mock_m2m.return_value = mock_inst
+            engine.load()
+            self.assertIsNotNone(engine.tier1_engine)
+            self.assertIsNotNone(engine.tier2_engine)
+
 
 class TestTwoTierSabotages(unittest.TestCase):
     """Sabotage tests: mutations must cause tests to fail."""
