@@ -267,6 +267,7 @@ def gpu_hardware_info() -> dict[str, Any]:
     info: dict[str, Any] = {
         "gpu_name": None,
         "compute_capability": None,
+        "cuda_driver_version": None,
         "cuda_runtime_version": None,
         "torch_cuda_version": None,
     }
@@ -282,6 +283,10 @@ def gpu_hardware_info() -> dict[str, Any]:
                 info["compute_capability"] = f"{cap[0]}.{cap[1]}"
             except Exception as exc:
                 info["compute_capability"] = f"unsupported ({exc})"
+
+            driver_fn = getattr(torch._C, "_cuda_getDriverVersion", None)
+            if callable(driver_fn):
+                info["cuda_driver_version"] = driver_fn()
 
             # Try to get runtime version from torch if available
             try:
@@ -303,6 +308,7 @@ def gpu_hardware_info() -> dict[str, Any]:
             cuda_v = pynvml.nvmlSystemGetCudaDriverVersion()
             major = cuda_v // 1000
             minor = (cuda_v % 1000) // 10
+            info["cuda_driver_version"] = cuda_v
             info["cuda_runtime_version"] = f"{major}.{minor}"
         except Exception:
             pass

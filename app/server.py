@@ -2229,6 +2229,7 @@ async def health() -> JSONResponse:
         "mt_backend_class": PIPELINE.mt.__class__.__name__ if PIPELINE else None,
         "gpu_name": gpu_hw.get("gpu_name"),
         "compute_capability": gpu_hw.get("compute_capability"),
+        "cuda_driver_version": gpu_hw.get("cuda_driver_version"),
         "cuda_runtime_version": gpu_hw.get("cuda_runtime_version"),
         "torch_cuda_version": gpu_hw.get("torch_cuda_version"),
     }

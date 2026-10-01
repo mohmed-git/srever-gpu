@@ -23,9 +23,16 @@ RUN python3 -c "import vllm; print('Build verification succeeded: vLLM', vllm.__
 # Build-time pre-conversion of Qwen2.5-1.5B-Instruct to CTranslate2 int8_float16
 RUN ct2-transformers-converter --model Qwen/Qwen2.5-1.5B-Instruct --quantization int8_float16 --output_dir /models/qwen2.5-1.5b-ct2
 
+# Build-time pre-conversion of Qwen2.5-7B-Instruct to CTranslate2 int8_float16
+RUN ct2-transformers-converter --model Qwen/Qwen2.5-7B-Instruct --quantization int8_float16 --output_dir /models/qwen2.5-7b-ct2
+
 ENV MT_MODEL=/models/qwen2.5-1.5b-ct2 \
     MT_TOKENIZER=Qwen/Qwen2.5-1.5B-Instruct \
-    MT_BACKEND=qwen_ct2
+    MT_BACKEND=two_tier \
+    MT_TIER1_MODEL=/models/qwen2.5-1.5b-ct2 \
+    MT_TIER1_BACKEND=qwen_ct2 \
+    MT_TIER2_MODEL=/models/qwen2.5-7b-ct2 \
+    MT_TIER2_BACKEND=qwen_ct2
 
 COPY app ./app
 COPY tests ./tests

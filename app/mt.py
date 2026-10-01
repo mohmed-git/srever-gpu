@@ -1400,13 +1400,16 @@ class QwenCt2Engine(MtEngine):
         candidates = [
             model_id,
             "/models/qwen2.5-1.5b-ct2",
+            "/models/qwen2.5-7b-ct2",
         ]
         here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         safe_name = model_id.replace("/", "--")
         candidates.extend([
             os.path.join(here, "models", "qwen2.5-1.5b-ct2"),
+            os.path.join(here, "models", "qwen2.5-7b-ct2"),
             os.path.join(here, "models", f"{safe_name}-ct2-{compute}"),
             os.path.join(os.path.dirname(here), "models", "qwen2.5-1.5b-ct2"),
+            os.path.join(os.path.dirname(here), "models", "qwen2.5-7b-ct2"),
         ])
         for p in candidates:
             if os.path.isdir(p) and (
@@ -2291,10 +2294,15 @@ class TwoTierMtEngine(MtEngine):
             if t1_backend in {"auto", ""}:
                 t1_backend = "qwen_ct2" if self.settings.on_cuda else "m2m100_ct2"
 
+            t1_model = getattr(self.settings, "mt_tier1_model", "Qwen/Qwen2.5-1.5B-Instruct")
+            import os
+            if t1_backend == "qwen_ct2" and os.path.isdir("/models/qwen2.5-1.5b-ct2"):
+                t1_model = "/models/qwen2.5-1.5b-ct2"
+
             t1_settings = replace(
                 self.settings,
                 mt_backend=t1_backend,
-                mt_model=getattr(self.settings, "mt_tier1_model", "Qwen/Qwen2.5-1.5B-Instruct"),
+                mt_model=t1_model,
                 mt_quant=getattr(self.settings, "mt_tier1_quant", "awq"),
                 mt_gpu_mem_fraction=getattr(self.settings, "mt_tier1_gpu_mem_fraction", 0.15),
                 mt_lora_path="",  # Tier 1 is lean base model
@@ -2321,10 +2329,14 @@ class TwoTierMtEngine(MtEngine):
             if t2_backend in {"auto", ""}:
                 t2_backend = "qwen_vllm" if self.settings.on_cuda else "m2m100_ct2"
 
+            t2_model = getattr(self.settings, "mt_tier2_model", "Qwen/Qwen2.5-7B-Instruct")
+            if t2_backend == "qwen_ct2" and os.path.isdir("/models/qwen2.5-7b-ct2"):
+                t2_model = "/models/qwen2.5-7b-ct2"
+
             t2_settings = replace(
                 self.settings,
                 mt_backend=t2_backend,
-                mt_model=getattr(self.settings, "mt_tier2_model", "Qwen/Qwen2.5-7B-Instruct"),
+                mt_model=t2_model,
                 mt_quant=getattr(self.settings, "mt_tier2_quant", "awq"),
                 mt_gpu_mem_fraction=getattr(self.settings, "mt_tier2_gpu_mem_fraction", 0.45),
                 mt_lora_path=getattr(self.settings, "mt_lora_path", ""),
